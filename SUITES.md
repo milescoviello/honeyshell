@@ -1,0 +1,149 @@
+# The suites
+
+Every suite and the single question it asks. Most are *differential*:
+they compare this emulator against real bash, real coreutils, or a real
+Debian host, rather than against an expectation written by hand.
+
+Run one:  `python3 -W ignore <suite>.py`
+
+Run all:  `./run-suites.sh`
+
+- `alttest.py` -- Does the box agree with itself about what `editor` actually runs?
+- `apttest.py` -- If the box can reach the archive, what happens when you install?
+- `archtest.py` -- Does the box agree with itself about what is inside an archive?
+- `archtest2.py` -- tar: does unpacking put the files where the script expects them?
+- `arithtest.py` -- Arithmetic, expr, and the escaped asterisk between them.
+- `attrtest.py` -- Do ext2 file attributes actually do anything, or only print?
+- `authtest.py` -- What does the box know about how the attacker got in?
+- `awktest.py` -- Diff our awk against the real one, on the box that has the real one.
+- `bgtest.py` -- One launch, one process.
+- `bigfiletest.py` -- The same bytes, every way of moving them: do the answers agree?
+- `bindirtest.py` -- Which directory is this binary in, and does everything agree?
+- `bintest.py` -- What does this box actually have installed, and what can it do with it?
+- `boottest.py` -- Does the box agree with itself about how it booted?
+- `builtintest.py` -- If `type` calls it a builtin, does it run?
+- `bytesviewtest.py` -- Do the tools that show invisible bytes agree there are any?
+- `bytetest.py` -- Does the box tell the same story about the same bytes?
+- `captest.py` -- The privilege-escalation recon surface, and whether it agrees with itself.
+- `cgrouptest.py` -- cgroup v2: the tree, and the numbers systemd quotes from it.
+- `colortest.py` -- grep's colour, and the terminal signal that decides it.
+- `cputest.py` -- Does the box describe a CPU that /sys actually contains?
+- `crontest.py` -- crontab: one crontab for everyone, and no validation at all.
+- `detect.py` -- Try to prove this box is fake, the way an attacker who just landed would.
+- `devtest.py` -- Does the disk story hold together from /etc/fstab down to /dev?
+- `difftest.py` -- Differential test: our fake shell vs real bash.
+- `difftest2.py` -- Round 2: wider corpus, still machine-independent constructs only.
+- `difftest3.py` -- Round 3: harder constructs + idioms lifted from real bot payloads.
+- `difftest4.py` -- Differential test for the Debian userland added on top of the core shell.
+- `disktest.py` -- How big is this disk, and how much of it is gone?
+- `dispatchtest.py` -- How a loader picks its payload: case dispatch and =~ tests.
+- `dltest.py` -- The file the attacker downloaded, and the file we archived.
+- `dnstest.py` -- Resolving a name: a crash, and three views that never agreed.
+- `dupetest.py` -- No definition may silently shadow another.
+- `echotest.py` -- `curl ipinfo.io/org` answered with an ELF binary.
+- `environtest.py` -- What does this box say about the processes running on it?
+- `envtest.py` -- The environment, from four directions.
+- `errtest.py` -- set -e, set -u, pipefail and trap -- does the shell stop when told to?
+- `exectest.py` -- How execution fails, and what the box says about it.
+- `failtest.py` -- The wording and exit status of every way a command can fail.
+- `fdtest.py` -- What files does this process have open, and does /proc agree?
+- `fetchtest.py` -- Do curl and wget behave the way a loader expects?
+- `filetest.py` -- Diff the file, archive and encoding commands against real bash, deeply.
+- `fmtest.py` -- findmnt's columns, against the other commands that know the same facts.
+- `fwtest.py` -- The firewall accepted every change and kept none of them.
+- `fwtest2.py` -- The firewall table, and the three commands that read it.
+- `globtest.py` -- Does pathname expansion match the real shell's?
+- `greptest.py` -- grep kept only the last -e.
+- `hardlinktest.py` -- Hard links: the two ways of asking, and only one answered.
+- `heredoctest.py` -- Here-documents: quoted ones were real, and real ones lost their block.
+- `hugetest.py` -- Hugepages: one number, five places that report it.
+- `hwtest.py` -- What hardware does this box say it has?
+- `idtest.py` -- Does the box agree about who you are, who owns what, and what you may do?
+- `idtest2.py` -- Does the box agree with itself about who it is?
+- `inodetest.py` -- How many names does this file have, and what inode is behind them?
+- `iptest.py` -- iproute2's filters and output modes.
+- `jobspectest.py` -- Naming a background job: do %+, %-, %N and %prefix all resolve?
+- `jobtest.py` -- Does the shell know about the jobs it just started?
+- `jrnltest.py` -- journalctl's output modes and filters, against the journal underneath.
+- `killtest.py` -- Killing one process is not stopping the service.
+- `kmsgtest.py` -- Three commands read the kernel's messages. Do they agree?
+- `lateraltest.py` -- Where did they try to go next?
+- `launchtest.py` -- What a process the attacker just started looks like to every reader.
+- `limittest.py` -- ulimit said yes and changed nothing.
+- `limtest.py` -- Do the four things that report resource limits report the same limits?
+- `linktest.py` -- Do the commands that follow a symlink agree about where it goes?
+- `loadertest.py` -- What a downloaded installer script actually meets on the way to running.
+- `localetest.py` -- Does the box agree with itself about what locale it is running in?
+- `loctest.py` -- What encoding is this box in, and which files say so?
+- `logtest.py` -- Do the log surfaces agree with each other and with the rest of the box?
+- `lsargtest.py` -- ls with more than one operand -- order, grouping, and shared columns.
+- `memtest.py` -- Four memory sources, four answers.
+- `modetest.py` -- Do the commands that create files agree about what mode to give them?
+- `modtest.py` -- Do the views of "which kernel modules are loaded" agree with each other?
+- `mounttest.py` -- Does the box agree with itself about what is mounted?
+- `nettest.py` -- Does the box agree about where it is and what it is running?
+- `nettest2.py` -- /dev/tcp: the reverse shell, and what the box says about it.
+- `nicetest.py` -- Process priority: set it and nothing moved.
+- `nsstest.py` -- The name-service databases, and the three things that read them.
+- `nstattest.py` -- How much traffic has this box seen, and who is counting?
+- `nstest.py` -- Am I really root, and am I really on the metal?
+- `opttest.py` -- Does any command still mistake an option's value for its operand?
+- `ordertest.py` -- Redirections apply left to right, and the order changes the answer.
+- `owntest.py` -- Does every binary on this box belong to a package?
+- `pamtest.py` -- Does the box agree with itself that it authenticates anybody?
+- `paramtest.py` -- Parameter expansion, and what happens when one of them fails.
+- `pathtest.py` -- Do the commands that resolve paths agree with each other?
+- `pkgdbtest.py` -- What is installed here, and does the database agree with the tools?
+- `pkgtest.py` -- Does dpkg agree with the filesystem about what it installed?
+- `probesuite.py` -- Honeypot-detection probe suite.
+- `procsubtest.py` -- Process substitution, and the loop that could not see it.
+- `proctest.py` -- Does the box agree with itself about what is running?
+- `psmisctest.py` -- Does every binary the box says it has actually run?
+- `quotetest.py` -- Filenames that need quoting, and the contexts that render them.
+- `rctest.py` -- Do commands *fail* the same way the real ones do?
+- `readtest.py` -- Reading a list, and what a loop exits with.
+- `reconntest.py` -- Does the box tell the same story when the attacker comes back?
+- `rectest.py` -- Which commands actually walk the tree?
+- `redirtest.py` -- Where does the output go?
+- `replaytest.py` -- Replay the fingerprinting probes attackers actually sent, against real Debian.
+- `restest.py` -- Does the box agree about how much of everything it has?
+- `rootcmdtest.py` -- The box's record of who ran what as root.
+- `rottest.py` -- The logs that were rotated away -- can anything read them?
+- `runningtest.py` -- Does the box remember what it is running?
+- `runtest.py` -- systemd-run and the sysv helpers -- scheduling that leaves a trace.
+- `schedtest.py` -- What priority is this process, and does changing it change anything?
+- `scripttest.py` -- From a written file to a running process: chmod, the shebang, and source.
+- `sessiontest.py` -- Does the box agree with itself about who is logged in, and when?
+- `shadowtest.py` -- The hash in /etc/shadow and the password that opens the account.
+- `shelltest.py` -- Diff the shell language itself against real bash.
+- `shoptest.py` -- bash -s: the flag that read as a filename.
+- `signaltest.py` -- Do the two ways to kill a process agree that it died?
+- `sizetest.py` -- How big is this file, and what did it cost the disk?
+- `skeltest.py` -- What does this box give a new account, and does it match the ones on it?
+- `socktest.py` -- Sockets: four tables, four answers.
+- `splittest.py` -- Word splitting: "$@" versus $@ versus "$*", and whether IFS matters.
+- `sshidtest.py` -- What does the box say about its own SSH identity, and about keys?
+- `ssltest.py` -- Does the box agree with itself about hashing, encoding and its CA store?
+- `sstest.py` -- ss's extended columns and filters, against the socket underneath.
+- `stamptest.py` -- File timestamps -- four clocks, not one.
+- `startuptest.py` -- Shell startup files -- /etc/profile, profile.d, ~/.profile, ~/.bashrc.
+- `stocktest.py` -- What does a program we have not implemented say about itself?
+- `stresstest.py` -- Adversarial input: try to hang, crash or exhaust the shell emulator.
+- `sudotest.py` -- What does sudo tell someone probing what they can do?
+- `swaptest.py` -- The disk and the swap: two commands describing another machine.
+- `sysctltest.py` -- Does sysctl agree with /proc/sys?
+- `systemdtest.py` -- Does systemd agree with itself about what starts at boot?
+- `tampertest.py` -- Can an attacker actually replace the system binaries, and do we parse
+- `termtest.py` -- Does the box agree with itself about how big the terminal is?
+- `texttest.py` -- Diff the text-processing tools against real bash, deeply.
+- `timelinetest.py` -- The box's own history: does it hold still, and does it hold together?
+- `timertest.py` -- Units that are not services.
+- `timetest.py` -- Does every clock on the box agree, and does nothing move that shouldn't?
+- `tmrtest.py` -- What is scheduled on this box, when did it last run, and who agrees?
+- `tztest.py` -- What time is it here, where does the box think it is, and who says so?
+- `unittest2.py` -- If you write a unit file, does the box agree the unit exists?
+- `updalttest.py` -- Which program is this name, and does everything that names it agree?
+- `usertest.py` -- The user databases disagreed once anything changed.
+- `vartest.py` -- What kind of variable is this, and who agrees?
+- `vertest.py` -- When the box is asked its own version numbers, do the answers agree?
+- `wheretest.py` -- Where is this program? Do the five ways of asking agree?
