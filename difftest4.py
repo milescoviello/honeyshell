@@ -15,6 +15,7 @@ made every sha*sum raise TypeError.
 Run from ~/opsec/honeypot:  python3 -W ignore difftest4.py
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -60,9 +61,24 @@ def ours(cmd):
     return sh.run(cmd)
 
 
+# Same third bucket as difftest3: hexdump lives in bsdextrautils, which a
+# minimal Debian does not install. Diffing against a host that has no
+# hexdump compares our output to "command not found", which says nothing
+# about the emulator.
+NEEDS = {
+    "hexdump -C f1": ("hexdump",),
+    "hexdump f1": ("hexdump",),
+}
+
+
 def main():
     match = differ = 0
+    skipped = []
     for cmd in CASES:
+        missing = [b for b in NEEDS.get(cmd, ()) if not shutil.which(b)]
+        if missing:
+            skipped.append((cmd, missing))
+            continue
         tmp = tempfile.mkdtemp(prefix="dt4-")
         try:
             open(os.path.join(tmp, "f1"), "w").write(F1)
@@ -90,7 +106,10 @@ def main():
         except Exception as exc:
             differ += 1
             print("  ERROR   $ %s -> %r" % (cmd, exc))
-    print("\n%d/%d match  (%d differ)" % (match, len(CASES), differ))
+    for cmd, missing in skipped:
+        print("  SKIP    $ %-22s host has no %s" % (cmd, ", ".join(missing)))
+    print("\n%d/%d match  (%d differ, %d skipped)"
+          % (match, len(CASES) - len(skipped), differ, len(skipped)))
     return 1 if differ else 0
 
 

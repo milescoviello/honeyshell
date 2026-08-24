@@ -197,6 +197,23 @@ CASES = [
  ("arith in string",    "n=3; echo \"n is $((n*2))\""),
 ]
 
+# One case reads the host's own process table. `ps aux | awk '{print $2}'`
+# prints real PIDs: on a booted machine those are 1 and 2 (init, kthreadd),
+# which happens to equal the persona's first two PIDs, and inside a PID
+# namespace they are 1 and 9, which does not. The case is worth keeping --
+# it drives a three-stage pipe through ps, grep and awk -- but only its
+# shape was ever the emulator's contract, so compare the shape.
+def _pid_shape(t):
+    out = []
+    for ln in t.splitlines():
+        st = ln.strip()
+        out.append(ln if st in ("PID", "") or not st.isdigit() else "<pid>")
+    return "\n".join(out) + ("\n" if t.endswith("\n") else "")
+
+
+SHAPE = {"ps|grep|awk": _pid_shape}
+
+
 def real(snippet, cwd):
     p = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True,
                        cwd=cwd, timeout=15)
@@ -228,6 +245,9 @@ def main():
             got = ours(snip)
         except Exception as exc:                      # noqa: BLE001
             got = "<crash: %r>" % (exc,)
+        _norm = SHAPE.get(name)
+        if _norm:
+            want, got = _norm(want), _norm(got)
         if want == got:
             ok += 1
             if verbose:

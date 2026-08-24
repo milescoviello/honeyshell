@@ -2,7 +2,7 @@
 """Round 3: harder constructs + idioms lifted from real bot payloads."""
 import importlib.util
 import sys
-import os, subprocess
+import os, shutil, subprocess
 # Resolve next to this file, not relative to the caller's cwd: the guest
 # has no repo checkout, so a hardcoded "honeypot/fakeshell.py" meant these
 # could only ever run from the repo root -- and the guest's bash is the
@@ -78,13 +78,32 @@ KNOWN = {
         "`read` does honour IFS (see shelltest)",
 }
 
-bad=[]; known=[]
+# A case whose binary the test host does not have asks the host a question
+# it cannot answer -- nothing about the emulator gets tested, so the result
+# is neither a match nor a difference. It must not go in KNOWN either: KNOWN
+# tolerates a case forever, including on hosts that *do* have the binary,
+# where it would hide a real regression. Runtime-decided third bucket.
+#
+# Both of these resolve wget first in the persona, so a host without wget is
+# answering a different question, not the same one differently. Found when
+# CI moved to a debian:trixie container, which ships neither wget nor curl.
+NEEDS = {
+    "bot: which chain": ("wget",),
+    "bot: multi-stage": ("wget",),
+}
+
+bad=[]; known=[]; skipped=[]
 for name,sc in CASES:
+    missing=[b for b in NEEDS.get(name,()) if not shutil.which(b)]
+    if missing:
+        skipped.append((name,missing)); continue
     ro,re_=run_real(sc); fo,fe=run_fake(sc)
     if ro!=fo or norm(re_)!=norm(fe):
         (known if name in KNOWN else bad).append((name,sc,ro,re_,fo,fe))
-print(f"{len(CASES)-len(bad)}/{len(CASES)} match  ({len(bad)} differ, "
-      f"{len(known)} known)\n")
+print(f"{len(CASES)-len(bad)-len(skipped)}/{len(CASES)} match  "
+      f"({len(bad)} differ, {len(known)} known, {len(skipped)} skipped)\n")
+for name,missing in skipped:
+    print(f"    skip   {name:<22} host has no {', '.join(missing)}")
 for name,sc,ro,re_,fo,fe in bad:
     print(f"--- {name}\n    $ {sc[:70]}")
     print(f"    real out={ro!r} err={norm(re_)[:70]!r}")

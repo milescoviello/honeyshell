@@ -52,10 +52,51 @@ PASS, FAIL = [], []
 # What this box accepts, per ssh_honeypot.REAL_CREDS.
 WORKING = {"root": "123456", "deploy": "deploy123"}
 
-try:
-    import crypt as _crypt
-except ImportError:                                            # py3.13+
-    _crypt = None
+def _load_crypt():
+    """Return a crypt(3) callable taking (phrase, setting), or None.
+
+    Python removed the `crypt` module in 3.13. That mattered more than it
+    looked: 3.13 is what the guest runs *and* what a debian:trixie CI
+    container runs, so the most valuable assertion in this suite -- "the two
+    passwords this box accepts actually verify against the hashes in
+    /etc/shadow" -- stopped running on both of the hosts that matter, and
+    reported itself as a red failure while doing so. A check that is red
+    everywhere teaches you to ignore red.
+
+    Only the stdlib wrapper went away; libcrypt is still installed and still
+    does yescrypt. Bind it directly rather than skipping the check.
+    """
+    try:
+        import crypt as _c                                     # <= 3.12
+        return _c.crypt
+    except ImportError:
+        pass
+    try:
+        import ctypes
+        import ctypes.util
+        lib = ctypes.CDLL(ctypes.util.find_library("crypt")
+                          or "libcrypt.so.1")
+        lib.crypt.restype = ctypes.c_char_p
+        lib.crypt.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+
+        def _crypt_via_ctypes(phrase, setting):
+            r = lib.crypt(phrase.encode(), setting.encode())
+            if not r:
+                raise OSError("crypt(3) rejected setting %r" % setting[:16])
+            out = r.decode()
+            # libxcrypt signals failure with a leading '*' rather than NULL,
+            # and a '*' would compare unequal to the real hash and read as a
+            # verification failure -- i.e. as a bug in the shadow file.
+            if out.startswith("*"):
+                raise OSError("crypt(3) failed on setting %r" % setting[:16])
+            return out
+
+        return _crypt_via_ctypes
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+_crypt_fn = _load_crypt()
 
 
 def shell():
@@ -90,23 +131,23 @@ def hash_of(s, user):
 def t_the_working_credentials_verify():
     """The whole point. Skipped where crypt is unavailable, and the suite
     says so rather than passing quietly."""
-    if _crypt is None:
-        check("crypt module available to verify", False,
-              "no crypt module here; run this suite on a host that has one")
+    if _crypt_fn is None:
+        check("a crypt(3) implementation is reachable", False,
+              "no crypt module and no libcrypt -- cannot verify hashes here")
         return
     s = shell()
     for user, pw in WORKING.items():
         h = hash_of(s, user)
         check("%s hash present" % user, h.startswith("$y$"), h[:20])
-        eq("%s verifies against %r" % (user, pw), _crypt.crypt(pw, h), h)
+        eq("%s verifies against %r" % (user, pw), _crypt_fn(pw, h), h)
 
 
 def t_a_wrong_password_does_not_verify():
-    if _crypt is None:
+    if _crypt_fn is None:
         return
     s = shell()
     h = hash_of(s, "root")
-    check("wrong password rejected", _crypt.crypt("hunter2", h) != h, "")
+    check("wrong password rejected", _crypt_fn("hunter2", h) != h, "")
 
 
 def t_the_format_is_well_formed():

@@ -12,6 +12,18 @@
 #   KNOWN_FAILURES= ./run-suites.sh
 : "${KNOWN_FAILURES=awktest.py}"
 
+# Refuse to run twice at once: the first thing this does is delete
+# __pycache__ out from under anything already importing, and the differential
+# suites each build a temp tree that a concurrent run will race.
+LOCK=/tmp/honeyshell-suites.lock
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK" || exit 1
+  if ! flock -n 9; then
+    echo "refusing: another suite run already holds $LOCK" >&2
+    exit 2
+  fi
+fi
+
 cd "$(dirname "$0")" || exit 1
 rm -rf __pycache__
 n=0; bad=0; known=0

@@ -118,6 +118,19 @@ def ours(cmd):
     return norm(out), "".join(sh._err), sh.last_rc
 
 
+# `ls -U` means "do not sort", so the order is whatever order readdir hands
+# the entries back in -- the filesystem's choice, not ls's and certainly not
+# this emulator's. These two passed on ext4, passed on btrfs, passed on a
+# local overlayfs, and failed on the overlayfs GitHub Actions gives a
+# container. A test that depends on the host's directory hashing is testing
+# the host. The entry *set* is the emulator's contract, so compare that.
+FS_ORDER = {"ls -U d2 d1", "ls -U d1 f1"}
+
+
+def unordered(t):
+    return "\n".join(sorted(t.split("\n")))
+
+
 def main():
     verbose = "-v" in sys.argv
     tmp = tempfile.mkdtemp()
@@ -132,6 +145,8 @@ def main():
             bad += 1
             print("  ERROR   $ %s -> %r" % (cmd, exc))
             continue
+        if cmd in FS_ORDER:
+            ro, oo = unordered(ro), unordered(oo)
         which = ([] + (["stdout"] if ro != oo else [])
                  + (["stderr"] if re_ != oe else [])
                  + (["rc"] if rrc != orc else []))

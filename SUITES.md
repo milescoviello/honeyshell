@@ -56,6 +56,7 @@ Run all:  `./run-suites.sh`
 - `greptest.py` -- grep kept only the last -e.
 - `hardlinktest.py` -- Hard links: the two ways of asking, and only one answered.
 - `heredoctest.py` -- Here-documents: quoted ones were real, and real ones lost their block.
+- `hostassumetest.py` -- Do the differential suites know a host difference from an emulator bug?
 - `hugetest.py` -- Hugepages: one number, five places that report it.
 - `hwtest.py` -- What hardware does this box say it has?
 - `idtest.py` -- Does the box agree about who you are, who owns what, and what you may do?
