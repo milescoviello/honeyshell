@@ -34328,6 +34328,84 @@ class Shell:
     #: sudo's default timestamp_timeout, in seconds.
     _SUDO_TIMEOUT = 15 * 60
 
+    #: What sudo keeps from the caller under `Defaults env_reset` -- Debian's
+    #: compiled-in env_keep list. Anything not here, and not set below, is
+    #: dropped. LC_* is a prefix, handled separately.
+    _SUDO_ENV_KEEP = ("COLORS", "DISPLAY", "HOSTNAME", "KRB5CCNAME",
+                      "LS_COLORS", "PS1", "PS2", "QTDIR", "USERNAME",
+                      "LANG", "LANGUAGE", "LINGUAS", "TERM",
+                      "XAUTHORITY", "XAUTHORIZATION")
+
+    #: Never preserved, not even under -E. Stripping these is the reason
+    #: sudo can be trusted at all: a preserved LD_PRELOAD turns every sudo
+    #: into an arbitrary-code-execution primitive, so real sudo removes them
+    #: unconditionally and an attacker can check that in one command.
+    _SUDO_ENV_NEVER = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+                       "LD_DEBUG", "LD_DEBUG_OUTPUT", "LD_ORIGIN_PATH",
+                       "LD_PROFILE", "IFS", "PERL5LIB", "PERL5OPT",
+                       "PYTHONPATH", "PYTHONHOME", "BASH_ENV", "ENV",
+                       "SHELLOPTS", "BASHOPTS", "GLOBIGNORE", "CDPATH")
+
+    def _sudo_build_env(self, target, caller, preserve, argv):
+        """Rebuild the environment the way /etc/sudoers says it is rebuilt.
+
+        The box publishes that file and it says `Defaults env_reset`. sudo
+        was not doing it: every variable the caller had went straight
+        through, LD_PRELOAD included. Three readers disagreed with one
+        written promise -- env_reset, the -E flag (which was indistinguish-
+        able from not passing it), and the five SUDO_* variables real sudo
+        sets and this one set none of.
+
+        Measured against sudo 1.9.16p2, deploy -> root:
+
+          plain   HOME and MAIL become the TARGET's; USER and LOGNAME become
+                  the target; PATH is secure_path; DISPLAY, LANG, LC_*,
+                  LS_COLORS, PS1 and TERM survive; everything else goes.
+          -E      the caller's HOME, MAIL, PWD, SHLVL and custom variables
+                  survive; USER, LOGNAME and PATH still become the target's.
+          both    LD_PRELOAD is gone, and SUDO_* is set.
+
+        SSH_CONNECTION surviving a sudo is the cheap tell here: it says the
+        environment was never reset without needing LD_PRELOAD at all.
+        """
+        keep = {}
+        if preserve:
+            keep = {k: v for k, v in self.vars.items()}
+        else:
+            for k, v in self.vars.items():
+                if k in self._SUDO_ENV_KEEP or k.startswith("LC_"):
+                    keep[k] = v
+            home = "/root" if target == "root" else "/home/" + target
+            keep["HOME"] = home
+            keep["MAIL"] = ("/var/mail/%s" % target)
+        for k in self._SUDO_ENV_NEVER:
+            keep.pop(k, None)
+        keep["USER"] = keep["LOGNAME"] = target
+        keep["SHELL"] = "/bin/bash"
+        # The same constant /etc/sudoers is written from, so the file and
+        # the behaviour cannot drift. sudopwtest asserts the file still
+        # contains it.
+        keep["PATH"] = PATH_ROOT
+        # sudo describes the caller, not the target, in these.
+        keep["SUDO_USER"] = caller["user"]
+        keep["SUDO_UID"] = str(caller["uid"])
+        keep["SUDO_GID"] = str(caller["gid"])
+        keep["SUDO_HOME"] = caller["home"]
+        cmd = " ".join(argv)
+        if argv and "/" not in argv[0]:
+            full = self.path_lookup(argv[0])
+            if full:
+                cmd = full + cmd[len(argv[0]):]
+        keep["SUDO_COMMAND"] = cmd
+        self.vars.clear()
+        self.vars.update(keep)
+        # sudo builds the child's *environment*, so everything in it is
+        # exported by definition. Setting self.vars alone left SUDO_USER
+        # visible to the shell and invisible to `printenv`, to `env`, and to
+        # any child -- so `sudo sh -c 'echo $SUDO_USER'`, which is how a
+        # script actually reads it, saw nothing.
+        self.exported = set(keep)
+
     def _sudo_authenticate(self, nonint, from_stdin, stdin,
                            target=None, argv=None):
         """True if sudo may proceed; writes sudo's own refusal if not.
@@ -34419,7 +34497,7 @@ class Shell:
         standalone = False
         # -n and -S decide *how* sudo may ask for a password, so they cannot
         # be consumed and forgotten.
-        nonint = from_stdin = False
+        nonint = from_stdin = preserve_env = False
         while i < len(a):
             if a[i] in ("-n", "-S", "-k", "-H", "-E", "-b"):
                 if a[i] in ("-k", "-K"):
@@ -34431,6 +34509,8 @@ class Shell:
                     nonint = True
                 elif a[i] == "-S":
                     from_stdin = True
+                elif a[i] in ("-E", "--preserve-env"):
+                    preserve_env = True
                 i += 1
             elif a[i] in ("-u", "--user") and i + 1 < len(a):
                 target = a[i + 1]
@@ -34519,14 +34599,16 @@ class Shell:
                  command=" ".join(a)[:400])
         self._sudo_auth_log(target, a)
         uid, gid, groups = self._creds_for(target)
-        saved = (self.user, self.uid, self.gid, self.fs,
-                 self.vars.get("USER"), self.vars.get("HOME"),
-                 self.vars.get("LOGNAME"))
+        _caller = {"user": self.user, "uid": self.uid, "gid": self.gid,
+                   "home": self.vars.get(
+                       "HOME", "/root" if self.uid == 0
+                       else "/home/" + self.user)}
+        saved = (self.user, self.uid, self.gid, self.fs, dict(self.vars),
+                 set(self.exported))
         self.user, self.uid, self.gid = target, uid, gid
         self.fs = self.rawfs if uid == 0 else CredFS(self.rawfs, uid, gid,
                                                      groups)
-        self.vars["USER"] = self.vars["LOGNAME"] = target
-        self.vars["HOME"] = "/root" if target == "root" else "/home/" + target
+        self._sudo_build_env(target, _caller, preserve_env, a)
         try:
             # A command sudo cannot find is sudo's error, not the shell's.
             # This fell through to dispatch, which answered
@@ -34551,8 +34633,10 @@ class Shell:
                 return "", 1
             return self.dispatch(a[0], a[1:], stdin)
         finally:
-            (self.user, self.uid, self.gid, self.fs, u, h, lg) = saved
-            self.vars["USER"], self.vars["HOME"], self.vars["LOGNAME"] = u, h, lg
+            (self.user, self.uid, self.gid, self.fs, _env, _exp) = saved
+            self.vars.clear()
+            self.vars.update(_env)
+            self.exported = _exp
 
     def cmd_mktemp(self, a, stdin=""):
         name = "/tmp/tmp.%s" % "".join(random.choice(
