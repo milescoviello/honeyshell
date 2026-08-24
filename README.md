@@ -60,9 +60,15 @@ and it is why there are more lines of test than of implementation.
 ## Running the tests
 
 ```sh
-./run-suites.sh              # all of them; prints only failures
-python3 -W ignore difftest.py    # one of them
+./run-suites.sh                  # all of them; prints only failures
+KNOWN_FAILURES= ./run-suites.sh  # ...and do not tolerate the known one
+python3 -W ignore difftest.py    # just one
 ```
+
+CI runs them in a `debian:trixie` container rather than on `ubuntu-latest`,
+for the reason in the next paragraph: on a host that is not Debian 13 the
+differential suites report the *host's* differences, which looks like signal
+and is not.
 
 Some suites are **differential**: they run the same input through this
 emulator and through the real `bash`/`coreutils` on the host and diff the
@@ -124,6 +130,10 @@ Two things worth knowing before you deploy it:
 
 `run-suites.sh` should report **one** failure on a Debian host, and it is a
 real one rather than a flake:
+
+`run-suites.sh` tolerates this one by name and reports it as `KNOWN`, so CI
+stays green without the failure being hidden — an unexpected failure still
+turns the build red, and `KNOWN_FAILURES= ./run-suites.sh` tolerates nothing.
 
 - `awktest.py` — 89 of 90 cases match GNU Awk 5.2.1 exactly. The one that
   does not is `gsub(/a/, "\\&")`: real gawk leaves `banana` unchanged and

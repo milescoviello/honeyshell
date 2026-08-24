@@ -1,0 +1,39 @@
+name: suites
+
+# The suites run inside a debian:trixie container, not on ubuntu-latest.
+# That is not fussiness: most of them are *differential* -- they run the same
+# input through this emulator and through the host's real bash, coreutils and
+# gawk and diff the output. On a runner that is not Debian 13 they would
+# report the runner's differences rather than the emulator's, which is worse
+# than not running them at all because it looks like signal.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suites:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    steps:
+      - name: Install what the differential suites diff against
+        run: |
+          apt-get update -qq
+          # gawk, not mawk: awktest diffs against GNU awk specifically and
+          # Debian ships mawk by default. procps/psmisc/libcap2-bin are the
+          # packages whose behaviour the coherence suites compare against.
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            python3 gawk coreutils procps psmisc libcap2-bin util-linux \
+            findutils grep sed diffutils file dpkg tzdata git
+      - uses: actions/checkout@v4
+      - name: Report the environment the diffs are against
+        run: |
+          python3 --version
+          awk --version | head -1
+          bash --version | head -1
+          cat /etc/debian_version
+      - name: Run every suite
+        run: ./run-suites.sh
