@@ -7522,6 +7522,11 @@ class VFS:
         if _n is not None and "i" in getattr(_n, "attrs", ()):
             self._write_denied = True
             return False
+        # A file that does not exist yet is governed by its directory. This
+        # is what makes `chattr -R +i /bin` mean anything.
+        if _n is None and self.dir_locked(path):
+            self._write_denied = True
+            return False
         # +a permits appending and refuses everything else. The flag was
         # cosmetic: `echo clobber > logfile` truncated a file the kernel
         # would have protected, which is the one operation append-only
@@ -7587,6 +7592,39 @@ class VFS:
         if path == "/proc/sys/vm/nr_hugepages":
             self._sync_hugepages(data.decode("latin-1", "replace"))
         return True
+
+    def attr_locked(self, path):
+        """True if chattr +i forbids changing this inode at all.
+
+        +i locks the *inode*, not just its contents: the kernel refuses
+        chmod, chown, chgrp, utimes, hard-linking and truncation as well as
+        write and unlink, and refuses them to root too. Only write and
+        unlink honoured it, so `lsattr` called a file immutable while
+        `chmod` and `chown` changed it anyway -- two commands answering one
+        question two different ways, on the precise flag an anti-forensics
+        loader sets and then verifies.
+
+        Measured against the guest: every one of chmod, chown, touch, ln,
+        truncate returns "Operation not permitted" with rc 1 on a +i file.
+        """
+        n = self.nodes.get(path)
+        if n is None:
+            n = self.nodes.get(self.resolve(path))
+        return n is not None and "i" in getattr(n, "attrs", ())
+
+    def dir_locked(self, path):
+        """True if the immutable bit on the parent directory forbids
+        creating, renaming or removing this name.
+
+        `chattr -R +i /bin /usr/bin /sbin /usr/sbin` is the last thing
+        203.0.113.33's miner installer runs, and the whole point of it is
+        that nothing can be added to those directories afterwards. Without
+        this the recursive lock was decorative: the files it had just made
+        immutable could not be replaced, but a new file could be dropped
+        beside them.
+        """
+        parent = path.rsplit("/", 1)[0] or "/"
+        return self.attr_locked(parent)
 
     # Set by remove() when it refuses, so the caller can say why: the
     # kernel returns EPERM for an immutable or append-only file and every
@@ -17990,6 +18028,11 @@ class Shell:
         rc = 0
         for f in files:
             p = VFS.norm(f, self.cwd)
+            if self.fs.attr_locked(p):
+                self.err("touch: cannot touch '%s': "
+                         "Operation not permitted" % f)
+                rc = 1
+                continue
             if self.fs.exists(p):
                 # An existing file gets its mtime bumped. Leaving it alone made
                 # `touch f && stat f` report a timestamp from months ago, and
@@ -18005,7 +18048,10 @@ class Shell:
                 continue
             if not self.fs.write(p, b"", mode=0o666 & ~self.umask,
                                  mtime=when):
-                self.err("touch: cannot touch '%s': No such file or directory" % f)
+                self.err("touch: cannot touch '%s': %s" % (
+                    f, "Operation not permitted"
+                    if getattr(self.fs, "_write_denied", False)
+                    else "No such file or directory"))
                 rc = 1
             else:
                 # A file touch creates is born now whatever -t said, and its
@@ -18165,6 +18211,11 @@ class Shell:
                     or self.fs.nodes.get(self.fs.resolve(p)))
             if node is None:
                 self.err("chmod: cannot access '%s': No such file or directory" % f); return "", 1
+            if self.fs.attr_locked(p):
+                self.err("chmod: changing permissions of '%s': "
+                         "Operation not permitted" % f)
+                rc = 1
+                continue
             if re.fullmatch(r"[0-7]{1,4}", spec):
                 self.fs.chmod(p, int(spec, 8))
             else:
@@ -18694,6 +18745,12 @@ class Shell:
             return "", 0
         if self.fs.isdir(p):
             self.err("ln: %s: hard link not allowed for directory" % src)
+            return "", 1
+        # +i refuses new hard links to the locked inode, and a locked
+        # directory refuses the new name being created inside it.
+        if self.fs.attr_locked(p) or self.fs.dir_locked(q):
+            self.err("ln: failed to create hard link '%s' => '%s': "
+                     "Operation not permitted" % (args[1], src))
             return "", 1
         if not self.fs.hardlink(p, q):
             self.err("ln: failed to access '%s': No such file or directory" % src)
@@ -19384,7 +19441,7 @@ class Shell:
                 return gid
         return None
 
-    def cmd_chown(self, a, stdin=""):
+    def cmd_chown(self, a, stdin="", _tool="chown"):
         args = [x for x in a if not x.startswith("-")]
         if len(args) < 2:
             self.err("chown: missing operand")
@@ -19409,6 +19466,12 @@ class Shell:
                 self.err("chown: cannot access '%s': No such file or directory" % f)
                 rc = 1
                 continue
+            if self.fs.attr_locked(path):
+                self.err("%s: changing %s of '%s': Operation not permitted"
+                         % (_tool,
+                            "group" if _tool == "chgrp" else "ownership", f))
+                rc = 1
+                continue
             # It used to validate the path and then do nothing, so
             # `chown www-data f && ls -l f` still said root.
             node = (self.fs.nodes.get(path)
@@ -19425,7 +19488,8 @@ class Shell:
         # -R has to survive the hand-off, or `chgrp -R` changes one
         # directory while `chown -R` walks the tree.
         flags = [x for x in a if x in ("-R", "--recursive")]
-        return self.cmd_chown(flags + [":" + args[0]] + args[1:], stdin)
+        return self.cmd_chown(flags + [":" + args[0]] + args[1:], stdin,
+                              _tool="chgrp")
 
     def cmd_chcon(self, a, stdin=""):
         return "", 0
@@ -19600,6 +19664,11 @@ class Shell:
             path = VFS.norm(f, self.cwd)
             node = self.fs.nodes.get(path) or self.fs.nodes.get(
                 self.fs.resolve(path))
+            if self.fs.attr_locked(path):
+                self.err("truncate: cannot open '%s' for writing: "
+                         "Operation not permitted" % f)
+                rc = 1
+                continue
             if node is None and no_create:
                 continue
             cur = node_size(node, path) if node is not None else 0

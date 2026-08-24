@@ -61,6 +61,7 @@ Run all:  `./run-suites.sh`
 - `hwtest.py` -- What hardware does this box say it has?
 - `idtest.py` -- Does the box agree about who you are, who owns what, and what you may do?
 - `idtest2.py` -- Does the box agree with itself about who it is?
+- `immutabletest.py` -- chattr said the file was locked -- did every writer believe it?
 - `inodetest.py` -- How many names does this file have, and what inode is behind them?
 - `iptest.py` -- iproute2's filters and output modes.
 - `jobspectest.py` -- Naming a background job: do %+, %-, %N and %prefix all resolve?

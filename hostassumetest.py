@@ -37,6 +37,7 @@ Run from `honeypot/`.
 
 import ast
 import importlib.util
+import io
 import os
 import subprocess
 import sys
@@ -236,34 +237,42 @@ def t_the_gate_runner_is_tracked_and_locks():
 
 
 def t_a_second_runner_refuses():
-    """Behavioural, not textual: hold the lock and confirm it bails out."""
+    """Behavioural, not textual: hold the lock and confirm it bails out.
+
+    The lock is taken here, in-process, rather than by spawning `flock` and
+    hoping it wins the race. If the holder loses, the runner does not refuse
+    -- it *runs*, which means a suite has kicked off a full suite pass from
+    inside itself. Acquiring it first makes that outcome impossible, and if
+    the acquire fails it is because something else already holds it, which is
+    the same condition under test.
+    """
+    import fcntl
+
     p = _runner()
     if p is None:
         check("a second runner refuses", False, "no runner to test")
         return
-    src = open(p, encoding="utf-8").read()
     lock = "/tmp/honeypot-suites.lock"
-    for ln in src.splitlines():
+    for ln in io.open(p, encoding="utf-8"):
         if ln.startswith("LOCK="):
             lock = ln.split("=", 1)[1].strip()
             break
-    holder = subprocess.Popen(
-        ["flock", lock, "-c", "sleep 20"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    fh = io.open(lock, "w")
+    mine = True
     try:
-        # Give flock a moment to actually acquire it.
-        for _ in range(50):
-            r = subprocess.run([p], capture_output=True, text=True, timeout=60)
-            if r.returncode == 2:
-                break
-            if holder.poll() is not None:
-                break
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # Already held -- most likely by the very gate running this suite.
+        mine = False
+    try:
+        r = subprocess.run([p], capture_output=True, text=True, timeout=120)
         check("a second runner exits 2 rather than corrupting the first",
-              r.returncode == 2, "rc=%s out=%r" % (r.returncode,
-                                                   (r.stderr or "")[:80]))
+              r.returncode == 2,
+              "rc=%s err=%r" % (r.returncode, (r.stderr or "")[:90]))
     finally:
-        holder.kill()
-        holder.wait()
+        if mine:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
 
 
 def main():
