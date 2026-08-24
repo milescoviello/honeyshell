@@ -97,6 +97,7 @@ Run all:  `./run-suites.sh`
 - `pathtest.py` -- Do the commands that resolve paths agree with each other?
 - `pkgdbtest.py` -- What is installed here, and does the database agree with the tools?
 - `pkgtest.py` -- Does dpkg agree with the filesystem about what it installed?
+- `pkgverifytest.py` -- The package database and the filesystem: does anything reconcile them?
 - `probesuite.py` -- Honeypot-detection probe suite.
 - `procsubtest.py` -- Process substitution, and the loop that could not see it.
 - `proctest.py` -- Does the box agree with itself about what is running?

@@ -1,6 +1,6 @@
 # honeypot — a Debian 13 shell emulator, and the test suite that proves it
 
-A shell emulator faithful enough to put behind an SSH honeypot, with **141
+A shell emulator faithful enough to put behind an SSH honeypot, with **142
 test suites** that check it against the real thing rather than against
 expectations written by hand.
 
@@ -40,7 +40,7 @@ and it is why there are more lines of test than of implementation.
 |---|---:|
 | Emulator | 36,854 lines |
 | Commands | ~700 |
-| Suites | 141 |
+| Suites | 142 |
 | Test code | 39,400 lines |
 
 ## What is in here
@@ -55,7 +55,7 @@ and it is why there are more lines of test than of implementation.
 | `tzdb.py` | | Timezone data |
 | `skeldb.py` | | `/etc/skel` |
 
-`SUITES.md` lists all 141 suites and the one question each asks.
+`SUITES.md` lists all 142 suites and the one question each asks.
 
 ## Running the tests
 

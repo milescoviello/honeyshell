@@ -4061,11 +4061,38 @@ class VFS:
         # for that source IP again. Silent, permanent, and invisible: the
         # shell kept working perfectly.
         self._baseline_error = None
+        # Paths whose contents have been replaced since the baseline was
+        # built. `dpkg -V` is the only reader: it compares md5sums, so the
+        # question it asks is exactly "was this file written to".
+        #
+        # This is a separate record from the journal on purpose. The journal
+        # is capped and stops recording past the cap, so a file modified late
+        # in a busy session would be absent from it and `dpkg -V` would call
+        # a tampered binary pristine -- the one answer that must never be
+        # wrong here. Paths are cheap; contents are what the cap is for.
+        self.pkg_touched = {}
+        # Paths an attacker deleted. seed_binaries runs from Shell.__init__,
+        # which happens *after* the journal is replayed -- fs_for() builds a
+        # VFS, replays, and only then is a Shell constructed -- and it
+        # recreated any packaged binary that was not currently on disk. So
+        # `rm -f /usr/bin/pgrep` survived until the service restarted or the
+        # per-IP filesystem was evicted, and then the binary was back. Every
+        # anti-forensics script begins by deleting /bin/ps and friends, and
+        # a returning attacker finding them restored learns exactly what we
+        # are. A near-identical bug was fixed once before, in
+        # _drop_merged_usr_twins, for the two-spellings-one-inode case.
+        self.unlinked = set()
+        # Distinct from _replaying, which is also set while replaying the
+        # journal after a restart. A replayed write is a real modification
+        # that happened earlier and must still show up in dpkg -V; a baseline
+        # write is the package's own content and must not.
+        self._seeding = True
         self._replaying = True
         try:
             self._build_baseline()
         finally:
             self._replaying = False
+            self._seeding = False
             self._sealed = True
         # What the seeded tree occupies, so df can price the delta against
         # the figures in _FILESYSTEMS -- those already include the baseline.
@@ -5187,7 +5214,7 @@ class VFS:
                 self.stock_bins.add(name)
                 for d in dirs:
                     path = d + "/" + name
-                    if path in self.nodes:
+                    if path in self.nodes or path in self.unlinked:
                         continue
                     self.nodes[path] = FileNode(
                         mode=0o755, elf=(path, size),
@@ -6616,6 +6643,14 @@ class VFS:
                             node.atime, node.mtime = e[2], e[3]
                             node.ctime = time.time()
                     elif e[0] == "r":
+                        # Record the intent before attempting it. At replay
+                        # time the packaged binaries do not exist yet --
+                        # seed_binaries runs from Shell.__init__, which is
+                        # later -- so remove() bails out before it can note
+                        # the deletion, and the file was then seeded back in.
+                        # The journal entry is the evidence that it was
+                        # deleted, whether or not there is a node to unlink.
+                        self.unlinked.add(e[1])
                         self.remove(e[1], recursive=e[2])
                     # Anything else is from a newer build than this one.
                     # This used to be a bare `else` that removed e[1], so
@@ -7539,6 +7574,8 @@ class VFS:
             if not _new.startswith(_prev):
                 self._write_denied = True
                 return False
+        if not getattr(self, "_seeding", False):
+            self.pkg_touched[path] = True
         # The VFS is byte-oriented, but several callers hand over str. Coerce
         # once here rather than at every call site; latin-1 is lossless 1:1 for
         # bytes, which is the same mapping used for reads.
@@ -7661,6 +7698,7 @@ class VFS:
                 return False
             for k in [k for k in self.nodes if k == path or k.startswith(path + "/")]:
                 del self.nodes[k]
+            self.unlinked.add(path)
             self._record(("r", path, True), len(path))
             return True
         # /bin/ps and /usr/bin/ps are one file reached two ways, so
@@ -7671,6 +7709,7 @@ class VFS:
         for key in [k for k, v in self.nodes.items()
                     if v is node and self.resolve(k) == target]:
             del self.nodes[key]
+        self.unlinked.add(path)
         self._record(("r", path, False), len(path))
         return True
 
@@ -13908,6 +13947,36 @@ class Shell:
         if name in added:
             return added[name][3]
         return self._PKG_FILES.get(name, ())
+
+    def _pkg_bin_hits(self, b):
+        """Where a package's binary actually is.
+
+        Ask the placement rule which directory this belongs in before falling
+        back to a search. Probing sbin first meant any binary that existed in
+        both was reported from /usr/sbin, disagreeing with the .list file
+        written from the same rule.
+
+        Extracted from `dpkg -L` when `dpkg -V` needed the same answer. Two
+        readers deriving one set of paths from two copies of a rule is how
+        they end up disagreeing, which is the whole failure mode this
+        codebase is built against.
+
+        Returns the fallback /usr/bin path when nothing exists, so a caller
+        that cares about existence -- dpkg -V does, to say "missing" -- can
+        test the path it gets back.
+        """
+        if b in self._BIN_AND_SBIN:
+            order = ("/usr/bin/", "/usr/sbin/", "/usr/lib/")
+        elif b in self._SBIN:
+            order = ("/usr/sbin/", "/usr/bin/", "/usr/lib/")
+        else:
+            order = ("/usr/bin/", "/usr/sbin/", "/usr/lib/")
+        hits = [d + b for d in order if self.fs.exists(d + b)]
+        if not hits:
+            return ["/usr/bin/" + b]
+        if b not in self._BIN_AND_SBIN:
+            return hits[:1]
+        return hits
 
     def _owner_of(self, binary):
         added, _removed = self._apt_state()
@@ -33826,22 +33895,7 @@ class Shell:
                 # file that was not there, which `dpkg -L pkg | xargs ls`
                 # shows in one command.
                 for b in self._pkg_file_list(name):
-                    # Ask the placement rule which directory this belongs in
-                    # before falling back to a search. Probing sbin first
-                    # meant any binary that existed in both was reported from
-                    # /usr/sbin, disagreeing with the .list file written from
-                    # the same rule.
-                    if b in self._BIN_AND_SBIN:
-                        order = ("/usr/bin/", "/usr/sbin/", "/usr/lib/")
-                    elif b in self._SBIN:
-                        order = ("/usr/sbin/", "/usr/bin/", "/usr/lib/")
-                    else:
-                        order = ("/usr/bin/", "/usr/sbin/", "/usr/lib/")
-                    hits = [d + b for d in order if self.fs.exists(d + b)]
-                    if not hits:
-                        hits = ["/usr/bin/" + b]
-                    elif b not in self._BIN_AND_SBIN:
-                        hits = hits[:1]
+                    hits = self._pkg_bin_hits(b)
                     paths.extend(hits)
                     # ...and the directory each one sits in, which dpkg lists
                     # beside the files. Skipping this dropped the /usr/bin and
@@ -33902,6 +33956,43 @@ class Shell:
                            .replace("\\n", "\n").replace("\\t", "\t"))
                 out.append(line)
             return "".join(out), 0
+        if has("-V", "--verify"):
+            # dpkg -V verifies md5sums and nothing else: every column except
+            # the third is always '?', which is why a chmod on a packaged file
+            # reports clean here and a rewrite reports ??5??????. Measured on
+            # the guest, including that the exit status stays 0 even when it
+            # finds tampering -- so a script gating on `dpkg -V && ok` learns
+            # nothing, and one reading stdout learns everything.
+            #
+            # This is the command a defender runs after the anti-forensics
+            # sequence 203.0.113.33 ran here: seven packaged binaries
+            # replaced, each chmod 111 and chattr +i. Every neighbouring
+            # action worked -- -l, -S, -s, -L, --audit -- so the box would
+            # say procps owns /usr/bin/ps, list the file and hand over its
+            # md5, while the one action that joins those facts answered
+            # "dpkg: need an action option".
+            wanted = [x for x in args if not x.startswith("-")]
+            if wanted:
+                for w in wanted:
+                    if self._pkg_version(w) is None:
+                        self.err("dpkg: package '%s' is not installed" % w)
+                        return "", 1
+                chosen = wanted
+            else:
+                chosen = [n for n, _v, _a in self._installed_packages()]
+            touched = getattr(self.fs, "pkg_touched", {})
+            rows = set()
+            for name in chosen:
+                for b in self._pkg_file_list(name):
+                    for path in self._pkg_bin_hits(b):
+                        if not self.fs.exists(path):
+                            rows.add((path, "missing"))
+                        elif touched.get(path):
+                            rows.add((path, "??5??????"))
+            # "missing" is 7 characters and "??5??????" is 9; dpkg pads both
+            # into a 12-wide field, so the paths line up under each other.
+            return "".join("%-12s%s\n" % (flag, path)
+                           for path, flag in sorted(rows)), 0
         if has("--audit", "-C"):
             return "", 0
         if has("-i", "--install", "-r", "--remove", "-P", "--purge"):

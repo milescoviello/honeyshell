@@ -34,6 +34,24 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUDGET = 20          # seconds per case
 
+# One case legitimately needs longer, named here rather than raising BUDGET
+# for all of them. Measured: `echo` of a 1MB argument takes ~11s on the
+# development laptop while every other case finishes under 1.1s, so a flat
+# 20s limit was measuring how fast the machine is rather than whether the
+# shell terminates. It passed here and failed on a CI runner about twice as
+# slow. A genuine hang is unbounded, so a bigger budget for one case costs
+# nothing in detection power -- whereas raising it for all 23 would.
+#
+# The 11 seconds is a fidelity problem in its own right, not an acceptable
+# cost, and it is not being hidden here: strip_redirections walks the string
+# one character at a time -- 8.9s of its own time, 37M str.startswith calls
+# across the parse -- and an attacker who pads a command notices an 11s
+# pause. A bulk-copy fast path needs the four out[-1]/out[-2] fd-number
+# checks consolidated first, because they read the *element* structure of
+# the output list and a bulk append changes it, which would quietly alter
+# redirection parsing. Recorded in FINDINGS.md.
+SLOW = {"very long argument": 90}
+
 CASES = [
     ("fork bomb",             ":(){ :|:& };:"),
     ("infinite while",        "while true; do :; done"),
@@ -97,9 +115,10 @@ def main():
     for name, script in CASES:
         with open(payload, "w") as fh:
             json.dump(script, fh)
+        budget = SLOW.get(name, BUDGET)
         try:
             r = subprocess.run([sys.executable, runner, payload],
-                               capture_output=True, text=True, timeout=BUDGET)
+                               capture_output=True, text=True, timeout=budget)
             line = (r.stdout.strip().splitlines() or ["{}"])[-1]
             d = json.loads(line) if line.startswith("{") else {
                 "v": "NO OUTPUT", "e": r.stderr[-70:]}
@@ -110,8 +129,8 @@ def main():
                   % ("ok" if verdict == "ok" else "FAIL", name,
                      d.get("dt", 0), d.get("n", "-"), d.get("e", "")[:44]))
         except subprocess.TimeoutExpired:
-            failed.append((name, "HANG", ">%ds" % BUDGET))
-            print("  FAIL %-24s   >%ds  (killed)" % (name, BUDGET))
+            failed.append((name, "HANG", ">%ds" % budget))
+            print("  FAIL %-24s   >%ds  (killed)" % (name, budget))
     print("\n" + "=" * 58)
     print("passed %d, failed %d" % (len(CASES) - len(failed), len(failed)))
     for f in failed:
