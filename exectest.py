@@ -1,8 +1,9 @@
 r"""How execution fails, and what the box says about it.
 
 Fifty-third coherence sweep. The axis came from the traffic. An operator
-now seen from four addresses (203.0.113.34, 203.0.113.31, 203.0.113.32 and
-203.0.113.42) sends a recon script with a section literally labelled
+now seen from four addresses (203.0.113.34, 203.0.113.31,
+203.0.113.32 and 203.0.113.42) sends a recon script with a
+section literally labelled
 ===SHELL_BEHAVIOR=== which harvests, verbatim:
 
     path_err=     the error for executing a path that does not exist
