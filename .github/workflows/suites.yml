@@ -25,9 +25,13 @@ jobs:
           # gawk, not mawk: awktest diffs against GNU awk specifically and
           # Debian ships mawk by default. procps/psmisc/libcap2-bin are the
           # packages whose behaviour the coherence suites compare against.
+          # ca-certificates is not optional here: a bare debian:trixie image
+          # has no CA store, and with --no-install-recommends `git` does not
+          # pull one in -- so actions/checkout fails with "Problem with the
+          # SSL CA cert" before a single suite runs.
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            python3 gawk coreutils procps psmisc libcap2-bin util-linux \
-            findutils grep sed diffutils file dpkg tzdata git
+            ca-certificates python3 gawk coreutils procps psmisc libcap2-bin \
+            util-linux findutils grep sed diffutils file dpkg tzdata git
       - uses: actions/checkout@v4
       - name: Report the environment the diffs are against
         run: |
