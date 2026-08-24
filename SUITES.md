@@ -107,6 +107,7 @@ Run all:  `./run-suites.sh`
 - `readtest.py` -- Reading a list, and what a loop exits with.
 - `reconntest.py` -- Does the box tell the same story when the attacker comes back?
 - `rectest.py` -- Which commands actually walk the tree?
+- `redirfdtest.py` -- Which file descriptor is that, and does the whole parser agree?
 - `redirtest.py` -- Where does the output go?
 - `replaytest.py` -- Replay the fingerprinting probes attackers actually sent, against real Debian.
 - `restest.py` -- Does the box agree about how much of everything it has?

