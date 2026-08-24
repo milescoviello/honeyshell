@@ -20541,10 +20541,22 @@ class Shell:
             # su would start a shell and read from the tty.
             return "", 0
         # Run it as that user, in their home if this was a login shell.
+        # uid and gid travel with the name. They did not: su set self.user
+        # and rebuilt self.creds, so `id -u` and `whoami` reported the target
+        # while every privilege decision that reads self.uid still saw root.
+        # Six of them do -- sudo, crontab -u, setcap, capsh, pslog and the
+        # shadow tools -- so `su deploy` handed out password-free sudo,
+        # another user's crontab and a full capability set. cmd_sudo has
+        # always set all three together; su was the odd one out.
+        _suid, _sgid = self.uid, self.gid
         saved = (self.user, self.cwd, self.vars.get("HOME"),
                  self.vars.get("USER"), self.vars.get("LOGNAME"))
         try:
             self.user = target
+            try:
+                self.uid, self.gid = self._creds_for(target)[:2]
+            except Exception:                                 # noqa: BLE001
+                pass
             if login:
                 self.cwd = row[5] if self.fs.isdir(row[5]) else "/"
                 self.vars["HOME"] = row[5]
@@ -20572,6 +20584,7 @@ class Shell:
             return pre + out, self.last_rc
         finally:
             self.user, self.cwd = saved[0], saved[1]
+            self.uid, self.gid = _suid, _sgid
             for k, v in zip(("HOME", "USER", "LOGNAME"), saved[2:]):
                 if v is not None:
                     self.vars[k] = v
@@ -34086,7 +34099,7 @@ class Shell:
                 "[-U user]\n"
                 "            [-u user] [command [arg ...]]\n")
 
-    def _sudo_auth_log(self, target, argv, denied=False):
+    def _sudo_auth_log(self, target, argv, denied=False, badpw=False):
         """Write the three lines sudo writes for every invocation.
 
         /etc/sudoers here says `Defaults mail_badpass` and sudo is built
@@ -34117,6 +34130,47 @@ class Shell:
             uid = self._creds_for(self.user)[0] if self.user else 0
             tuid = self._creds_for(target)[0]
             tty = self.vars.get("SSH_TTY", "")
+            if badpw:
+                # A rejected password is four lines, and it was zero: a
+                # successful sudo logged three and a not-in-sudoers refusal
+                # logged one, so the single outcome that leaves no trace was
+                # the one an attacker most wants to know about. Grepping
+                # auth.log after a fumbled sudo and finding nothing is the
+                # tell.
+                #
+                # Message bodies measured on debian:trixie with rsyslog,
+                # sudo 1.9.16p2: logname= and rhost= really are empty, there
+                # are two spaces between "rhost=" and "user=", and it counts
+                # ONE incorrect attempt, not three -- with the password on
+                # stdin there is no second line to read. The framing
+                # (timestamp, host, sudo[pid]) is the guest's, not the
+                # container's, which used rsyslog's RFC3339 template.
+                #
+                # logname= was empty in both measurements, taken under su
+                # and under script; it was not measured over SSH, where it
+                # may well carry the login name.
+                short = tty.replace("/dev/", "")
+                lines = [
+                    "%s %s sudo[%d]: pam_unix(sudo:auth): authentication "
+                    "failure; logname= uid=%d euid=0 tty=%s ruser=%s "
+                    "rhost=  user=%s"
+                    % (stamp, HOST, pid, uid, tty, self.user, self.user),
+                    "%s %s sudo[%d]: pam_unix(sudo:auth): conversation failed"
+                    % (stamp, HOST, pid),
+                    "%s %s sudo[%d]: pam_unix(sudo:auth): auth could not "
+                    "identify password for [%s]" % (stamp, HOST, pid,
+                                                    self.user),
+                    "%s %s sudo[%d]:   %s : 1 incorrect password attempt ; "
+                    "%sPWD=%s ; USER=%s ; COMMAND=%s"
+                    % (stamp, HOST, pid, self.user,
+                       ("TTY=%s ; " % short) if tty else "",
+                       self.cwd, target, cmd[:400]),
+                ]
+                node.content = (self.rawfs.read(path) or b"") + (
+                    "\n".join(lines) + "\n").encode("latin-1", "replace")
+                node.blob = None
+                node.mtime = now
+                return
             if denied:
                 # A refusal is one line, with the reason in place of the
                 # session pair, and three spaces before the user.
@@ -34148,6 +34202,74 @@ class Shell:
             node.ctime = max(node.ctime, node.mtime)
         except Exception:                                     # noqa: BLE001
             pass
+
+    #: The passwords this box actually accepts. sudo has to agree with them
+    #: or the box contradicts itself three ways: /etc/shadow publishes a real
+    #: yescrypt hash of each one, sshd accepts them, and sudo accepted
+    #: *anything* -- a wrong password, an empty one, or none at all -- while
+    #: its own `sudo -l` reported "(ALL : ALL) ALL" with no NOPASSWD tag,
+    #: i.e. that a password was required. An attacker who probes with a
+    #: deliberately bogus password and gets root has learned what this is,
+    #: and that probe costs them one command.
+    #:
+    #: Kept here as plaintext rather than verified against the shadow hash at
+    #: runtime, so the shell never needs libcrypt to let someone in.
+    #: sudopwtest asserts each of these verifies against the hash in
+    #: /etc/shadow, so the two cannot drift.
+    ACCOUNT_PW = {"root": "123456", "deploy": "deploy123"}
+
+    #: sudo's default timestamp_timeout, in seconds.
+    _SUDO_TIMEOUT = 15 * 60
+
+    def _sudo_authenticate(self, nonint, from_stdin, stdin,
+                           target=None, argv=None):
+        """True if sudo may proceed; writes sudo's own refusal if not.
+
+        Measured on Debian 13, sudo 1.9.16p2:
+
+          root                uid 0 is never prompted, and a password piped
+                              in is ignored. Every loader that logs in as
+                              root and runs `echo '123456' | sudo -S sh -c`
+                              depends on this, so that path is untouched.
+          correct via -S      runs, and caches the timestamp
+          wrong or empty -S   "Sorry, try again." then EOF -- so sudo
+                              reports *one* incorrect attempt, not three,
+                              because with -S there is no second line to
+                              read. Guessing three here would be the tell.
+          -n, uncached        "sudo: a password is required"
+          no -S and no tty    "a terminal is required to read the password"
+          cached              proceeds without reading stdin at all, so a
+                              wrong password after a right one is irrelevant
+        """
+        if self.uid == 0:
+            return True
+        if time.time() - getattr(self, "_sudo_ts", 0.0) < self._SUDO_TIMEOUT:
+            return True
+        if nonint:
+            self.err("sudo: a password is required")
+            return False
+        if not from_stdin:
+            self.err("sudo: a terminal is required to read the password; "
+                     "either use the -S option to read from standard input "
+                     "or configure an askpass helper")
+            self.err("sudo: a password is required")
+            return False
+        given = (stdin or "").split("\n", 1)[0]
+        if given and given == self.ACCOUNT_PW.get(self.user):
+            self._sudo_ts = time.time()
+            return True
+        self.err("[sudo] password for %s: Sorry, try again." % self.user)
+        self.err("[sudo] password for %s: " % self.user)
+        self.err("sudo: no password was provided")
+        self.err("sudo: 1 incorrect password attempt")
+        self.log(event="sudo_bad_password", user=self.user)
+        # auth.log too, or the one outcome that leaves no trace is the one
+        # an attacker most wants to check. Only on the command path: the
+        # lines a failed `sudo -l` writes were not measured, and the fourth
+        # line's shape there is different because there is no COMMAND.
+        if argv:
+            self._sudo_auth_log(target or "root", argv, badpw=True)
+        return False
 
     def cmd_sudo(self, a, stdin=""):
         """sudo actually elevates now.
@@ -34188,10 +34310,20 @@ class Shell:
         # timestamp and exit 0 without running anything. Every other option
         # here still needs a command after it.
         standalone = False
+        # -n and -S decide *how* sudo may ask for a password, so they cannot
+        # be consumed and forgotten.
+        nonint = from_stdin = False
         while i < len(a):
             if a[i] in ("-n", "-S", "-k", "-H", "-E", "-b"):
                 if a[i] in ("-k", "-K"):
                     standalone = True
+                    # -k drops the cached timestamp, which is the whole
+                    # reason a script runs it before re-authenticating.
+                    self._sudo_ts = 0.0
+                if a[i] == "-n":
+                    nonint = True
+                elif a[i] == "-S":
+                    from_stdin = True
                 i += 1
             elif a[i] in ("-u", "--user") and i + 1 < len(a):
                 target = a[i + 1]
@@ -34217,12 +34349,40 @@ class Shell:
         # which was right.
         if not a and not standalone:
             return "usage: sudo -h | -K | -k | -V\n", 1
+        # -V and -h are only recognised above, where they have to be the
+        # first argument. Reached here they fell through to the dispatcher,
+        # which answered "sudo: -V: command not found" -- sudo naming its own
+        # option as a missing command, which is the leak rather than the
+        # wrong exit code. Measured: real sudo rejects the combination with
+        # its usage line and rc 1, because -V and -h are exclusive of every
+        # other option.
+        #
+        # Known gap, measured only once so not generalised: `sudo -H -l` is
+        # also a usage error on a real box, and -l is accepted here with any
+        # flag. Establishing which flags -l and -v tolerate needs the whole
+        # exclusivity matrix measured, not one data point extrapolated.
+        if a and a[0] in ("-V", "--version", "-h", "--help"):
+            return "usage: sudo -h | -K | -k | -V\n", 1
+        # -v is a mode too, and unlike -V it tolerates -n: measured,
+        # `sudo -n -v` answers "sudo: a password is required" rather than a
+        # usage error. It was reaching the dispatcher and answering
+        # "sudo: -v: command not found".
+        if a and a[0] in ("-v", "--validate"):
+            if not self._is_sudoer(self.user):
+                self.err("Sorry, user %s may not run sudo on %s."
+                         % (self.user, HOST))
+                return "", 1
+            if not self._sudo_authenticate(nonint, from_stdin, stdin):
+                return "", 1
+            return "", 0
         allowed = self._is_sudoer(self.user)
 
         if a and a[0] == "-l":
             if not allowed:
                 self.err("Sorry, user %s may not run sudo on %s."
                          % (self.user, HOST))
+                return "", 1
+            if not self._sudo_authenticate(nonint, from_stdin, stdin):
                 return "", 1
             return ("Matching Defaults entries for %s on web01:\n"
                     "    env_reset, mail_badpass,\n"
@@ -34243,6 +34403,11 @@ class Shell:
             self._sudo_auth_log(target, a, denied=True)
             return "", 1
 
+        if not self._sudo_authenticate(nonint, from_stdin, stdin,
+                                       target=target, argv=a):
+            self.log(event="sudo_auth_failed", user=self.user,
+                     command=" ".join(a)[:400])
+            return "", 1
         self.log(event="sudo", user=self.user, target=target,
                  command=" ".join(a)[:400])
         self._sudo_auth_log(target, a)

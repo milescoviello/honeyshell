@@ -132,6 +132,7 @@ Run all:  `./run-suites.sh`
 - `startuptest.py` -- Shell startup files -- /etc/profile, profile.d, ~/.profile, ~/.bashrc.
 - `stocktest.py` -- What does a program we have not implemented say about itself?
 - `stresstest.py` -- Adversarial input: try to hang, crash or exhaust the shell emulator.
+- `sudopwtest.py` -- sudo said a password was required, and then took any password at all.
 - `sudotest.py` -- What does sudo tell someone probing what they can do?
 - `swaptest.py` -- The disk and the swap: two commands describing another machine.
 - `sysctltest.py` -- Does sysctl agree with /proc/sys?

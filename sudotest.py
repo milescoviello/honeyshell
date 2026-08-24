@@ -48,6 +48,18 @@ def run(s, cmd):
     return (out + err), s.last_rc
 
 
+def auth(s):
+    """Give a non-root user its password once.
+
+    sudo caches the timestamp for 15 minutes, so every later sudo in the same
+    session runs without asking -- which is what a real box does and what the
+    checks below assume. They used to assume it without authenticating at all,
+    because sudo took any password, including none.
+    """
+    s.run("echo 'deploy123' | sudo -S true")
+    s._err.clear()
+
+
 def check(name, cond, detail=""):
     (PASS if cond else FAIL).append(name)
     if not cond:
@@ -88,13 +100,25 @@ def t_help_is_sudos_usage():
 
 
 def t_validate_says_nothing_when_it_works():
-    """Root needs no password, so -v validates silently and succeeds."""
+    """Root needs no password, so -v validates silently and succeeds.
+
+    deploy does need one. This used to assert that deploy validated silently
+    too -- which is the behaviour sudo has only for uid 0, as the first line
+    of this docstring already said. The assertion contradicted the comment
+    directly above it, and passed because sudo accepted any password at all.
+    """
     out, rc = run(sh(), "sudo -v")
     eq("root: rc", rc, 0)
     eq("root: silent", out, "")
-    out, rc = run(sh("deploy"), "sudo -v")
-    eq("deploy: rc", rc, 0)
-    eq("deploy: silent", out, "")
+    d = sh("deploy")
+    out, rc = run(d, "sudo -n -v")
+    eq("deploy unauthenticated: rc", rc, 1)
+    check("deploy unauthenticated: is asked for a password",
+          "a password is required" in out, out[:70])
+    auth(d)
+    out, rc = run(d, "sudo -v")
+    eq("deploy authenticated: rc", rc, 0)
+    eq("deploy authenticated: silent", out, "")
     out, rc = run(sh("www-data"), "sudo -v")
     eq("www-data: rc", rc, 1)
     check("www-data: refused by name",
@@ -151,10 +175,12 @@ def t_the_privilege_decisions_are_unchanged():
     eq("www-data refused", rc, 1)
     check("with Debian's wording",
           "www-data is not in the sudoers file." in out, out[:70])
-    out, rc = run(sh("deploy"), "sudo id")
+    d = sh("deploy")
+    auth(d)
+    out, rc = run(d, "sudo id")
     eq("deploy elevated", rc, 0)
     check("to root", "uid=0(root)" in out, out[:50])
-    out, _rc = run(sh("deploy"), "sudo -l")
+    out, _rc = run(d, "sudo -l")
     check("and -l says so", "(ALL : ALL) ALL" in out, out[:70])
     out, rc = run(sh("www-data"), "sudo -l")
     eq("www-data -l rc", rc, 1)

@@ -244,7 +244,13 @@ def t_sudo_l_matches_the_sudoers_file():
           R("id -Gn deploy", s)[0])
     check("and %sudo has a rule", "%sudo\tALL=(ALL:ALL) ALL" in body,
           body[-60:])
-    out = R("su - deploy -c 'sudo -l'", s)[0]
+    # deploy's rule has no NOPASSWD tag, so sudo -l wants the password
+    # first -- which is the point of the rule this check is reading. It used
+    # to elevate without one, because sudo accepted anything.
+    err = R("su - deploy -c 'sudo -n -l'", s)[1]
+    check("deploy is asked for a password before -l will list",
+          "a password is required" in err, err[:70])
+    out = R("""su - deploy -c "echo 'deploy123' | sudo -S -l" """, s)[0]
     check("so sudo -l says so for deploy", "(ALL : ALL) ALL" in out,
           out[-60:])
 

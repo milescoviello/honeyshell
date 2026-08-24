@@ -206,6 +206,20 @@ def main():
     d = sh("deploy")
     check("deploy is in the sudo group per id",
           "27(sudo)" in d.run("id"), d.run("id").strip())
+    # deploy's sudoers line carries no NOPASSWD tag, so sudo wants the
+    # password once and then caches it. These checks used to elevate without
+    # supplying one, which passed only because sudo accepted anything --
+    # including, on a real box, nothing at all.
+    #
+    # Two of the checks below were passing for the wrong reason as well: a
+    # *failed* sudo also leaves the caller as deploy with no shadow access,
+    # so "identity is restored after sudo returns" held whether or not sudo
+    # had ever worked.
+    check("deploy is refused before authenticating",
+          d.run("sudo -n whoami").strip() == "", "elevated with no password")
+    d._err.clear()
+    d.run("echo 'deploy123' | sudo -S true")
+    d._err.clear()
     check("sudo elevates for a sudo-group member",
           d.run("sudo whoami").strip() == "root", d.run("sudo whoami").strip())
     check("sudo -u runs as the named user",
