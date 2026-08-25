@@ -154,3 +154,4 @@ Run all:  `./run-suites.sh`
 - `vartest.py` -- What kind of variable is this, and who agrees?
 - `vertest.py` -- When the box is asked its own version numbers, do the answers agree?
 - `wheretest.py` -- Where is this program? Do the five ways of asking agree?
+- `wholefiletest.py` -- Does the box's copy of a file match the box it copies?

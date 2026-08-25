@@ -156,8 +156,18 @@ def main():
     s.run("echo 'echo B_D' > /etc/profile.d/zz-b.sh")
     s.run("echo 'echo C_USER' >> /root/.profile")
     out = sh(v).run_startup_files(login=True).split()
-    check("etc/profile before profile.d before user",
-          out, ["A_PROFILE", "B_D", "C_USER"])
+    # profile.d runs BEFORE the appended marker, because Debian's real
+    # /etc/profile ends with the run-parts loop that sources it -- so a line
+    # appended to the file lands after that loop, not before. Verified
+    # against the host's bash sourcing the real file with the same marker
+    # appended: B_D, then A_PROFILE.
+    #
+    # This expected A_PROFILE first, which was true only while /etc/profile
+    # was a sketch with no loop in it and the shell sourced profile.d
+    # separately. The order was pinned to our own implementation rather than
+    # to the file it imitates.
+    check("profile.d runs from /etc/profile's own loop, then the rest",
+          out, ["B_D", "A_PROFILE", "C_USER"])
 
     # profile.d files run in name order, as the sourcing loop sorts them.
     v = F.VFS()

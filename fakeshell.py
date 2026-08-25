@@ -2625,6 +2625,30 @@ CPU_CACHES = (
 #:
 #: /etc/cron.daily/logrotate is deliberately absent -- the guest has no such
 #: file, because logrotate runs from a systemd timer on trixie.
+#: Whole files, off the guest, because the sketched versions were the
+#: tell. Comparing every /etc file's size against the real box found
+#: thirteen under 35% of the original: sshd_config was 400 bytes against
+#: 3446, sudoers 200 against 1714, bash.bashrc 56 against 1997. The
+#: emulator was built outward from what commands need to READ, so each
+#: file only ever got the lines some command parses -- and nobody had
+#: compared a whole file against the original.
+#:
+#: sshd_config is the sharpest of them: it is what you read to check
+#: PermitRootLogin and PasswordAuthentication, and this is an SSH
+#: honeypot. It is NOT the guest's file verbatim -- the guest is the
+#: management sshd with PasswordAuthentication no, and root/123456
+#: demonstrably works here. Stock Debian structure, persona values: Port
+#: 22, PermitRootLogin yes, PasswordAuthentication yes, and the local
+#: ClientAliveInterval dropped. The other four are the guest's verbatim,
+#: because their contents are stock and their semantics already matched.
+WHOLE_ETC = {
+    '/etc/bash.bashrc': '# System-wide .bashrc file for interactive bash(1) shells.\n\n# To enable the settings / commands in this file for login shells as well,\n# this file has to be sourced in /etc/profile.\n\n# If not running interactively, don\'t do anything\n[ -z "${PS1-}" ] && return\n\n# check the window size after each command and, if necessary,\n# update the values of LINES and COLUMNS.\nshopt -s checkwinsize\n\n# set variable identifying the chroot you work in (used in the prompt below)\nif [ -z "${debian_chroot:-}" ] && [ -r /etc/debian_chroot ]; then\n    debian_chroot=$(< /etc/debian_chroot)\nfi\n\n# set a fancy prompt (non-color, overwrite the one in /etc/profile)\n# but only if not SUDOing and have SUDO_PS1 set; then assume smart user.\nif ! [ -n "${SUDO_USER-}" -a -n "${SUDO_PS1-}" ]; then\n  PS1=\'${debian_chroot:+($debian_chroot)}\\u@\\h:\\w\\$ \'\nfi\n\n# Commented out, don\'t overwrite xterm -T "title" -n "icontitle" by default.\n# If this is an xterm set the title to user@host:dir\n#case "$TERM" in\n#xterm*|rxvt*)\n#    PROMPT_COMMAND=\'echo -ne "\\033]0;${USER}@${HOSTNAME}: ${PWD}\\007"\'\n#    ;;\n#*)\n#    ;;\n#esac\n\n# enable bash completion in interactive shells\n#if ! shopt -oq posix; then\n#  if [ -f /usr/share/bash-completion/bash_completion ]; then\n#    . /usr/share/bash-completion/bash_completion\n#  elif [ -f /etc/bash_completion ]; then\n#    . /etc/bash_completion\n#  fi\n#fi\n\n# if the command-not-found package is installed, use it\nif [ -x /usr/lib/command-not-found -o -x /usr/share/command-not-found/command-not-found ]; then\n\tfunction command_not_found_handle {\n\t        # check because c-n-f could\'ve been removed in the meantime\n                if [ -x /usr/lib/command-not-found ]; then\n\t\t   /usr/lib/command-not-found -- "$1"\n                   return $?\n                elif [ -x /usr/share/command-not-found/command-not-found ]; then\n\t\t   /usr/share/command-not-found/command-not-found -- "$1"\n                   return $?\n\t\telse\n\t\t   printf "%s: command not found\\n" "$1" >&2\n\t\t   return 127\n\t\tfi\n\t}\nfi\n',
+    '/etc/nsswitch.conf': '# /etc/nsswitch.conf\n#\n# Example configuration of GNU Name Service Switch functionality.\n# If you have the `glibc-doc-reference\' and `info\' packages installed, try:\n# `info libc "Name Service Switch"\' for information about this file.\n\npasswd:         files\ngroup:          files\nshadow:         files\ngshadow:        files\n\nhosts:          files myhostname resolve [!UNAVAIL=return] dns\nnetworks:       files\n\nprotocols:      db files\nservices:       db files\nethers:         db files\nrpc:            db files\n\nnetgroup:       nis\n',
+    '/etc/profile': '# /etc/profile: system-wide .profile file for the Bourne shell (sh(1))\n# and Bourne compatible shells (bash(1), ksh(1), ash(1), ...).\n\nif [ "$(id -u)" -eq 0 ]; then\n  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\nelse\n  PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"\nfi\nexport PATH\n\nif [ "${PS1-}" ]; then\n  if [ "${BASH-}" ] && [ "$BASH" != "/bin/sh" ]; then\n    # The file bash.bashrc already sets the default PS1.\n    # PS1=\'\\h:\\w\\$ \'\n    if [ -f /etc/bash.bashrc ]; then\n      . /etc/bash.bashrc\n    fi\n  else\n    if [ "$(id -u)" -eq 0 ]; then\n      PS1=\'# \'\n    else\n      PS1=\'$ \'\n    fi\n  fi\nfi\n\nif [ -d /etc/profile.d ]; then\n  for i in $(run-parts --list --regex \'^[a-zA-Z0-9_][a-zA-Z0-9._-]*\\.sh$\' /etc/profile.d); do\n    if [ -r $i ]; then\n      . $i\n    fi\n  done\n  unset i\nfi\n',
+    '/etc/ssh/sshd_config': '\n# This is the sshd server system-wide configuration file.  See\n# sshd_config(5) for more information.\n\n# This sshd was compiled with PATH=/usr/local/bin:/usr/bin:/bin:/usr/games\n\n# The strategy used for options in the default sshd_config shipped with\n# OpenSSH is to specify options with their default value where\n# possible, but leave them commented.  Uncommented options override the\n# default value.\n\nInclude /etc/ssh/sshd_config.d/*.conf\n\nPort 22\n#AddressFamily any\n#ListenAddress 0.0.0.0\n#ListenAddress ::\n\n#HostKey /etc/ssh/ssh_host_rsa_key\n#HostKey /etc/ssh/ssh_host_ecdsa_key\n#HostKey /etc/ssh/ssh_host_ed25519_key\n\n# Ciphers and keying\n#RekeyLimit default none\n\n# Logging\n#SyslogFacility AUTH\n#LogLevel INFO\n\n# Authentication:\n\n#LoginGraceTime 2m\nPermitRootLogin yes\n#StrictModes yes\n#MaxAuthTries 6\n#MaxSessions 10\n\n#PubkeyAuthentication yes\n\n# Expect .ssh/authorized_keys2 to be disregarded by default in future.\n#AuthorizedKeysFile\t.ssh/authorized_keys .ssh/authorized_keys2\n\n#AuthorizedPrincipalsFile none\n\n#AuthorizedKeysCommand none\n#AuthorizedKeysCommandUser nobody\n\n# For this to work you will also need host keys in /etc/ssh/ssh_known_hosts\n#HostbasedAuthentication no\n# Change to yes if you don\'t trust ~/.ssh/known_hosts for\n# HostbasedAuthentication\n#IgnoreUserKnownHosts no\n# Don\'t read the user\'s ~/.rhosts and ~/.shosts files\n#IgnoreRhosts yes\n\n# To disable tunneled clear text passwords, change to "no" here!\nPasswordAuthentication yes\n#PermitEmptyPasswords no\n\n# Change to "yes" to enable keyboard-interactive authentication.  Depending on\n# the system\'s configuration, this may involve passwords, challenge-response,\n# one-time passwords or some combination of these and other methods.\n# Beware issues with some PAM modules and threads.\nKbdInteractiveAuthentication no\n\n# Kerberos options\n#KerberosAuthentication no\n#KerberosOrLocalPasswd yes\n#KerberosTicketCleanup yes\n#KerberosGetAFSToken no\n\n# GSSAPI options\n#GSSAPIAuthentication no\n#GSSAPICleanupCredentials yes\n#GSSAPIStrictAcceptorCheck yes\n#GSSAPIKeyExchange no\n\n# Set this to \'yes\' to enable PAM authentication, account processing,\n# and session processing. If this is enabled, PAM authentication will\n# be allowed through the KbdInteractiveAuthentication and\n# PasswordAuthentication.  Depending on your PAM configuration,\n# PAM authentication via KbdInteractiveAuthentication may bypass\n# the setting of "PermitRootLogin prohibit-password".\n# If you just want the PAM account and session checks to run without\n# PAM authentication, then enable this but set PasswordAuthentication\n# and KbdInteractiveAuthentication to \'no\'.\nUsePAM yes\n\n#AllowAgentForwarding yes\n#AllowTcpForwarding yes\n#GatewayPorts no\nX11Forwarding yes\n#X11DisplayOffset 10\n#X11UseLocalhost yes\n#PermitTTY yes\nPrintMotd no\n#PrintLastLog yes\n#TCPKeepAlive yes\n#PermitUserEnvironment no\n#Compression delayed\n#ClientAliveInterval 0\n#ClientAliveCountMax 3\n#UseDNS no\n#PidFile /run/sshd.pid\n#MaxStartups 10:30:100\n#PermitTunnel no\n#ChrootDirectory none\n#VersionAddendum none\n\n# no default banner path\n#Banner none\n\n# Allow client to pass locale and color environment variables\nAcceptEnv LANG LC_* COLORTERM NO_COLOR\n\n# override default of no subsystems\nSubsystem\tsftp\t/usr/lib/openssh/sftp-server\n\n# Example of overriding settings on a per-user basis\n#Match User anoncvs\n#\tX11Forwarding no\n#\tAllowTcpForwarding no\n#\tPermitTTY no\n#\tForceCommand cvs server\n',
+    '/etc/sudoers': '#\n# This file MUST be edited with the \'visudo\' command as root.\n#\n# Please consider adding local content in /etc/sudoers.d/ instead of\n# directly modifying this file.\n#\n# See the man page for details on how to write a sudoers file.\n#\nDefaults\tenv_reset\nDefaults\tmail_badpass\nDefaults\tsecure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n\n# This fixes CVE-2005-4890 and possibly breaks some versions of kdesu\n# (#1011624, https://bugs.kde.org/show_bug.cgi?id=452532)\nDefaults\tuse_pty\n\n# This preserves proxy settings from user environments of root\n# equivalent users (group sudo)\n#Defaults:%sudo env_keep += "http_proxy https_proxy ftp_proxy all_proxy no_proxy"\n\n# This allows running arbitrary commands, but so does ALL, and it means\n# different sudoers have their choice of editor respected.\n#Defaults:%sudo env_keep += "EDITOR"\n\n# Completely harmless preservation of a user preference.\n#Defaults:%sudo env_keep += "GREP_COLOR"\n\n# While you shouldn\'t normally run git as root, you need to with etckeeper\n#Defaults:%sudo env_keep += "GIT_AUTHOR_* GIT_COMMITTER_*"\n\n# Per-user preferences; root won\'t have sensible values for them.\n#Defaults:%sudo env_keep += "EMAIL DEBEMAIL DEBFULLNAME"\n\n# "sudo scp" or "sudo rsync" should be able to use your SSH agent.\n#Defaults:%sudo env_keep += "SSH_AGENT_PID SSH_AUTH_SOCK"\n\n# Ditto for GPG agent\n#Defaults:%sudo env_keep += "GPG_AGENT_INFO"\n\n# Host alias specification\n\n# User alias specification\n\n# Cmnd alias specification\n\n# User privilege specification\nroot\tALL=(ALL:ALL) ALL\n\n# Allow members of group sudo to execute any command\n%sudo\tALL=(ALL:ALL) ALL\n\n# See sudoers(5) for more information on "@include" directives:\n\n@includedir /etc/sudoers.d\n',
+}
+
 CRON_SCRIPTS = {
     '/etc/cron.daily/apt-compat': (1750746300, '#!/bin/sh\n\nset -e\n\n# Systemd systems use a systemd timer unit which is preferable to\n# run. We want to randomize the apt update and unattended-upgrade\n# runs as much as possible to avoid hitting the mirrors all at the\n# same time. The systemd time is better at this than the fixed\n# cron.daily time\nif [ -d /run/systemd/system ]; then\n    exit 0\nfi\n\ncheck_power()\n{\n    # laptop check, on_ac_power returns:\n    #       0 (true)    System is on main power\n    #       1 (false)   System is not on main power\n    #       255 (false) Power status could not be determined\n    # Desktop systems always return 255 it seems\n    if command -v on_ac_power >/dev/null; then\n        if on_ac_power; then\n            :\n        elif [ $? -eq 1 ]; then\n            return 1\n        fi\n    fi\n    return 0\n}\n\n# sleep for a random interval of time (default 30min)\n# (some code taken from cron-apt, thanks)\nrandom_sleep()\n{\n    RandomSleep=1800\n    eval $(apt-config shell RandomSleep APT::Periodic::RandomSleep)\n    if [ $RandomSleep -eq 0 ]; then\n\treturn\n    fi\n    if [ -z "$RANDOM" ] ; then\n        # A fix for shells that do not have this bash feature.\n\tRANDOM=$(( $(dd if=/dev/urandom bs=2 count=1 2> /dev/null | cksum | cut -d\' \' -f1) % 32767 ))\n    fi\n    TIME=$(($RANDOM % $RandomSleep))\n    sleep $TIME\n}\n\n# delay the job execution by a random amount of time\nrandom_sleep\n\n# ensure we don\'t do this on battery\ncheck_power || exit 0\n\n# run daily job\nexec /usr/lib/apt/apt.systemd.daily\n'),
     '/etc/cron.daily/dpkg': (1765866300, '#!/bin/sh\n\n# Skip if systemd is running.\nif [ -d /run/systemd/system ]; then\n  exit 0\nfi\n\n/usr/libexec/dpkg/dpkg-db-backup\n'),
@@ -4192,6 +4216,19 @@ class VFS:
         self.nodes["/var/www"].mtime = FS_EPOCH - 31 * 86400 - 22400
         self.nodes["/root/scripts"].mtime = FS_EPOCH - 64 * 86400 - 9100
         self._seed()
+        self._seed_gaps()
+        # Whole files last of all. Not merely after _seed(): /etc/sudoers was
+        # written by _seed() AND again by _seed_gaps(), and the later of the
+        # two won -- so a real file installed in the first was quietly
+        # replaced by the sketch in the second. One file, two writers, and
+        # the wrong one last is the same shape as everything else here.
+        self._install_whole_files()
+        # Captured LAST, once the image is finished. It used to be taken
+        # straight after _seed(), while _seed_gaps() and the whole-file
+        # install still had writes to make -- so any file touched after
+        # that point looked like an attacker's edit, and replacing the
+        # sketched /etc/profile with the real one made every clean login
+        # report persistence.
         # What the startup files looked like in the image. A shell compares
         # against this to tell an attacker's addition from the box's own
         # content -- persistence written with one `echo` is still
@@ -4261,7 +4298,7 @@ class VFS:
             node = self.nodes.get(wdir)
             if node is not None:
                 node.uid = node.gid = 33
-        self._seed_gaps()
+
         self._seed_procsys()
         self._link_layout()
         self._seed_docdirs()
@@ -4767,6 +4804,22 @@ class VFS:
                                          mtime=self._dir_mtime)
                 made += 1
         return made
+
+    def _install_whole_files(self):
+        """Replace the sketched /etc files with the guest's real contents.
+
+        Runs after every other seeding pass, because more than one of them
+        writes the same path and the last writer wins.
+        """
+        for path, body in WHOLE_ETC.items():
+            keep = self.nodes.get(path)
+            data = body.encode("latin-1", "replace")
+            self.nodes[path] = FileNode(
+                data,
+                mode=keep.mode if keep is not None else 0o644,
+                uid=keep.uid if keep is not None else 0,
+                gid=keep.gid if keep is not None else 0,
+                mtime=keep.mtime if keep is not None else BOOT_TS)
 
     def _seed_gaps(self):
         """Files whose absence contradicted something else we already claim.
@@ -11341,7 +11394,32 @@ class Shell:
         # passed through, so `$'a\tb'` came out as the six characters "$a\tb".
         if "$'" in word:
             out2, i2, n2 = [], 0, len(word)
+            # ...but only where the $' is UNQUOTED. `echo 'a$'` contains the
+            # two characters $' at its end, and this scan used to read them
+            # as the start of an ANSI-C string, consume to the next quote and
+            # drop the $. So every single-quoted string ENDING in $ lost it:
+            # `grep -o 'b$'` matched twice instead of once, `tr -d '$'` got an
+            # empty argument and deleted nothing, and Debian's own
+            # /etc/profile -- which ends with
+            #     run-parts --list --regex '...\.sh$' /etc/profile.d
+            # -- called run-parts with no arguments at all on every login
+            # shell. A $ mid-string was fine, which is why the obvious test
+            # cases (`sed 's/x$/y/'`) all passed: their $ is not next to the
+            # closing quote.
+            _q2 = None
             while i2 < n2:
+                _c2 = word[i2]
+                if _q2:
+                    out2.append(_c2)
+                    if _c2 == _q2:
+                        _q2 = None
+                    i2 += 1
+                    continue
+                if _c2 in "'\"" and not word.startswith("$'", i2):
+                    _q2 = _c2
+                    out2.append(_c2)
+                    i2 += 1
+                    continue
                 if word.startswith("$'", i2):
                     j2, buf2 = i2 + 2, []
                     while j2 < n2 and word[j2] != "'":
@@ -34639,9 +34717,14 @@ class Shell:
                 return "", 1
             if not self._sudo_authenticate(nonint, from_stdin, stdin):
                 return "", 1
+            # use_pty is in /etc/sudoers, so it has to be in the list sudo
+            # prints -- the file and the command are two readings of one
+            # configuration. It appeared in the file only when the sketched
+            # sudoers was replaced by the guest's real one.
             return ("Matching Defaults entries for %s on web01:\n"
                     "    env_reset, mail_badpass,\n"
-                    "    secure_path=/usr/local/sbin\\:/usr/local/bin\\:/usr/sbin\\:/usr/bin\\:/sbin\\:/bin\n\n"
+                    "    secure_path=/usr/local/sbin\\:/usr/local/bin\\:/usr/sbin\\:/usr/bin\\:/sbin\\:/bin,\n"
+                    "    use_pty\n\n"
                     "User %s may run the following commands on web01:\n"
                     "    (ALL : ALL) ALL\n" % (self.user, self.user), 0)
         if not a:
@@ -34705,6 +34788,88 @@ class Shell:
             self.vars.clear()
             self.vars.update(_env)
             self.exported = _exp
+
+    def cmd_run_parts(self, a, stdin=""):
+        """run-parts, because /etc/profile calls it on every login shell.
+
+        Debian's /etc/profile ends with
+
+            for i in $(run-parts --list --regex '...\\.sh$' /etc/profile.d)
+
+        and run-parts was declared in debianutils' file list without being
+        implemented, so it fell through to the generic stub and answered with
+        its own version and usage. That went unnoticed for as long as
+        /etc/profile was a sketch that never called it: replacing the sketch
+        with the real file is what exposed the gap. `bash -lc id` printed the
+        uid and then run-parts' usage after it.
+
+        Measured on the guest: --list prints full paths, one per line,
+        sorted; no matches is no output and rc 0; without --regex the
+        default LSB name rule applies; a bad option goes to stderr with
+        rc 1.
+        """
+        import re as _re
+        listing = testing = False
+        regex = None
+        args = []
+        i = 0
+        while i < len(a):
+            x = a[i]
+            if x in ("--list", "-l"):
+                listing = True
+            elif x == "--test":
+                testing = True
+            elif x == "--regex":
+                regex = a[i + 1] if i + 1 < len(a) else ""
+                i += 1
+            elif x.startswith("--regex="):
+                regex = x.split("=", 1)[1]
+            elif x in ("--report", "-v", "--verbose", "--exit-on-error",
+                       "--new-session", "--reverse", "--lsbsysinit"):
+                pass
+            elif x in ("-a", "--arg", "-u", "--umask"):
+                i += 1
+            elif x.startswith("--arg=") or x.startswith("--umask="):
+                pass
+            elif x.startswith("-"):
+                self.err("run-parts: unrecognized option '%s'" % x)
+                self.err("Usage: run-parts [OPTION]... [FILE]...")
+                return "", 1
+            else:
+                args.append(x)
+            i += 1
+        if not args:
+            self.err("run-parts: missing operand")
+            self.err("Usage: run-parts [OPTION]... [FILE]...")
+            return "", 1
+        d = VFS.norm(args[-1], self.cwd)
+        if not self.fs.isdir(d):
+            self.err("run-parts: failed to open directory %s: "
+                     "No such file or directory" % args[-1])
+            return "", 1
+        # Without --regex, run-parts uses the LSB namespace rule: letters,
+        # digits, underscores and hyphens only. That is why a file called
+        # `backup.sh` is skipped by cron and `backup` is not.
+        pat = _re.compile(regex) if regex else _re.compile(r"^[a-zA-Z0-9_-]+$")
+        names = []
+        for nm in sorted(self.fs.listdir(d) or []):
+            if not pat.search(nm) if regex else not pat.match(nm):
+                continue
+            full = d.rstrip("/") + "/" + nm
+            if self.fs.isdir(full):
+                continue
+            names.append(full)
+        if listing or testing:
+            return "".join(n + "\n" for n in names), 0
+        out = []
+        for full in names:
+            node = self.fs.nodes.get(full) or self.fs.nodes.get(
+                self.fs.resolve(full))
+            if node is None or not (getattr(node, "mode", 0) & 0o111):
+                continue
+            body, _rc = self.dispatch(full, [], "")
+            out.append(body)
+        return "".join(out), 0
 
     def cmd_mktemp(self, a, stdin=""):
         name = "/tmp/tmp.%s" % "".join(random.choice(
@@ -37145,7 +37310,8 @@ class Shell:
         and one of the most common things done to a box after a login --
         saw it never run, on a machine that would have run it on every
         shell since. /etc/profile.d/*.sh, the system-wide version of the
-        same trick, was equally inert.
+        same trick, was equally inert -- it is sourced by /etc/profile's own
+        run-parts loop now that that file is the real one.
 
         Anything they added is executed the way bash would execute it, and
         the addition is logged: a startup file that no longer matches the
@@ -37158,12 +37324,13 @@ class Shell:
         files = []
         if login:
             files.append("/etc/profile")
-            try:
-                for nm in sorted(self.fs.listdir("/etc/profile.d") or []):
-                    if nm.endswith(".sh"):
-                        files.append("/etc/profile.d/" + nm)
-            except Exception:                                 # noqa: BLE001
-                pass
+            # /etc/profile.d is NOT listed here. The real /etc/profile ends
+            # with a run-parts loop that sources it, so naming the directory
+            # again sourced everything in it twice -- and in the wrong order,
+            # before /etc/profile's own body rather than after it. This loop
+            # was correct while /etc/profile was a sketch that never sourced
+            # anything; the moment the real file went in, one job had two
+            # mechanisms. The file is the source of truth now.
             for cand in self._PROFILE_CANDIDATES:
                 if self.fs.exists(home + "/" + cand):
                     files.append(home + "/" + cand)
