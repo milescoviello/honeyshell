@@ -77,6 +77,7 @@ Run all:  `./run-suites.sh`
 - `killtest.py` -- Killing one process is not stopping the service.
 - `kmsgtest.py` -- Three commands read the kernel's messages. Do they agree?
 - `lateraltest.py` -- Where did they try to go next?
+- `launchfdtest.py` -- Where a launched process thinks it is, and what it is writing to.
 - `launchtest.py` -- What a process the attacker just started looks like to every reader.
 - `limittest.py` -- ulimit said yes and changed nothing.
 - `limtest.py` -- Do the four things that report resource limits report the same limits?

@@ -6640,7 +6640,13 @@ class VFS:
             interactive = tty != "?" and (comm_of in ("bash", "sh", "dash")
                                           or cmd.lstrip("-") in ("bash", "sh"))
             home = "/root" if user == "root" else "/home/" + user
-            links.append(("cwd", home if interactive else "/"))
+            # proc_meta holds only what this session launched, so it is the
+            # one reliable way to tell an attacker's background job from a
+            # daemon. Tty was the proxy before, and `nohup ./x &` has no
+            # tty and is not a daemon.
+            _own = (getattr(self, "proc_meta", None) or {}).get(pid) or {}
+            links.append(("cwd", _own.get("cwd")
+                          or (home if interactive else "/")))
             for name, target in links:
                 self.nodes[base + "/" + name] = FileNode(
                     mode=0o777, link=target, uid=uid, gid=uid, mtime=proc_start,
@@ -6650,7 +6656,20 @@ class VFS:
             if not kern:
                 dev = "/dev/pts/0" if tty.startswith("pts") else (
                     "/dev/console" if tty != "?" else "/dev/null")
-                if tty == "?":
+                if tty == "?" and _own:
+                    # Launched from this session: stdin on /dev/null and
+                    # stdout/stderr wherever the launch put them -- the
+                    # nohup.out the shell just created, or the redirect
+                    # target the attacker wrote. Not a journal socket, and
+                    # not an inode that appears in no socket table.
+                    _out = _own.get("out")
+                    fds = [("0", "/dev/null", 0o500)]
+                    if _out:
+                        fds += [("1", _out, 0o300), ("2", _out, 0o300)]
+                    else:
+                        fds += [("1", "/dev/null", 0o300),
+                                ("2", "/dev/null", 0o300)]
+                elif tty == "?":
                     # A journald-managed service has stdin on /dev/null and
                     # stdout+stderr on the *same* journal socket, then its
                     # own sockets above that. The shared inode is the part
@@ -6700,12 +6719,20 @@ class VFS:
                     for num, tgt in sorted((self.shell_fds or {}).items()):
                         if num > 2:
                             fds.append((str(num), tgt))
-                for fd, tgt in fds:
+                for _entry in fds:
+                    fd, tgt = _entry[0], _entry[1]
+                    # The permission bits on an fd link are the *open mode*,
+                    # not the target's type: read-only is lr-x, write-only
+                    # l-wx, read-write lrwx. Measured on Debian 13 --
+                    # `nohup ./x &` gives lr-x 0 -> /dev/null and l-wx
+                    # 1 -> nohup.out. Everything here was lrwx, so an
+                    # append-only log looked writable and readable at once.
+                    _fmode = _entry[2] if len(_entry) > 2 else 0o700
                     # 64 is the size Linux reports for every one of these
                     # symlinks; ours said 0. And the timestamp is when the
                     # process started, not when the box booted.
                     node = FileNode(
-                        mode=0o700, link=tgt, uid=uid, gid=uid,
+                        mode=_fmode, link=tgt, uid=uid, gid=uid,
                         mtime=proc_start, ino=self._alloc_ino())
                     self.nodes["%s/fd/%s" % (base, fd)] = node
                     # fdinfo mirrors fd, one file per descriptor. The
@@ -16389,6 +16416,7 @@ class Shell:
             tgt = self.fs.resolve(tgt)
         self.vars["OLDPWD"] = self.cwd
         self.cwd = tgt
+        self._republish_cwd()
         self.vars["PWD"] = tgt
         return (tgt + "\n") if echo else "", 0
 
@@ -18189,6 +18217,7 @@ class Shell:
         argv, comm, exe, script = self._proc_identity(cmd)
         self.fs.procs.append((pid, argv, "?" if background else "pts/0"))
         self._proc_meta(pid, comm, exe, script)
+        self._proc_stdout(pid, cmd)
         if len(self.fs.procs) > 40:
             gone = self.fs.procs.pop(0)
             getattr(self.fs, "proc_meta", {}).pop(gone[0], None)
@@ -18216,7 +18245,56 @@ class Shell:
         if meta is None:
             meta = self.fs.proc_meta = {}
         meta[pid] = {"comm": comm, "exe": exe, "script": script,
-                     "start": time.time(), "ppid": self.shell_pid}
+                     "start": time.time(), "ppid": self.shell_pid,
+                     # Where it was launched from. /proc/<pid>/cwd gave "/"
+                     # to anything without a tty, on the reasoning that
+                     # daemons and kernel threads sit at the root -- which
+                     # is true of daemons and not of `nohup ./x &`, whose
+                     # cwd is the shell's. The emulator contradicted itself
+                     # over it: nohup.out was correctly created in the
+                     # launching directory while cwd said "/".
+                     "cwd": self.cwd}
+
+    _REDIR_OUT = re.compile(r'(?:^|\s)\d?>>?\s*([^\s;&|]+)')
+
+    def _republish_cwd(self):
+        """Keep /proc/<shell>/cwd level with the shell's own idea of it.
+
+        `cd /tmp` moved pwd and left `readlink /proc/$$/cwd` at /root.
+        /proc is rebuilt when the process *table* changes, and a cd does not
+        change it, so the two drifted for the whole session. Retargeting the
+        one link is O(1); a full republish on every cd is not.
+        """
+        for pid in (self.shell_pid,):
+            node = self.fs.nodes.get("/proc/%d/cwd" % pid)
+            if node is not None:
+                node.link = self.cwd
+
+    def _proc_stdout(self, pid, cmd):
+        """Where a launched process's stdout and stderr actually point.
+
+        /proc/<pid>/fd said `socket:[14101]` for both -- the shape of a
+        journald-managed service, which is right for nginx and wrong for
+        anything an attacker starts. Two things made it visible without
+        leaving the box: that inode is in no socket table, so
+        `readlink /proc/<pid>/fd/1` could not be joined against
+        /proc/net/tcp; and nohup had just printed "appending output to
+        'nohup.out'" and created the file, while /proc said the process was
+        writing to a socket.
+        """
+        meta = (getattr(self.fs, "proc_meta", None) or {}).get(pid)
+        if meta is None:
+            return
+        m = None
+        for m in self._REDIR_OUT.finditer(cmd or ""):
+            pass
+        if m:
+            meta["out"] = VFS.norm(m.group(1), self.cwd)
+        elif re.match(r'^\s*nohup\b', cmd or ""):
+            path = VFS.norm("nohup.out", self.cwd)
+            if not self.fs.isdir(os.path.dirname(path) or "/"):
+                path = VFS.norm("nohup.out", self.vars.get("HOME", "/root"))
+            meta["out"] = path
 
     def _ps_ppid(self, row):
         pid = row[1]
