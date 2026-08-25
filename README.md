@@ -1,6 +1,6 @@
 # honeypot — a Debian 13 shell emulator, and the test suite that proves it
 
-A shell emulator faithful enough to put behind an SSH honeypot, with **149
+A shell emulator faithful enough to put behind an SSH honeypot, with **151
 test suites** that check it against the real thing rather than against
 expectations written by hand.
 
@@ -38,16 +38,16 @@ and it is why there are more lines of test than of implementation.
 
 | | |
 |---|---:|
-| Emulator | 36,854 lines |
-| Commands | ~700 |
-| Suites | 149 |
-| Test code | 39,400 lines |
+| Emulator | 37,895 lines |
+| Commands | ~365 |
+| Suites | 151 |
+| Test code | 42,076 lines |
 
 ## What is in here
 
 | File | Lines | Job |
 |---|---:|---|
-| `fakeshell.py` | 36,854 | The emulator: the VFS, the shell language, and every command |
+| `fakeshell.py` | 37,895 | The emulator: the VFS, the shell language, and every command |
 | `awkemu.py` | 1,304 | awk — attackers pipe nearly everything through it |
 | `localedb.py` | 1,164 | Locale data, so `LC_ALL=` actually changes what commands print |
 | `sedemu.py` | 792 | sed |
@@ -55,7 +55,7 @@ and it is why there are more lines of test than of implementation.
 | `tzdb.py` | | Timezone data |
 | `skeldb.py` | | `/etc/skel` |
 
-`SUITES.md` lists all 149 suites and the one question each asks.
+`SUITES.md` lists all 151 suites and the one question each asks.
 
 ## Running the tests
 
@@ -115,6 +115,14 @@ sh = fakeshell.Shell(
 )
 out = sh.run(attacker_input)
 ```
+
+One `VFS` can be shared by several `Shell`s on several threads -- which is
+what an SSH connection carrying multiple channels gives you. Construction is
+serialised and the node table is snapshotted before it is walked. That was
+not true until `concurtest.py` was written: two constructors racing raised
+`RuntimeError: dictionary changed size during iteration`, and even when they
+did not, the block accounting double-counted and `df` drifted upward with
+nothing written.
 
 Two things worth knowing before you deploy it:
 

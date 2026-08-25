@@ -27,6 +27,7 @@ Run all:  `./run-suites.sh`
 - `captest.py` -- The privilege-escalation recon surface, and whether it agrees with itself.
 - `cgrouptest.py` -- cgroup v2: the tree, and the numbers systemd quotes from it.
 - `colortest.py` -- grep's colour, and the terminal signal that decides it.
+- `concurtest.py` -- Several channels on one connection, all touching one filesystem.
 - `cputest.py` -- Does the box describe a CPU that /sys actually contains?
 - `crontamptest.py` -- A wipe, a gutting and an install all logged as cron_install.
 - `crontest.py` -- crontab: one crontab for everyone, and no validation at all.
@@ -103,6 +104,7 @@ Run all:  `./run-suites.sh`
 - `probesuite.py` -- Honeypot-detection probe suite.
 - `procsubtest.py` -- Process substitution, and the loop that could not see it.
 - `proctest.py` -- Does the box agree with itself about what is running?
+- `profiledtest.py` -- What runs at login, and the variable it tests.
 - `psmisctest.py` -- Does every binary the box says it has actually run?
 - `quotectxtest.py` -- Does an operator inside quotes stay inside quotes?
 - `quotetest.py` -- Filenames that need quoting, and the contexts that render them.

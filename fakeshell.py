@@ -21,6 +21,7 @@ import random
 import re
 import shlex
 import struct
+import threading
 import time
 import zlib
 
@@ -2641,6 +2642,22 @@ CPU_CACHES = (
 #: 22, PermitRootLogin yes, PasswordAuthentication yes, and the local
 #: ClientAliveInterval dropped. The other four are the guest's verbatim,
 #: because their contents are stock and their semantics already matched.
+#: The profile.d set, off the guest. /etc/profile sources this directory on
+#: every login shell, and ours held exactly one entry -- a symlink to
+#: /usr/lib/systemd/profile.d/70-systemd-shell-extra.sh whose target did not
+#: exist. So the box sourced a dangling link at every login, and a real
+#: cloud image has three files here.
+#:
+#: These execute. They use ${VAR-} defaults, [ ... -a ... ], the
+#: ${BASH_VERSINFO[0]} array subscript, shopt -q progcomp and
+#: ${XDG_CONFIG_HOME:-$HOME/.config} -- so installing them puts all of that
+#: on the login path, which is how the run-parts gap surfaced in sweep 146.
+PROFILE_D = {
+    '/etc/profile.d/Z99-cloud-locale-test.sh': '#!/bin/sh\n# Copyright (C) 2012, Canonical Group, Ltd.\n#\n# Author: Ben Howard <ben.howard@canonical.com>\n# Author: Scott Moser <scott.moser@ubuntu.com>\n# (c) 2012, Canonical Group, Ltd.\n#\n# This file is part of cloud-init. See LICENSE file for license information.\n \n# Purpose: Detect invalid locale settings and inform the user\n#  of how to fix them.\n\nlocale_warn() {\n    command -v local >/dev/null && local _local="local" ||\n        typeset _local="typeset"\n\n    $_local bad_names="" bad_lcs="" key="" val="" var="" vars="" bad_kv=""\n    $_local w1 w2 w3 w4 remain\n\n    # if shell is zsh, act like sh only for this function (-L).\n    # The behavior change will not permanently affect user\'s shell.\n    [ "${ZSH_NAME+zsh}" = "zsh" ] && emulate -L sh\n\n    # locale is expected to output either:\n    # VARIABLE=\n    # VARIABLE="value"\n    # locale: Cannot set LC_SOMETHING to default locale\n    while read -r w1 w2 w3 w4 remain; do\n        case "$w1" in\n            locale:) bad_names="${bad_names} ${w4}";;\n            *)\n                key=${w1%%=*}\n                val=${w1#*=}\n                val=${val#\\"}\n                val=${val%\\"}\n                vars="${vars} $key=$val";;\n        esac\n    done\n    for bad in $bad_names; do\n        for var in ${vars}; do\n            [ "${bad}" = "${var%=*}" ] || continue\n            val=${var#*=}\n            [ "${bad_lcs#* ${val}}" = "${bad_lcs}" ] &&\n                bad_lcs="${bad_lcs} ${val}"\n            bad_kv="${bad_kv} $bad=$val"\n            break\n        done\n    done\n    bad_lcs=${bad_lcs# }\n    bad_kv=${bad_kv# }\n    [ -n "$bad_lcs" ] || return 0\n\n    printf "_____________________________________________________________________\\n"\n    printf "WARNING! Your environment specifies an invalid locale.\\n"\n    printf " The unknown environment variables are:\\n   %s\\n" "$bad_kv"\n    printf " This can affect your user experience significantly, including the\\n"\n    printf " ability to manage packages. You may install the locales by running:\\n\\n"\n\n    printf " sudo dpkg-reconfigure locales\\n\\n"\n    printf " and select the missing language. Alternatively, you can install the\\n"\n    printf " locales-all package:\\n\\n"\n    printf " sudo apt-get install locales-all\\n\\n"\n    printf "To disable this message for all users, run:\\n"\n    printf "   sudo touch /var/lib/cloud/instance/locale-check.skip\\n"\n    printf "_____________________________________________________________________\\n\\n"\n\n    # only show the message once\n    : > ~/.cloud-locale-test.skip 2>/dev/null || :\n}\n\n[ -f ~/.cloud-locale-test.skip -o -f /var/lib/cloud/instance/locale-check.skip ] ||\n    locale 2>&1 | locale_warn\n\nunset locale_warn\n',
+    '/etc/profile.d/bash_completion.sh': '# shellcheck shell=sh disable=SC1091,SC2166,SC2268,SC3028,SC3044,SC3054\n# Check for interactive bash and that we haven\'t already been sourced.\nif [ "x${BASH_VERSION-}" != x -a "x${PS1-}" != x -a "x${BASH_COMPLETION_VERSINFO-}" = x ]; then\n\n    # Check for recent enough version of bash.\n    if [ "${BASH_VERSINFO[0]}" -gt 4 ] ||\n        [ "${BASH_VERSINFO[0]}" -eq 4 -a "${BASH_VERSINFO[1]}" -ge 2 ]; then\n        [ -r "${XDG_CONFIG_HOME:-$HOME/.config}/bash_completion" ] &&\n            . "${XDG_CONFIG_HOME:-$HOME/.config}/bash_completion"\n        if shopt -q progcomp && [ -r /usr/share/bash-completion/bash_completion ]; then\n            # Source completion code.\n            . /usr/share/bash-completion/bash_completion\n        fi\n    fi\n\nfi\n',
+    '/usr/lib/systemd/profile.d/70-systemd-shell-extra.sh': '# shellcheck shell=sh\n\n#  This file is part of systemd.\n#\n#  systemd is free software; you can redistribute it and/or modify it\n#  under the terms of the GNU Lesser General Public License as published by\n#  the Free Software Foundation; either version 2.1 of the License, or\n#  (at your option) any later version.\n\n# Import the additional shell prompt prefix and suffix strings into $PS1, and\n# show the shell welcome string. These can be provisioned as system or service\n# credentials shell.prompt.prefix, shell.prompt.suffix and shell.welcome, and\n# are propagated into these environment variables by pam_systemd(8).\n\nif [ -n "${SHELL_PROMPT_PREFIX-}" ]; then\n    PS1="$SHELL_PROMPT_PREFIX$PS1"\nfi\n\nif [ -n "${SHELL_PROMPT_SUFFIX-}" ]; then\n    PS1="$PS1$SHELL_PROMPT_SUFFIX"\nfi\n\nif [ -n "${SHELL_WELCOME-}" ]; then\n   printf \'%b\\n\' "$SHELL_WELCOME"\nfi\n',
+}
+
 WHOLE_ETC = {
     '/etc/bash.bashrc': '# System-wide .bashrc file for interactive bash(1) shells.\n\n# To enable the settings / commands in this file for login shells as well,\n# this file has to be sourced in /etc/profile.\n\n# If not running interactively, don\'t do anything\n[ -z "${PS1-}" ] && return\n\n# check the window size after each command and, if necessary,\n# update the values of LINES and COLUMNS.\nshopt -s checkwinsize\n\n# set variable identifying the chroot you work in (used in the prompt below)\nif [ -z "${debian_chroot:-}" ] && [ -r /etc/debian_chroot ]; then\n    debian_chroot=$(< /etc/debian_chroot)\nfi\n\n# set a fancy prompt (non-color, overwrite the one in /etc/profile)\n# but only if not SUDOing and have SUDO_PS1 set; then assume smart user.\nif ! [ -n "${SUDO_USER-}" -a -n "${SUDO_PS1-}" ]; then\n  PS1=\'${debian_chroot:+($debian_chroot)}\\u@\\h:\\w\\$ \'\nfi\n\n# Commented out, don\'t overwrite xterm -T "title" -n "icontitle" by default.\n# If this is an xterm set the title to user@host:dir\n#case "$TERM" in\n#xterm*|rxvt*)\n#    PROMPT_COMMAND=\'echo -ne "\\033]0;${USER}@${HOSTNAME}: ${PWD}\\007"\'\n#    ;;\n#*)\n#    ;;\n#esac\n\n# enable bash completion in interactive shells\n#if ! shopt -oq posix; then\n#  if [ -f /usr/share/bash-completion/bash_completion ]; then\n#    . /usr/share/bash-completion/bash_completion\n#  elif [ -f /etc/bash_completion ]; then\n#    . /etc/bash_completion\n#  fi\n#fi\n\n# if the command-not-found package is installed, use it\nif [ -x /usr/lib/command-not-found -o -x /usr/share/command-not-found/command-not-found ]; then\n\tfunction command_not_found_handle {\n\t        # check because c-n-f could\'ve been removed in the meantime\n                if [ -x /usr/lib/command-not-found ]; then\n\t\t   /usr/lib/command-not-found -- "$1"\n                   return $?\n                elif [ -x /usr/share/command-not-found/command-not-found ]; then\n\t\t   /usr/share/command-not-found/command-not-found -- "$1"\n                   return $?\n\t\telse\n\t\t   printf "%s: command not found\\n" "$1" >&2\n\t\t   return 127\n\t\tfi\n\t}\nfi\n',
     '/etc/nsswitch.conf': '# /etc/nsswitch.conf\n#\n# Example configuration of GNU Name Service Switch functionality.\n# If you have the `glibc-doc-reference\' and `info\' packages installed, try:\n# `info libc "Name Service Switch"\' for information about this file.\n\npasswd:         files\ngroup:          files\nshadow:         files\ngshadow:        files\n\nhosts:          files myhostname resolve [!UNAVAIL=return] dns\nnetworks:       files\n\nprotocols:      db files\nservices:       db files\nethers:         db files\nrpc:            db files\n\nnetgroup:       nis\n',
@@ -4049,6 +4066,20 @@ class VFS:
 
     def __init__(self):
         self.nodes = {}
+        # One SSH connection carries as many channels as the client wants,
+        # and every channel on it shares this VFS. That makes self.nodes
+        # genuinely concurrent: a write from one channel resizes the dict
+        # while another channel walks it. It crashed inside
+        # Shell.__init__ -> absorb_seed -> _alloc_blocks with
+        # "RuntimeError: dictionary changed size during iteration", which
+        # killed the whole session thread -- so the transport went down and
+        # a third exec was logged by the request handler and then never run.
+        # The capture said we ran it; the box had already gone.
+        #
+        # Reproduced at roughly one round in fifteen against a quiet box,
+        # which is why it read as flakiness in chantest for so long. Go
+        # loaders using x/crypto/ssh open exactly this shape.
+        self._nodes_lock = threading.RLock()
         # Who is reading. kernel.kptr_restrict is 1, which means root sees
         # real kernel addresses and everyone else sees zeros -- /proc/modules
         # showed zeros to root, contradicting the sysctl one directory away.
@@ -4159,15 +4190,40 @@ class VFS:
     # Prefixes that live on some other filesystem than /dev/sda1.
     _NOT_ON_ROOT = ("/proc/", "/sys/", "/dev/", "/run/", "/boot/efi/")
 
+    def node_items(self):
+        """A snapshot of the node table, for anything that walks it.
+
+        Iterating self.nodes live races with a write from another channel
+        on the same connection. The cost is one list of references per
+        walk, against a tree of a few thousand nodes -- these callers were
+        already O(n), so this does not change their shape.
+        """
+        with self._nodes_lock:
+            return list(self.nodes.items())
+
+    def node_paths(self):
+        """A snapshot of just the paths. Same reason as node_items()."""
+        with self._nodes_lock:
+            return list(self.nodes)
+
     def absorb_seed(self, inode_mark, block_mark):
-        """Fold whatever was created since the mark into the baseline."""
-        self._base_inodes += self._root_inodes() - inode_mark
-        self._base_blocks += self._alloc_blocks() - block_mark
+        """Fold whatever was created since the mark into the baseline.
+
+        Under the lock because `x += f()` is a read, a call and a write:
+        two channels constructing a Shell at the same time could each read
+        the old _base_blocks and both store their own total, losing one
+        delta entirely. That does not crash -- it just makes df quietly
+        report the wrong number, which is worse, because the whole point of
+        this filesystem is that df, du, stat -f and tune2fs cannot disagree.
+        """
+        with self._nodes_lock:
+            self._base_inodes += self._root_inodes() - inode_mark
+            self._base_blocks += self._alloc_blocks() - block_mark
 
     def _root_inodes(self):
         """Nodes living on /dev/sda1 -- one inode each, same filter as
         _alloc_blocks so df's two halves cannot drift apart."""
-        return sum(1 for path in self.nodes
+        return sum(1 for path in self.node_paths()
                    if not path.startswith(self._NOT_ON_ROOT))
 
     def _alloc_blocks(self):
@@ -4183,7 +4239,7 @@ class VFS:
         append-only journal could never do.
         """
         total = 0
-        for path, node in self.nodes.items():
+        for path, node in self.node_items():
             # Only the root filesystem. /proc, /sys, /dev and the tmpfs
             # mounts are separate filesystems with their own df rows, and
             # counting their generated contents against /dev/sda1 made the
@@ -4237,6 +4293,16 @@ class VFS:
         self._install_whole_files()
         self._install_account_backups()
         self._install_motd_chain()
+        # The profile.d set last: /etc/profile.d/70-systemd-shell-extra.sh is a
+        # symlink installed earlier and its target lives under /usr/lib.
+        for _p, _b in PROFILE_D.items():
+            _d = _p.rsplit("/", 1)[0]
+            if _d not in self.nodes:
+                self.nodes[_d] = FileNode(mode=0o755, uid=0, gid=0,
+                                          is_dir=True, mtime=BOOT_TS)
+            self.nodes[_p] = FileNode(_b.encode("latin-1", "replace"),
+                                      mode=0o644, uid=0, gid=0,
+                                      mtime=BOOT_TS - 40 * 86400)
         # Captured LAST, once the image is finished. It used to be taken
         # straight after _seed(), while _seed_gaps() and the whole-file
         # install still had writes to make -- so any file touched after
@@ -4248,22 +4314,30 @@ class VFS:
         # content -- persistence written with one `echo` is still
         # persistence, and it has to be reported the first time a session
         # runs it.
+        # Read through read(), NOT node.content. The detector that consumes
+        # this baseline calls rawfs.read(), and read() resolves symlinks
+        # while .content does not. /etc/profile.d/70-systemd-shell-extra.sh
+        # is a symlink whose body lives under /usr/lib, so its node carries
+        # b"" -- the baseline recorded "" for it, the session read the real
+        # 800 bytes, the diff was the whole file, and EVERY clean login
+        # reported the box's own systemd snippet as attacker persistence.
+        # Two readers answering "what is in this file" differently is the
+        # same bug this whole emulator exists to avoid, and it appeared
+        # inside the fix for the previous version of it.
         self.startup_baseline = {}
-        for _p in ["/etc/profile", "/root/.bashrc", "/root/.profile",
-                   "/home/deploy/.bashrc", "/home/deploy/.profile"]:
+        _paths = ["/etc/profile", "/root/.bashrc", "/root/.profile",
+                  "/home/deploy/.bashrc", "/home/deploy/.profile"]
+        _paths += [_nm for _nm in self.nodes
+                   if _nm.startswith("/etc/profile.d/") and _nm.endswith(".sh")]
+        for _p in _paths:
             _b = self.nodes.get(_p)
-            if _b is not None and not _b.is_dir:
-                try:
-                    self.startup_baseline[_p] = _b.content.decode("latin-1")
-                except Exception:                             # noqa: BLE001
-                    pass
-        for _nm in list(self.nodes):
-            if _nm.startswith("/etc/profile.d/") and _nm.endswith(".sh"):
-                try:
-                    self.startup_baseline[_nm] = \
-                        self.nodes[_nm].content.decode("latin-1")
-                except Exception:                             # noqa: BLE001
-                    pass
+            if _b is None or _b.is_dir:
+                continue
+            try:
+                self.startup_baseline[_p] = \
+                    (self.read(_p) or b"").decode("latin-1")
+            except Exception:                                 # noqa: BLE001
+                pass
         # Seeding rewrites mtime on plenty of nodes after they are built,
         # and ctime/btime were left where they started -- so /etc/shadow
         # came out with a change time *before* its own modify time, which
@@ -5944,8 +6018,8 @@ class VFS:
                     return head.endswith((".service", ".scope", ".slice"))
             return False
 
-        for k in [k for k in self.nodes if _is_child(k)]:
-            del self.nodes[k]
+        for k in [k for k in self.node_paths() if _is_child(k)]:
+            self.nodes.pop(k, None)
 
         def mkdir(path):
             self.nodes[path] = FileNode(mode=0o555, is_dir=True,
@@ -5995,7 +6069,7 @@ class VFS:
                               for k, v in getattr(self, "proc_meta",
                                                   {}).items()
                               if (v or {}).get("exe")}
-        for k in [k for k in self.nodes
+        for k in [k for k in self.node_paths()
                   if re.match(r"^/proc/\d+(/|$)", k)
                   or k == "/proc/self" or k.startswith("/proc/self/")
                   or k == "/proc/thread-self" or k.startswith("/proc/thread-self/")]:
@@ -6563,7 +6637,7 @@ class VFS:
             # Every name bound to this same inode -- not counting a spelling
             # that is only reachable through the merged-/usr symlinks.
             seen = 0
-            for k, v in self.nodes.items():
+            for k, v in self.node_items():
                 if v is not node:
                     continue
                 if k.startswith(self._USR_ALIASES) and "/usr" + k in self.nodes:
@@ -6572,7 +6646,7 @@ class VFS:
             return seen or 1
         prefix = path.rstrip("/") + "/"
         n = 2
-        for k, v in self.nodes.items():
+        for k, v in self.node_items():
             # `/` rstrips to "" and the prefix becomes "/", so the root
             # matched its own test and counted itself as one of its
             # subdirectories: `stat -c %h /` said 18 against fifteen.
@@ -7886,8 +7960,9 @@ class VFS:
         if self.nodes[path].is_dir:
             if not recursive:
                 return False
-            for k in [k for k in self.nodes if k == path or k.startswith(path + "/")]:
-                del self.nodes[k]
+            for k in [k for k in self.node_paths()
+                      if k == path or k.startswith(path + "/")]:
+                self.nodes.pop(k, None)
             self.unlinked.add(path)
             self._record(("r", path, True), len(path))
             return True
@@ -7896,9 +7971,9 @@ class VFS:
         # reappears the moment anything resolves the other spelling.
         node = self.nodes[path]
         target = self.resolve(path)
-        for key in [k for k, v in self.nodes.items()
+        for key in [k for k, v in self.node_items()
                     if v is node and self.resolve(k) == target]:
-            del self.nodes[key]
+            self.nodes.pop(key, None)
         self.unlinked.add(path)
         self._record(("r", path, False), len(path))
         return True
@@ -7920,7 +7995,7 @@ class VFS:
     def listdir(self, path):
         out = set()
         prefix = path.rstrip("/") + "/"
-        for k in self.nodes:
+        for k in self.node_paths():
             if k == path or not k.startswith(prefix):
                 continue
             rest = k[len(prefix):]
@@ -7971,7 +8046,7 @@ class VFS:
 
     def sync_log_mtimes(self):
         """Make every /var/log file's mtime match its newest entry."""
-        for path, node in self.nodes.items():
+        for path, node in self.node_items():
             if not path.startswith("/var/log/") or node.is_dir or node.link:
                 continue
             ts = self._last_line_ts(node.content or b"")
@@ -11020,6 +11095,36 @@ class Shell:
     def __init__(self, vfs=None, log=None, download=None, user="root",
                  peer=None, peer_port=0, local_port=22, store=None,
                  peer_fails=()):
+        """Serialised against other constructions on the same VFS.
+
+        Every channel of one SSH connection shares a VFS, and this
+        constructor spends 240 lines mutating it -- seed_binaries() adds
+        ~265 stubs, _publish_sockets() and _resync_proc() rebuild /proc,
+        and absorb_seed() at the end prices the delta against a mark taken
+        at the top. Two of these interleaving crashed outright
+        ("dictionary changed size during iteration"), and even when it did
+        not crash the accounting was wrong: thread A's mark predates
+        thread B's seeding, so A absorbs B's blocks and B absorbs them
+        again. Measured, 24 concurrent constructions put _base_blocks
+        between 95938 and 109772 where the sequential answer is 95917 --
+        so df's used figure drifted upward with no one having written
+        anything, which is precisely the self-contradiction this
+        filesystem exists to avoid.
+
+        Serialising costs nothing worth having: constructions are per
+        channel, not per command, and the work is bounded.
+        """
+        lock = getattr(vfs, "_nodes_lock", None)
+        if lock is None:
+            return self._construct(vfs, log, download, user, peer, peer_port,
+                                   local_port, store, peer_fails)
+        with lock:
+            return self._construct(vfs, log, download, user, peer, peer_port,
+                                   local_port, store, peer_fails)
+
+    def _construct(self, vfs=None, log=None, download=None, user="root",
+                   peer=None, peer_port=0, local_port=22, store=None,
+                   peer_fails=()):
         # What this address got wrong on the way in, from the SSH layer.
         # (ts, username, invalid_user, client_port) per rejected attempt.
         self.peer_fails = list(peer_fails or ())
@@ -11141,6 +11246,28 @@ class Shell:
         # literal "(x y z)" and every ${a[@]} came back empty -- a script
         # building a target list in an array looped zero times.
         self.arrays = {}
+        # BASH_VERSINFO, derived from BASH_VERSION so the two cannot drift.
+        # It was absent entirely: `echo ${BASH_VERSINFO[0]}` printed nothing
+        # where the guest prints 5, and `${#BASH_VERSINFO[@]}` gave 0 against
+        # its 6. That is not obscure -- /etc/profile.d/bash_completion.sh,
+        # which this box now sources on every login shell, gates on
+        #     [ "${BASH_VERSINFO[0]}" -gt 4 ] || [ ... -eq 4 -a ... -ge 2 ]
+        # so with the array empty the version check took the wrong branch and
+        # completion was never loaded. Any script testing the bash major
+        # version does the same thing.
+        #
+        # Guest: 5 2 37 1 release x86_64-pc-linux-gnu
+        _bv = self.vars.get("BASH_VERSION", "")
+        _m = re.match(r"(\d+)\.(\d+)\.(\d+)\((\d+)\)-(\w+)", _bv)
+        if _m:
+            self.arrays["BASH_VERSINFO"] = [
+                _m.group(1), _m.group(2), _m.group(3), _m.group(4),
+                _m.group(5), self.vars.get("MACHTYPE", "x86_64-pc-linux-gnu")]
+            # An array assignment sets the scalar view too -- `$a` and `${a}`
+            # both give element 0 -- so seeding self.arrays alone left
+            # `echo $BASH_VERSINFO` empty while `${BASH_VERSINFO[0]}` worked.
+            # Not exported: real bash does not put it in the environment.
+            self.vars["BASH_VERSINFO"] = _m.group(1)
         # One frame per active function call, holding the pre-call value of
         # anything that call declared local.
         self._local_stack = []

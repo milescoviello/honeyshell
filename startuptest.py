@@ -245,6 +245,38 @@ def main():
     check("wc counts the new line",
           s.run("wc -l < /root/.bashrc").strip().isdigit(), True)
 
+    # -- the baseline must agree with the reader that consumes it ----------
+    # _flag_startup_changes() diffs against startup_baseline using
+    # rawfs.read(). The baseline was built from node.content, which does not
+    # resolve symlinks -- and /etc/profile.d/70-systemd-shell-extra.sh is a
+    # symlink into /usr/lib. The baseline held "" for it, every session read
+    # the real 855 bytes, and so every clean login reported the box's own
+    # systemd snippet as attacker persistence.
+    #
+    # Checking "a clean login is quiet" alone would not have caught this
+    # until something happened to install a symlinked startup file, which is
+    # exactly how it got in. This checks the invariant instead: whatever is
+    # in the baseline must equal what the reader returns for it, for every
+    # entry, so any future installer that adds one is covered on arrival.
+    v = F.VFS()
+    disagree = []
+    for path, was in sorted(getattr(v, "startup_baseline", {}).items()):
+        try:
+            now = (v.read(path) or b"").decode("latin-1")
+        except Exception:                                     # noqa: BLE001
+            now = "<unreadable>"
+        if now != was:
+            disagree.append((path, len(was), len(now)))
+    check("baseline agrees with read() for every entry", disagree, [])
+
+    # And the symlinked file specifically, named, so a regression says which.
+    link = "/etc/profile.d/70-systemd-shell-extra.sh"
+    if link in v.nodes:
+        check("symlinked profile.d file is in the baseline",
+              link in v.startup_baseline, True)
+        check("...with the target's body, not the link's empty node",
+              len(v.startup_baseline.get(link, "")) > 100, True)
+
     n = len(FAILS)
     for label, got, want in FAILS:
         print("FAIL %s\n  got  %r\n  want %r" % (label, got, want))
