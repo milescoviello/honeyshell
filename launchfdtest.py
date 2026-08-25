@@ -180,17 +180,12 @@ def main():
         check("...still writing to the same file",
               fdmap(sh2, pid).get("1", ("", ""))[1], "/var/tmp/.q/nohup.out")
 
-    # -- tripwire: socket inodes that no table knows ------------------------
-    # Not fixed here, and deliberately. Every socket:[N] in /proc/*/fd
-    # should be findable in /proc/net/unix or /proc/net/tcp -- that join is
-    # the basis of socket-to-process attribution. The journal sockets are
-    # not, and completing /proc/net/unix from the descriptors turned a
-    # 6-row table into a 45-row one while `ss -xa` and `netstat -x` kept
-    # rendering their own lists, which is a worse disagreement than the one
-    # it fixed. Three readers have to be unified at once; that is its own
-    # sweep. This asserts today's wrong answer so it cannot change silently:
-    # if it fails, either the tables were unified (good -- update this) or
-    # something else moved.
+    # -- every socket descriptor resolves ------------------------------------
+    # This was a tripwire on the wrong answer for one sweep: the journal
+    # sockets were named by 67 descriptors and listed in no table. Fixed by
+    # deriving the connected rows from the descriptors themselves, through
+    # the one list `ss -x` and `netstat -x` also walk. Kept here rather than
+    # moved to socktest because the descriptors are this suite's subject.
     fs, sh = box()
     known = set()
     for line in sh.run("cat /proc/net/tcp").splitlines()[1:]:
@@ -208,9 +203,8 @@ def main():
                              sh.run("ls -l /proc/%d/fd 2>/dev/null" % pid)):
             if m.group(1) not in known:
                 unresolved += 1
-    check("KNOWN GAP: journal socket fds still resolve to no table row",
-          unresolved > 0, True)
-    check("...and it is only the daemons, not anything we launch",
+    check("every socket descriptor resolves to a table row", unresolved, 0)
+    check("...and nothing we launch names a socket at all",
           all(not t.startswith("socket:")
               for _m, t in fdmap(sh, me).values()), True)
 

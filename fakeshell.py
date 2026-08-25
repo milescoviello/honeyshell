@@ -209,6 +209,30 @@ UNIX_SOCKETS = (
 )
 
 
+def unix_rows(fs):
+    """Every unix socket on the box: the named ones, plus the connected ones
+    the process table actually holds descriptors for.
+
+    UNIX_SOCKETS alone described six sockets while /proc/*/fd named 67 more
+    -- one per journald-managed service, which holds a connected stream
+    socket to /run/systemd/journal/stdout. `readlink /proc/701/fd/1` gave
+    socket:[10701] and no table had a row for it, so the join from a
+    descriptor to a socket failed for every daemon on the box. That join is
+    the basis of socket-to-process attribution and the first thing anyone
+    does with an unexpected fd.
+
+    Derived from the descriptors the publisher emitted rather than listed
+    beside them, so the two cannot drift -- and returned from one place, so
+    /proc/net/unix, `ss -x` and `netstat -x` cannot answer differently.
+    Writing the rows straight into /proc/net/unix was tried first and was
+    worse: ss and netstat kept rendering UNIX_SOCKETS and the box then
+    disagreed with itself more loudly than before.
+    """
+    extra = sorted(getattr(fs, "unix_conn", None) or ())
+    return tuple(UNIX_SOCKETS) + tuple(
+        ("STREAM", "CONNECTED", ino, "", 0o600, 0, 0) for ino in extra)
+
+
 def _hex_addr(ip):
     """An IPv4 address as /proc/net/* writes it: little-endian, uppercase.
 
@@ -6094,17 +6118,7 @@ class VFS:
               % (100 + n, _hex_addr(addr), port, ino)
               for n, (addr, port, _p, _pid, _fd, ino)
               in enumerate(UDP_SOCKETS)))
-        w("/proc/net/unix",
-          "Num       RefCount Protocol Flags    Type St Inode Path\n"
-          + "".join(
-              "ffff9a0e%02x: %08d 00000000 %s %04d %02d %d%s\n"
-              % (n + 1, 2 if state == "CONNECTED" else 3,
-                 "00010000" if state == "LISTENING" else "00000000",
-                 1 if typ == "STREAM" else 2,
-                 1 if state == "LISTENING" else 3, ino,
-                 (" " + path) if path else "")
-              for n, (typ, state, ino, path, _m, _u, _g)
-              in enumerate(UNIX_SOCKETS)))
+        self._write_unix_table(w)
         # The socket files themselves. /run/php/php8.4-fpm.sock was seeded as
         # a plain empty file -- `ls -l` showed "-rw-rw----" where every real
         # unix socket shows "s" -- and /run/mysqld and /run/dbus did not
@@ -6552,6 +6566,7 @@ class VFS:
         """
         self.proc_derived = derived or {}
         self.proc_rows = {}
+        _fd_socks = set()
         self.shell_fds = getattr(self, "shell_fds", None) or {}
         self.proc_started = getattr(self, "proc_started", None) or {}
         self.proc_meta_exe = {k: (v or {}).get("exe")
@@ -6734,6 +6749,9 @@ class VFS:
                     node = FileNode(
                         mode=_fmode, link=tgt, uid=uid, gid=uid,
                         mtime=proc_start, ino=self._alloc_ino())
+                    _sm = re.match(r"^socket:\[(\d+)\]$", tgt)
+                    if _sm:
+                        _fd_socks.add(int(_sm.group(1)))
                     self.nodes["%s/fd/%s" % (base, fd)] = node
                     # fdinfo mirrors fd, one file per descriptor. The
                     # directory existed and was empty, so anything walking
@@ -6756,11 +6774,61 @@ class VFS:
         # /proc/self is a symlink to the caller's own directory, which is how
         # anything finds itself. It used to be a plain directory with two empty
         # files in it.
+        # Anything a descriptor named that no other table claims is a
+        # connected unix socket -- which is what a journald peer is.
+        _claimed = {ino for _t, _st, ino, _p, _m, _u, _g in UNIX_SOCKETS}
+        _claimed |= {listener_inode(p) for _a, p, _n, _pi, _f in LISTENERS}
+        _claimed |= {ino for _a, _p, _n, _pi, _f, ino in UDP_SOCKETS}
+        _claimed |= {established_inode(_lport, rport)
+                     for _lp, _lport, _rh, rport, _n, _e, _f
+                     in (getattr(self, "established", ()) or ())}
+        self.unix_conn = sorted(_fd_socks - _claimed)
+        self._write_unix_table()
+
         me = rows[-1][1] if rows else 1
         for nm in ("self", "thread-self"):
             self.nodes["/proc/" + nm] = FileNode(mode=0o777, link=str(me),
                                                  mtime=BOOT_TS,
                                                  ino=self._alloc_ino())
+
+    def _write_unix_table(self, w=None):
+        """Render /proc/net/unix from unix_rows(), which is the same list
+        `ss -x` and `netstat -x` walk. It was rendered from UNIX_SOCKETS
+        here and from UNIX_SOCKETS there, which agreed only because neither
+        knew about the connected sockets the fd table was naming."""
+        body = ("Num       RefCount Protocol Flags    Type St Inode Path\n"
+                + "".join(
+                    # The kernel's own format string is
+                    #   "%pK: %08X %08X %08X %04X %02X %5lu"
+                    # -- a 16-hex-digit pointer and the inode right-aligned
+                    # in five. Ours printed a 10-digit pointer and an
+                    # unpadded inode, so a reader lining up columns against
+                    # a real /proc/net/unix found them one field adrift.
+                    # Measured on the guest: 107 rows, 45 with a path, and
+                    # every connected one at RefCount 3, not 2.
+                    "%016x: %08d 00000000 %s %04d %02d %5d%s\n"
+                    % (0xffff9a0e0000 + ((n + 1) & 0xffff), 3,
+                       "00010000" if state == "LISTENING" else "00000000",
+                       1 if typ == "STREAM" else 2,
+                       1 if state == "LISTENING" else 3, ino,
+                       (" " + path) if path else "")
+                    for n, (typ, state, ino, path, _m, _u, _g)
+                    in enumerate(unix_rows(self))))
+        if w is not None:
+            w("/proc/net/unix", body)
+            return
+        # Straight into the node, not through write(): write() journals, and
+        # a /proc file in the replay journal is both a lie (it is not
+        # attacker state) and a leak (the journal grew by one entry on every
+        # reconnect, for ever). reconntest caught it on the first gate --
+        # "a loaded journal does not grow" is exactly this.
+        node = self.nodes.get("/proc/net/unix")
+        if node is None:
+            self.nodes["/proc/net/unix"] = FileNode(
+                content=body.encode(), mode=0o444, mtime=BOOT_TS,
+                ino=self._alloc_ino())
+        else:
+            node.content = body.encode()
 
     def _unit_of_pid(self, pid, comm, tty):
         """The systemd unit a pid belongs to, or None for a session process.
@@ -31942,7 +32010,7 @@ class Shell:
             out = [] if noheader else [
                 "Netid  State      Recv-Q Send-Q Local Address:Port  "
                 "Peer Address:Port  Process\n"]
-            for _typ, state, ino, path, _m, _u, _g in UNIX_SOCKETS:
+            for _typ, state, ino, path, _m, _u, _g in unix_rows(self.fs):
                 if listening and state != "LISTENING":
                     continue
                 out.append("%-6s %-10s %6d %6d %-19s %-18s\n"
@@ -32172,7 +32240,7 @@ class Shell:
                       "w/o servers"),
                    "Proto RefCnt Flags       Type       State         "
                    "I-Node   Path\n"]
-            for typ, state, ino, path, _m, _u, _g in UNIX_SOCKETS:
+            for typ, state, ino, path, _m, _u, _g in unix_rows(self.fs):
                 if listening and state != "LISTENING":
                     continue
                 if not listening and not show_all and state == "LISTENING":

@@ -165,6 +165,7 @@ Run all:  `./run-suites.sh`
 - `tztest.py` -- What time is it here, where does the box think it is, and who says so?
 - `unittest2.py` -- If you write a unit file, does the box agree the unit exists?
 - `unitverbtest.py` -- What systemctl says when an attacker installs, enables and masks units.
+- `unixsocktest.py` -- One unix socket table, read four ways.
 - `updalttest.py` -- Which program is this name, and does everything that names it agree?
 - `usertest.py` -- The user databases disagreed once anything changed.
 - `usrmergetest.py` -- dpkg does not follow the merged-/usr symlinks, and that is the answer.
