@@ -28,6 +28,7 @@ Run all:  `./run-suites.sh`
 - `cgrouptest.py` -- cgroup v2: the tree, and the numbers systemd quotes from it.
 - `colortest.py` -- grep's colour, and the terminal signal that decides it.
 - `concurtest.py` -- Several channels on one connection, all touching one filesystem.
+- `cpuloadtest.py` -- A process that uses CPU has to use it everywhere.
 - `cputest.py` -- Does the box describe a CPU that /sys actually contains?
 - `crontamptest.py` -- A wipe, a gutting and an install all logged as cron_install.
 - `crontest.py` -- crontab: one crontab for everyone, and no validation at all.
@@ -122,6 +123,7 @@ Run all:  `./run-suites.sh`
 - `redirtest.py` -- Where does the output go?
 - `replaytest.py` -- Replay the fingerprinting probes attackers actually sent, against real Debian.
 - `restest.py` -- Does the box agree about how much of everything it has?
+- `rmpersisttest.py` -- A binary an attacker deleted has to still be gone when they come back.
 - `rootcmdtest.py` -- The box's record of who ran what as root.
 - `rottest.py` -- The logs that were rotated away -- can anything read them?
 - `rotwindowtest.py` -- When did the logs rotate, and does everything that records it agree?
@@ -164,6 +166,7 @@ Run all:  `./run-suites.sh`
 - `unitverbtest.py` -- What systemctl says when an attacker installs, enables and masks units.
 - `updalttest.py` -- Which program is this name, and does everything that names it agree?
 - `usertest.py` -- The user databases disagreed once anything changed.
+- `usrmergetest.py` -- dpkg does not follow the merged-/usr symlinks, and that is the answer.
 - `vartest.py` -- What kind of variable is this, and who agrees?
 - `vertest.py` -- When the box is asked its own version numbers, do the answers agree?
 - `wheretest.py` -- Where is this program? Do the five ways of asking agree?

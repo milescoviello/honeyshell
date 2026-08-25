@@ -242,8 +242,12 @@ def t_dpkg_and_the_filesystem_agree_about_the_ssl_packages():
         o, _ = run(s, "for f in $(dpkg -L %s); do test -e $f || "
                       "echo MISSING $f; done" % pkg)
         eq("every file dpkg -L %s lists exists" % pkg, o.strip(), "")
+    # /usr/sbin, not /usr/bin: that is where ca-certificates installs it and
+    # where `command -v` finds it here. The old basename fallback in dpkg -S
+    # answered for the wrong directory too, so this passed while asking
+    # about a path that does not exist.
     for path in ("/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/openssl.cnf",
-                 "/usr/bin/openssl", "/usr/bin/update-ca-certificates"):
+                 "/usr/bin/openssl", "/usr/sbin/update-ca-certificates"):
         o, rc = run(s, "dpkg -S %s" % path)
         eq("dpkg -S knows %s" % path, rc, 0)
         check("dpkg -S names a package for %s" % path, ": " in o, o[:70])

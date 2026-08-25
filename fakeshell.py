@@ -16,6 +16,7 @@ so all of those behave the way bash does.
 import base64
 import fnmatch
 import hashlib
+import math
 import os
 import random
 import re
@@ -4549,6 +4550,14 @@ class VFS:
         # are. A near-identical bug was fixed once before, in
         # _drop_merged_usr_twins, for the two-spellings-one-inode case.
         self.unlinked = set()
+        # Directories removed whole. `unlinked` holds exact paths, which is
+        # enough for `rm -f /usr/bin/id` -- the seeder skips a path it names.
+        # It is not enough for `rm -rf /usr/bin`: replay tombstones the
+        # directory, the children do not exist yet to be tombstoned
+        # individually, and seed_binaries then puts all 365 of them back.
+        # Deleting a binary one way survived the reconnect and deleting it
+        # the other way did not.
+        self.unlinked_dirs = set()
         # Distinct from _replaying, which is also set while replaying the
         # journal after a restart. A replayed write is a real modification
         # that happened earlier and must still show up in dpkg -V; a baseline
@@ -5913,7 +5922,7 @@ class VFS:
                 self.stock_bins.add(name)
                 for d in dirs:
                     path = d + "/" + name
-                    if path in self.nodes or path in self.unlinked:
+                    if path in self.nodes or self.is_unlinked(path):
                         continue
                     self.nodes[path] = FileNode(
                         mode=0o755, elf=(path, size),
@@ -5944,6 +5953,23 @@ class VFS:
             twin = "/usr" + path
             if twin in self.nodes and self.nodes[twin] is not self.nodes[path]:
                 self.nodes[path] = self.nodes[twin]
+            elif ((self.is_unlinked(twin) or self.is_unlinked(path))
+                    and getattr(self.nodes[path], "elf", None) is not None):
+                # One of the two spellings was deleted and the other is a
+                # baseline node the seeder never touched, so it survived.
+                # Same bug as `rm -f /bin/ps` above, one directory up:
+                # `rm -rf /usr/bin` left /bin/ls in the table, and the shell
+                # then said "command not found" for a file the tree still
+                # listed. Whichever side was removed, both go.
+                #
+                # Stock binaries only. A file the attacker wrote into a
+                # directory they had wiped is under a tombstoned path too,
+                # and the first version of this took it away from them --
+                # `rm -rf /usr/bin; mkdir /usr/bin; cp payload /usr/bin/x`
+                # lost the payload on reconnect, which is worse than the
+                # bug it was fixing.
+                self.nodes.pop(path, None)
+                self.nodes.pop(twin, None)
 
     def _seed_ca_store(self, w):
         def d(path, mode=0o755):
@@ -6746,6 +6772,9 @@ class VFS:
             except ValueError:
                 _cpu_secs = 0
                 break
+        _live = self.proc_cpu_secs(pid)
+        if _live is not None:
+            _cpu_secs = int(_live)
         _ticks = _cpu_secs * 100
         _utime = _ticks * 7 // 10
         _stime = _ticks - _utime
@@ -7469,6 +7498,13 @@ class VFS:
                         # The journal entry is the evidence that it was
                         # deleted, whether or not there is a node to unlink.
                         self.unlinked.add(e[1])
+                        twin = self.usr_twin(e[1])
+                        if twin:
+                            self.unlinked.add(twin)
+                        if e[2]:
+                            self.unlinked_dirs.add(e[1])
+                            if twin:
+                                self.unlinked_dirs.add(twin)
                         self.remove(e[1], recursive=e[2])
                     # Anything else is from a newer build than this one.
                     # This used to be a bare `else` that removed e[1], so
@@ -7555,6 +7591,55 @@ class VFS:
         rows = getattr(self, "proc_rows", None) or {}
         return (max(rows) + 3) if rows else 1
 
+    def proc_cpu_rate(self, pid):
+        """What fraction of a core this process is using.
+
+        One number, because ps, /proc/<pid>/stat, /proc/<pid>/schedstat,
+        top and loadavg were each inventing their own. A miner launched
+        here showed 94.3% in ps, zero ticks in /proc, zero nanoseconds in
+        schedstat, and a box reporting 98.9% idle at load 0.03 -- in the
+        same second. Whoever installed it reads all five.
+        """
+        meta = (getattr(self, "proc_meta", None) or {}).get(pid) or {}
+        try:
+            return float(meta.get("rate") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def proc_cpu_secs(self, pid):
+        """Seconds of CPU this process has used, now. None if not ours.
+
+        Recomputed rather than stored: proc_rows is a snapshot taken when
+        the table last changed, so /proc/<pid>/stat was frozen at launch
+        while ps went on counting. After an hour ps said 00:56:24 and
+        /proc said 0 -- and the docstring one screen up already says a
+        frozen /proc/<pid>/stat is as good as a confession.
+        """
+        meta = (getattr(self, "proc_meta", None) or {}).get(pid) or {}
+        began = meta.get("start")
+        if not began:
+            return None
+        return max(0.0, (time.time() - began) * self.proc_cpu_rate(pid))
+
+    def _live_pids(self):
+        return [r[0] for r in (getattr(self, "procs", None) or []) if r]
+
+    def attacker_cpu(self):
+        """(cores in use, oldest start) across everything still running.
+
+        Only processes the attacker started: the stock table's CPU times are
+        fixed totals from before the box was handed to us, and adding them
+        to the load would make an idle box report a load of forty.
+        """
+        rates, began = 0.0, None
+        meta = getattr(self, "proc_meta", None) or {}
+        for pid in self._live_pids():
+            rates += self.proc_cpu_rate(pid)
+            st = (meta.get(pid) or {}).get("start")
+            if st and (began is None or st < began):
+                began = st
+        return rates, began
+
     def loadavg(self):
         """One load average per command.
 
@@ -7567,9 +7652,20 @@ class VFS:
         if cache:
             return cache
         t = time.time()
-        val = (0.02 + (int(t) % 3) / 100.0,
+        val = [0.02 + (int(t) % 3) / 100.0,
                0.04 + (int(t / 7) % 3) / 100.0,
-               0.01 + (int(t / 11) % 2) / 100.0)
+               0.01 + (int(t / 11) % 2) / 100.0]
+        # A process pegging a core has to show up here. The three averages
+        # are exponentially weighted over 1, 5 and 15 minutes, so a miner
+        # started a minute ago lifts the first number and barely moves the
+        # third -- which is also what a real box looks like just after one
+        # lands, and what it looks like an hour later.
+        cores, began = self.attacker_cpu()
+        if cores > 0 and began:
+            age = max(0.0, t - began)
+            for i, tau in enumerate((60.0, 300.0, 900.0)):
+                val[i] = round(val[i] + cores * (1.0 - math.exp(-age / tau)), 2)
+        val = tuple(round(v, 2) for v in val)
         self._load_cache = val
         return val
 
@@ -7794,6 +7890,25 @@ class VFS:
                 for i, v in enumerate(vals):
                     tot[i] += v
                 lines.append("cpu%d %s" % (c, " ".join(str(v) for v in vals)))
+            # Whatever the attacker's processes have burned, charged to
+            # cpu0. Split 70/30 the same way /proc/<pid>/stat splits it, and
+            # taken off idle, so `head -1 /proc/stat` sampled twice shows the
+            # same work the process's own utime does. Left out, an hour of a
+            # miner at 94% moved nothing here at all.
+            _extra = sum(self.proc_cpu_secs(p) or 0.0
+                         for p in self._live_pids())
+            if _extra > 0 and lines:
+                _ej = int(_extra * 100)
+                _eu, _es = _ej * 7 // 10, _ej - _ej * 7 // 10
+                _v = lines[0].split()
+                _c0 = [int(x) for x in _v[1:]]
+                _c0[0] += _eu
+                _c0[2] += _es
+                _c0[3] = max(0, _c0[3] - _ej)
+                lines[0] = "cpu0 %s" % " ".join(str(x) for x in _c0)
+                tot[0] += _eu
+                tot[2] += _es
+                tot[3] = max(0, tot[3] - _ej)
             head = "cpu  %s" % " ".join(str(v) for v in tot)
             return ("%s\n%s\n"
                     "intr %d %d 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 %d 0 0 0 0 0\n"
@@ -8527,10 +8642,25 @@ class VFS:
         if self.nodes[path].is_dir:
             if not recursive:
                 return False
-            for k in [k for k in self.node_paths()
-                      if k == path or k.startswith(path + "/")]:
+            victims = [k for k in self.node_paths()
+                       if k == path or k.startswith(path + "/")]
+            # Hold references while we look for twins: /bin/ls and
+            # /usr/bin/ls are one FileNode under two keys, and popping only
+            # the keys under this directory left the other spelling in the
+            # table. `rm -rf /usr/bin` then produced a tree that still
+            # listed /bin/ls next to a shell saying command not found --
+            # the same contradiction _drop_merged_usr_twins fixes for
+            # `rm -f /bin/ps`, one directory up.
+            doomed = [self.nodes[k] for k in victims if k in self.nodes]
+            marked = {id(n) for n in doomed}
+            for k in victims:
                 self.nodes.pop(k, None)
+            for k, v in self.node_items():
+                if id(v) in marked:
+                    self.nodes.pop(k, None)
+                    self.unlinked.add(k)
             self.unlinked.add(path)
+            self.unlinked_dirs.add(path)
             self._record(("r", path, True), len(path))
             return True
         # /bin/ps and /usr/bin/ps are one file reached two ways, so
@@ -8541,9 +8671,52 @@ class VFS:
         for key in [k for k, v in self.node_items()
                     if v is node and self.resolve(k) == target]:
             self.nodes.pop(key, None)
+        # Deleting a directory symlink deletes the way in, not what it
+        # points at: `rm -rf /bin` on the guest leaves 259 files in
+        # /usr/bin and makes /bin/ls "No such file or directory". The keys
+        # under the link are literal entries in this table, so they stayed
+        # resolvable -- /bin was gone and `ls -l /bin/ls` still answered,
+        # which no real box can do.
+        if node.link is not None:
+            for key in [k for k in self.node_paths()
+                        if k.startswith(path + "/")]:
+                self.nodes.pop(key, None)
+                self.unlinked.add(key)
+            self.unlinked_dirs.add(path)
         self.unlinked.add(path)
+        twin = self.usr_twin(path)
+        if twin:
+            self.unlinked.add(twin)
         self._record(("r", path, False), len(path))
         return True
+
+    _USR_MERGED = ("/bin/", "/sbin/", "/lib/", "/lib64/", "/lib32/")
+
+    def usr_twin(self, path):
+        """The other spelling of a merged-/usr path, or None.
+
+        /bin/ps and /usr/bin/ps are one file. `rm -f /bin/ps` unlinked both
+        keys for the session -- and journalled only the spelling that was
+        typed, so seed_binaries put /usr/bin/ps back on the next login and
+        `ls -i` showed it under both names again. Every anti-forensics
+        script starts by deleting /bin/ps; it worked until they reconnected.
+        """
+        if path.startswith(self._USR_MERGED):
+            return "/usr" + path
+        if path.startswith("/usr/"):
+            rest = path[4:]
+            if rest.startswith(self._USR_MERGED):
+                return rest
+        return None
+
+    def is_unlinked(self, path):
+        """True if this path was deleted, by name or with its directory."""
+        if path in self.unlinked:
+            return True
+        for d in self.unlinked_dirs:
+            if d == "/" or path.startswith(d + "/"):
+                return True
+        return False
 
     def mkdir(self, path, mode=0o755):
         if path in self.nodes:
@@ -17867,11 +18040,25 @@ class Shell:
             meta = getattr(self.fs, "proc_meta", {}).get(pid) or {}
             began = meta.get("start", time.time())
             elapsed = max(0.0, time.time() - began)
-            busy = "sleep" not in cmd and "sh " not in cmd[:8]
-            cpu = min(elapsed, elapsed * 0.94) if busy else 0.0
-            rows.append((self.user, pid, round(94.3 if busy else 0.0, 1),
+            # The rate is decided once and kept, so every reader derives from
+            # it. %CPU was the literal 94.3 while TIME was elapsed * 0.94 --
+            # ps printing two numbers in one row that do not agree, when the
+            # real one computes the second from the first.
+            if meta.get("rate") is None:
+                busy = "sleep" not in cmd and "sh " not in cmd[:8]
+                meta["rate"] = 0.94 if busy else 0.0
+                if hasattr(self.fs, "proc_meta"):
+                    self.fs.proc_meta[pid] = meta
+            rate = self.fs.proc_cpu_rate(pid)
+            cpu = elapsed * rate
+            # A process using most of a core is runnable, not sleeping.
+            # It read S, so `top` said "1 running" on a box where its own
+            # process list showed a task at 94%, and /proc/stat's
+            # procs_running agreed with the wrong one.
+            live = rate >= 0.5
+            rows.append((self.user, pid, round(rate * 100, 1),
                          0.4, 22456, 8120, tty,
-                         "S" if tty == "?" else "S+",
+                         ("R" if live else "S") + ("" if tty == "?" else "+"),
                          time.strftime("%H:%M", time.localtime(began)),
                          time.strftime("%H:%M:%S", time.gmtime(cpu)), cmd))
         return sorted(rows, key=lambda r: r[1])
@@ -27007,10 +27194,18 @@ class Shell:
         cache = mib("Buffers") + mib("Cached") + mib("SReclaimable")
         used = mib("MemTotal") - mib("MemFree") - cache
         la = self.fs.loadavg()
+        # The summary and the process list are one measurement. top reported
+        # 98.9% idle above a row of its own showing 94.3% -- one command
+        # contradicting itself inside a single screen.
+        _cores, _ = self.fs.attacker_cpu()
+        _busy = max(0.0, min(1.0, _cores / float(NCPU)))
+        _us = round(0.7 + _busy * 70.0, 1)
+        _sy = round(0.3 + _busy * 30.0, 1)
+        _id = round(max(0.0, 98.9 - _busy * 98.9), 1)
         head = (
             "top - %s up %s,  1 user,  load average: %.2f, %.2f, %.2f\n"
             "Tasks: %3d total,   %d running, %d sleeping,   0 stopped,   0 zombie\n"
-            "%%Cpu(s):  0.7 us,  0.3 sy,  0.0 ni, 98.9 id,  0.1 wa,  0.0 hi,  0.0 si,  0.0 st\n"
+            "%%Cpu(s): %4.1f us, %4.1f sy,  0.0 ni, %4.1f id,  0.1 wa,  0.0 hi,  0.0 si,  0.0 st\n"
             "MiB Mem :  %7.1f total, %8.1f free, %8.1f used, %8.1f buff/cache\n"
             "MiB Swap:  %7.1f total, %8.1f free, %8.1f used. %8.1f avail Mem\n"
             "\n"
@@ -27018,6 +27213,7 @@ class Shell:
             % (time.strftime("%H:%M:%S"), self._uptime_short(),
                la[0], la[1], la[2],
                len(rows), running, len(rows) - running,
+               _us, _sy, _id,
                mib("MemTotal"), mib("MemFree"), used, cache,
                mib("SwapTotal"), mib("SwapFree"),
                mib("SwapTotal") - mib("SwapFree"), mib("MemAvailable")))
@@ -35322,11 +35518,30 @@ class Shell:
                 # owns a given file. Directories that are the /usr merge's
                 # other spelling still resolve, which is why the check is on
                 # the directory rather than on the term itself.
-                _BINDIRS = ("/bin", "/sbin", "/usr/bin", "/usr/sbin",
-                            "/usr/lib", "/lib", "/usr/local/bin",
-                            "/usr/local/sbin")
-                if ("/" in term and not self.fs.exists(term)
-                        and os.path.dirname(term) not in _BINDIRS):
+                # dpkg does NOT follow the merged-/usr symlinks. Its file
+                # list records /usr/bin/ls, and `dpkg -S /bin/ls` on a real
+                # trixie answers "no path found matching pattern /bin/ls"
+                # with rc 1 -- measured, along with /bin/ps, /bin/netstat
+                # and /sbin/ip. This resolved the other spelling and
+                # answered confidently, which is the box being *more*
+                # helpful than the tool it is imitating.
+                #
+                # That matters here specifically: `dpkg -S /bin/ps` is what
+                # you run to find out what owns a binary an anti-forensics
+                # script has replaced, and the real answer is the unhelpful
+                # one. A path with a slash in it now has to be a literal
+                # entry in the file list.
+                # The spellings dpkg's list does not contain are exactly the
+                # pre-merge ones: /bin, /sbin, /lib and /lib64 are symlinks
+                # into /usr, and the file list records only the /usr side.
+                # A /usr path still resolves; a nonexistent one still does
+                # not.
+                _UNLISTED = ("/bin", "/sbin", "/lib", "/lib64",
+                             "/lib32", "/libx32")
+                if "/" in term and (
+                        os.path.dirname(term) in _UNLISTED
+                        or (not self.fs.exists(term)
+                            and term not in self._PKG_PATHS)):
                     owner = None
                 if owner is None:
                     self.err("dpkg-query: no path found matching pattern %s"

@@ -187,8 +187,19 @@ def t_the_shape_someone_actually_types():
     s = sh()
     eq("dpkg -S $(which curl)", run(s, "dpkg -S $(which curl)"),
        "curl: /usr/bin/curl")
-    eq("dpkg -S /bin/ls", run(s, "dpkg -S /bin/ls"), "coreutils: /usr/bin/ls")
-    eq("dpkg -S /bin/sh", run(s, "dpkg -S /bin/sh"), "dash: /usr/bin/sh")
+    # dpkg does NOT follow the merged-/usr symlinks: its file list holds
+    # /usr/bin/ls, and `dpkg -S /bin/ls` is "no path found matching pattern".
+    # Measured on the guest (Debian 13.6, dpkg 1.22.22) and on a trixie
+    # container. This expected the helpful answer, which the real tool does
+    # not give -- see usrmergetest.py.
+    check("dpkg -S /bin/ls refuses the pre-merge spelling",
+          "no path found matching pattern /bin/ls" in run(s, "dpkg -S /bin/ls"),
+          run(s, "dpkg -S /bin/ls"))
+    check("dpkg -S /bin/sh likewise",
+          "no path found matching pattern /bin/sh" in run(s, "dpkg -S /bin/sh"),
+          run(s, "dpkg -S /bin/sh"))
+    eq("dpkg -S /usr/bin/ls", run(s, "dpkg -S /usr/bin/ls"),
+       "coreutils: /usr/bin/ls")
     out = run(s, "dpkg -S /usr/bin/definitelynotreal")
     check("a path that is not there", "no path found" in out, out)
 

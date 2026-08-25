@@ -3,10 +3,10 @@
 #
 # One suite is expected to fail and says so out loud rather than being
 # skipped: awktest.py differs from GNU awk on `gsub(/a/, "\\&")` -- see
-# "Known differences" in the README. Listing it here keeps CI green without
-# hiding it, and an unexpected failure still turns the build red. Silencing a
-# known failure by skipping the suite would also hide the other 89 cases it
-# checks.
+# "The one known failure" in docs/testing.md. Listing it here keeps CI green
+# without hiding it, and an unexpected failure still turns the build red.
+# Silencing a known failure by skipping the suite would also hide the other
+# 89 cases it checks.
 #
 # KNOWN_FAILURES can be overridden to run with nothing tolerated:
 #   KNOWN_FAILURES= ./run-suites.sh

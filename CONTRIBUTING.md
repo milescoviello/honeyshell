@@ -11,6 +11,8 @@ So a patch that adds or changes behaviour wants a suite entry that asks the
 coherence question, not just an assertion that the new output is what you
 expected. `df` and `stat -f` reading from one accounting is worth more than
 either of them being individually correct.
+[docs/design.md](docs/design.md) sets out what that means in practice, with
+the cases the emulator already holds together.
 
 ## Reference values come from a real box
 
@@ -40,8 +42,16 @@ before you trust it.
 ./run-suites.sh
 ```
 
-All 139 should pass. If your change makes an unrelated suite fail, that suite
-has probably just told you something true.
+On a Debian 13 host that should print `suites: 163   unexpected failures: 0
+known: 1` — the one known failure is `awktest.py`, and
+[docs/testing.md](docs/testing.md) says why it is tolerated by name rather
+than skipped. Anything else failing is either your change or a host that is
+not Debian 13; several suites diff against the host's own `bash` and
+coreutils, so on another distribution they report the host's differences and
+not the emulator's.
+
+If your change makes an unrelated suite fail, that suite has probably just
+told you something true.
 
 ## Style
 

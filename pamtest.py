@@ -255,13 +255,21 @@ def t_dpkg_does_not_invent_an_owner_for_a_path():
         check("and says no path found", "no path found" in o, o[:70])
     # The /usr merge still has to resolve: /bin and /sbin are symlinks, and
     # dpkg answers with the real location under /usr.
+    # dpkg does NOT resolve the merge. Measured on the guest: `dpkg -S
+    # /bin/bash` and `dpkg -S /sbin/ifconfig` are both "no path found",
+    # rc 1, while the /usr spellings answer. This asserted the opposite --
+    # the check was even named "resolves the merge" -- which is a
+    # reasonable thing to assume and not what the tool does.
     for spelled, real, pkg in (("/bin/bash", "/usr/bin/bash", "bash"),
                                ("/sbin/ifconfig", "/usr/sbin/ifconfig",
                                 "net-tools")):
         o, rc = run(s, "dpkg -S %s" % spelled)
-        eq("dpkg -S %s rc" % spelled, rc, 0)
-        eq("dpkg -S %s resolves the merge" % spelled, o.strip(),
-           "%s: %s" % (pkg, real))
+        eq("dpkg -S %s rc" % spelled, rc, 1)
+        eq("dpkg -S %s refuses the pre-merge spelling" % spelled, o.strip(),
+           "dpkg-query: no path found matching pattern %s" % spelled)
+        o2, rc2 = run(s, "dpkg -S %s" % real)
+        eq("dpkg -S %s rc" % real, rc2, 0)
+        eq("dpkg -S %s answers" % real, o2.strip(), "%s: %s" % (pkg, real))
 
 
 def t_a_bare_name_lists_every_file_that_matches():
