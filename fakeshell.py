@@ -6423,10 +6423,37 @@ class VFS:
     # all empty. Reading /proc is the first thing any implant does, and the
     # first thing a careful attacker does by hand.
     PROC_DIRS = ("fd", "fdinfo", "net", "task", "ns", "map_files", "attr")
+    #: `ls /proc/1` on the guest lists 56 entries; this listed 31. The 25
+    #: added below are measured from the guest, not invented, and several
+    #: are read on purpose rather than by accident: uid_map, gid_map and
+    #: setgroups are how a process decides whether it is in a namespace,
+    #: smaps_rollup is what anything measuring its own memory reads, and
+    #: schedstat is the scheduler's own view of the CPU time /proc/<pid>/stat
+    #: reports. A short /proc/<pid> is one `ls` away from being noticed.
     PROC_FILES = ("cmdline", "comm", "environ", "io", "limits", "loginuid",
                   "maps", "mountinfo", "mounts", "oom_score", "oom_score_adj",
                   "sched", "sessionid", "stat", "statm", "status", "syscall",
-                  "wchan", "cgroup", "personality", "autogroup")
+                  "wchan", "cgroup", "personality", "autogroup",
+                  "arch_status", "auxv", "clear_refs", "coredump_filter",
+                  "cpu_resctrl_groups", "cpuset", "gid_map",
+                  "ksm_merging_pages", "ksm_stat", "mem", "mountstats",
+                  "numa_maps", "oom_adj", "pagemap", "patch_state",
+                  "projid_map", "schedstat", "setgroups", "smaps",
+                  "smaps_rollup", "stack", "timens_offsets", "timers",
+                  "timerslack_ns", "uid_map")
+
+    #: Modes, measured. Most of /proc/<pid> is 0444, but these are not, and
+    #: the difference is load-bearing: clear_refs is write-only, so `cat`ing
+    #: it must fail with EINVAL rather than print nothing, and mem is 0600.
+    PROC_FILE_MODES = {
+        "environ": 0o400, "io": 0o400, "syscall": 0o400, "maps": 0o444,
+        "auxv": 0o400, "clear_refs": 0o200, "mem": 0o600, "pagemap": 0o400,
+        "stack": 0o400, "ksm_merging_pages": 0o400, "ksm_stat": 0o400,
+        "mountstats": 0o400, "patch_state": 0o400,
+        "coredump_filter": 0o644, "oom_adj": 0o644, "uid_map": 0o644,
+        "gid_map": 0o644, "projid_map": 0o644, "setgroups": 0o644,
+        "timerslack_ns": 0o644, "oom_score_adj": 0o644,
+    }
     PROC_LINKS = ("exe", "cwd", "root")
 
     def sync_cgroups(self, units, scope):
@@ -6556,7 +6583,7 @@ class VFS:
                     b"", mode=0o666, uid=uid, gid=uid, mtime=proc_start,
                     ino=self._alloc_ino())
             for f in self.PROC_FILES:
-                mode = 0o400 if f in ("environ", "io", "syscall", "maps") else 0o444
+                mode = self.PROC_FILE_MODES.get(f, 0o444)
                 self.nodes[base + "/" + f] = FileNode(
                     b"", mode=mode, uid=uid, gid=uid, mtime=proc_start,
                     ino=self._alloc_ino())
@@ -6701,6 +6728,24 @@ class VFS:
         if row is None:
             return None
         user, _pid, cpu, mem, vsz, rss, tty, state, start, cputime, cmd = row
+        # CPU ticks from the TIME column ps prints, not from %CPU. utime and
+        # stime were int(cpu * 30) and int(cpu * 12), so /proc/<pid>/stat
+        # described a *rate* where it should hold a *total*: pid 1 showed
+        # TIME 00:00:41 beside utime/stime of 0 0, and a process ps said had
+        # used no CPU at all showed 2829 + 1131 ticks -- 39 seconds of CPU on
+        # something that had existed for under a second. (utime + stime) / 100
+        # has to equal the TIME column; measured on the guest, pid 1 gives
+        # 00:00:23 against 1317 + 1029 = 2346 ticks.
+        _cpu_secs = 0
+        for _part in str(cputime or "0").split(":"):
+            try:
+                _cpu_secs = _cpu_secs * 60 + int(_part)
+            except ValueError:
+                _cpu_secs = 0
+                break
+        _ticks = _cpu_secs * 100
+        _utime = _ticks * 7 // 10
+        _stime = _ticks - _utime
         derived = getattr(self, "proc_derived", {}).get(pid)
         if derived:
             comm, real_ppid = derived
@@ -6746,7 +6791,7 @@ class VFS:
                  str(pid), str(pid), "0" if tty == "?" else "34816",
                  "-1" if tty == "?" else str(pid), "4194560",
                  str(1200 + pid * 7), "0", str(pid % 40), "0",
-                 str(int(cpu * 30)), str(int(cpu * 12)), "0", "0",
+                 str(_utime), str(_stime), "0", "0",
                  # priority is 20 + nice and nice is nice; both were the
                  # literals 20 and 0, so renice moved ps and left /proc
                  # behind -- two views of one number.
@@ -6931,6 +6976,63 @@ class VFS:
             # /proc/mounts, so every tool that parses mountinfo -- which is
             # what container detection reads -- got the wrong columns.
             return mountinfo_text().encode()
+        # --- the entries added to match `ls /proc/1` on the guest --------
+        # Measured contents. A file that `ls` lists and `cat` returns
+        # nothing for is a worse tell than a file that is simply absent, so
+        # these carry the real thing rather than existing empty.
+        if what in ("uid_map", "gid_map", "projid_map"):
+            return b"         0          0 4294967295\n"
+        if what == "setgroups":
+            return b"allow\n"
+        if what == "cpuset":
+            return b"/\n"
+        if what == "cpu_resctrl_groups":
+            return b"res:\nmon:\n"
+        if what == "oom_adj":
+            return b"0\n"
+        if what == "coredump_filter":
+            return b"00000033\n"
+        if what == "timerslack_ns":
+            return b"50000\n"
+        if what == "patch_state":
+            return b"-1\n"
+        if what == "ksm_merging_pages":
+            return b"0\n"
+        if what == "ksm_stat":
+            return (b"ksm_rmap_items 0\nksm_zero_pages 0\n"
+                    b"ksm_merging_pages 0\nksm_process_profit 0\n")
+        if what == "timens_offsets":
+            return (b"monotonic           0         0\n"
+                    b"boottime            0         0\n")
+        if what in ("arch_status", "timers"):
+            # Both are empty on x86-64 for a process with no posix timers.
+            return b""
+        if what == "schedstat":
+            # (cpu time ns, run delay ns, timeslices). The first field is
+            # the same CPU time /proc/<pid>/stat reports, or the scheduler
+            # and the stat file describe different processes.
+            _cpu_ns = _cpu_secs * 10 ** 9
+            return ("%d %d %d\n" % (_cpu_ns, _cpu_ns // 8,
+                                    max(1, pid % 977))).encode()
+        if what == "smaps_rollup":
+            # Derived from the same rss/vsz the status file and ps use.
+            _sh = max(0, rss - rss // 4)
+            _pd = rss - _sh
+            return ("%012x-%012x ---p 00000000 00:00 0"
+                    "                          [rollup]\n"
+                    % (0x550000000000 + pid * 4096, 0x7ffc00000000)
+                    + "".join("%-18s %8d kB\n" % (k + ":", v) for k, v in (
+                        ("Rss", rss), ("Pss", _pd + _sh // 4),
+                        ("Pss_Dirty", _pd), ("Pss_Anon", _pd),
+                        ("Pss_File", _sh // 4), ("Pss_Shmem", 0),
+                        ("Shared_Clean", _sh), ("Shared_Dirty", 0),
+                        ("Private_Clean", 0), ("Private_Dirty", _pd),
+                        ("Referenced", rss), ("Anonymous", _pd),
+                        ("KSM", 0), ("LazyFree", 0), ("AnonHugePages", 0),
+                        ("ShmemPmdMapped", 0), ("FilePmdMapped", 0),
+                        ("Shared_Hugetlb", 0), ("Private_Hugetlb", 0),
+                        ("Swap", 0), ("SwapPss", 0),
+                        ("Locked", 0)))).encode()
         if what == "sched":
             return ("%s (%d, #threads: 1)\n"
                     "---------------------------------------------------------\n"

@@ -105,6 +105,7 @@ Run all:  `./run-suites.sh`
 - `probesuite.py` -- Honeypot-detection probe suite.
 - `procstarttest.py` -- When did this process start, and do all the readers agree?
 - `procsubtest.py` -- Process substitution, and the loop that could not see it.
+- `procsurfacetest.py` -- What /proc/<pid> shows, and whether it agrees with ps.
 - `proctest.py` -- Does the box agree with itself about what is running?
 - `profiledtest.py` -- What runs at login, and the variable it tests.
 - `psmisctest.py` -- Does every binary the box says it has actually run?
