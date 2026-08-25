@@ -108,6 +108,7 @@ Run all:  `./run-suites.sh`
 - `pkgtest.py` -- Does dpkg agree with the filesystem about what it installed?
 - `pkgverifytest.py` -- The package database and the filesystem: does anything reconcile them?
 - `probesuite.py` -- Honeypot-detection probe suite.
+- `procselftest.py` -- What a launched process inherits, and whether the shell survives it.
 - `procstarttest.py` -- When did this process start, and do all the readers agree?
 - `procsubtest.py` -- Process substitution, and the loop that could not see it.
 - `procsurfacetest.py` -- What /proc/<pid> shows, and whether it agrees with ps.

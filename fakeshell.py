@@ -6785,7 +6785,19 @@ class VFS:
         self.unix_conn = sorted(_fd_socks - _claimed)
         self._write_unix_table()
 
-        me = rows[-1][1] if rows else 1
+        # The session's shell, not the highest pid in the table. On a real
+        # box /proc/self is the *reading* command's own process, which is a
+        # short-lived child above everything -- so `rows[-1]` was a fair
+        # approximation right up until an attacker launched something, at
+        # which point /proc/self pointed at their own payload and
+        # `readlink /proc/self/exe` handed them its path. Everything read
+        # through /proc/self that matters -- environ, cgroup, limits -- is
+        # inherited from the shell anyway, so the shell is the right answer
+        # for those and a harmless one for the rest. cmdline and exe still
+        # describe bash rather than the command doing the reading; see the
+        # tripwire in procselftest.
+        me = getattr(self, "shell_env_pid", None) or (
+            rows[-1][1] if rows else 1)
         for nm in ("self", "thread-self"):
             self.nodes["/proc/" + nm] = FileNode(mode=0o777, link=str(me),
                                                  mtime=BOOT_TS,
@@ -6990,8 +7002,27 @@ class VFS:
             # /proc/self/environ and env described two different processes,
             # and neither SSH_CLIENT nor SSH_CONNECTION appeared anywhere in
             # the file people read specifically to find them.
-            if pid == getattr(self, "shell_env_pid", None):
+            shell_env = (getattr(self, "shell_envs", None) or {}).get(pid)
+            if shell_env is None and pid == getattr(self, "shell_env_pid",
+                                                    None):
                 shell_env = getattr(self, "shell_env", None) or {}
+            if shell_env is None:
+                # A process this session launched inherited the shell's
+                # environment -- that is what fork does. It was given a
+                # systemd service's instead, complete with NOTIFY_SOCKET,
+                # INVOCATION_ID and JOURNAL_STREAM, so an exported variable
+                # from the launching shell was missing and three variables
+                # only a unit can have were present. Measured on the guest:
+                # `nohup sleep 60 &` has NOTIFY_SOCKET count 0 and carries
+                # SHELL, PWD, LOGNAME and XDG_SESSION_TYPE.
+                _own = (getattr(self, "proc_meta", None) or {}).get(pid) or {}
+                shell_env = _own.get("env")
+                if shell_env is None and _own.get("ppid") is not None:
+                    shell_env = (getattr(self, "shell_envs", None)
+                                 or {}).get(_own["ppid"])
+                if shell_env is not None and _own.get("cwd"):
+                    shell_env = dict(shell_env, PWD=_own["cwd"])
+            if shell_env is not None:
                 if shell_env:
                     return ("\0".join("%s=%s" % kv for kv in
                                        sorted(shell_env.items())) + "\0"
@@ -7035,7 +7066,8 @@ class VFS:
             return ("\0".join(env) + "\0").encode()
         if what == "limits":
             over = (getattr(self, "shell_limits", None)
-                    if pid == getattr(self, "shell_env_pid", None) else None)
+                    if pid in (getattr(self, "shell_envs", None) or {})
+                    or pid == getattr(self, "shell_env_pid", None) else None)
             return proc_limits_text(over).encode()
         if what == "io":
             k = pid * 977
@@ -7074,10 +7106,20 @@ class VFS:
                 # units like kthreadd.service and kworker.service that
                 # `systemctl list-units` has never heard of.
                 return b"0::/\n"
-            unit = self._unit_of_pid(pid, comm, tty)
+            # A process this session started is in the session's scope, not
+            # a unit. It was given /system.slice/<comm>.service -- so
+            # `nohup ./svc &` claimed svc.service while `systemctl status
+            # svc.service` said "Unit svc.service could not be found" and
+            # `systemctl list-units` had never heard of it, and
+            # `systemd-cgls` sided with the cgroup file against systemctl.
+            # Measured on the guest: `nohup sleep 60 &` reports the *same*
+            # scope as the shell that started it.
+            _own = (getattr(self, "proc_meta", None) or {}).get(pid) or {}
+            _anchor = _own.get("ppid")
+            unit = None if _anchor else self._unit_of_pid(pid, comm, tty)
             path = ("init.scope" if pid == 1 else
                     ("system.slice/" + unit) if unit else
-                    session_scope_path(uid, pid))
+                    session_scope_path(uid, _anchor or pid))
             return ("0::/%s\n" % path).encode()
         if what == "maps":
             exe = cmd.lstrip("-").split()[0] if cmd.strip() else "/bin/false"
@@ -12199,6 +12241,19 @@ class Shell:
         # shell_pid only exists from here on, which is why the environ
         # snapshot above cannot record it itself.
         self.rawfs.shell_env_pid = self.shell_pid
+        # ...and keyed by pid as well, because one slot on the shared VFS is
+        # not one shell. `nohup ./x &` builds a second Shell, which
+        # overwrote shell_env_pid with its own pid -- a pid the process
+        # table does not contain -- and the session shell's own
+        # /proc/<pid>/environ, /proc/<pid>/cgroup and /proc/<pid>/limits all
+        # went empty the moment a payload was launched. That is the exact
+        # moment an operator looks around, and `cat /proc/$$/environ`
+        # returning nothing on a box where it worked a second ago is not
+        # something a real kernel does.
+        envs = getattr(self.rawfs, "shell_envs", None)
+        if envs is None:
+            envs = self.rawfs.shell_envs = {}
+        envs[self.shell_pid] = dict(self.rawfs.shell_env)
         # This shell's own resource limits. They were a module-level
         # constant, so `ulimit -n 65535` -- which every miner runs
         # before it starts -- could not change anything.
@@ -15773,7 +15828,9 @@ class Shell:
             sub.exec_mode, sub.is_subshell = self.exec_mode, True
             sub._payloads_seen = self._payloads_seen
             sub._nest = self._nest + 1
+            _claimed = sub.shell_pid
             sub.shell_pid = self.shell_pid   # bash: $$ is the parent's
+            self._inherit_session(_claimed)
             # ...but a subshell is a fork, so $BASHPID is its own.
             sub.forked_pid = self.fs.next_pid
             self.fs.next_pid += 1
@@ -18321,7 +18378,15 @@ class Shell:
                      # cwd is the shell's. The emulator contradicted itself
                      # over it: nohup.out was correctly created in the
                      # launching directory while cwd said "/".
-                     "cwd": self.cwd}
+                     "cwd": self.cwd,
+                     # The environment as it stood when this was launched.
+                     # The shell's own /proc/<pid>/environ is deliberately a
+                     # login-time snapshot -- a later `export` does not
+                     # change a running process's environ -- but a child
+                     # forked afterwards does inherit it, so `export
+                     # EVIL=1; nohup ./x &` has to show EVIL and did not.
+                     "env": {k: v for k, v in self.vars.items()
+                             if k in self.exported and k != "_"}}
 
     _REDIR_OUT = re.compile(r'(?:^|\s)\d?>>?\s*([^\s;&|]+)')
 
@@ -30440,6 +30505,34 @@ class Shell:
                 "(invocation only)\n"
                 "\t-abefhkmnptuvxBCEHPT or -o option" % (name, name))
 
+    def _inherit_session(self, claimed):
+        """Undo the session identity a subshell's constructor claimed.
+
+        Shell.__init__ takes the next pid and registers it as *the* session
+        shell: shell_env_pid, an entry in shell_envs, and the /proc rows any
+        later resync publishes. A subshell is a fork, not a login -- $$ stays
+        the parent's, which both call sites already knew -- but nothing put
+        the VFS back.
+
+        So `nohup ./x &` left the session shell's own /proc/<pid>/environ,
+        /proc/<pid>/cgroup and /proc/<pid>/limits empty, and pointed
+        /proc/self at a pid `ps` does not list. That is the exact moment an
+        operator looks around, and `cat /proc/$$/environ` returning nothing
+        on a box where it worked a second earlier is not something a real
+        kernel does.
+
+        Two call sites had the `$$` half of this and neither had the rest --
+        the same drift _shell_child's own docstring was written about.
+        """
+        if claimed == self.shell_pid:
+            return
+        (getattr(self.rawfs, "shell_envs", None) or {}).pop(claimed, None)
+        self.rawfs.shell_env_pid = self.shell_pid
+        # Shell.__init__ has already published /proc from its own view, so
+        # the rows name the claimed pid and /proc/self points at it. Redo it
+        # from here, where shell_pid is the parent's again.
+        self._resync_proc()
+
     def _shell_child(self, argv0=None):
         """A forked shell. Every entry path needs the same child.
 
@@ -30455,7 +30548,9 @@ class Shell:
         sub.exec_mode, sub.is_subshell = self.exec_mode, True
         sub._payloads_seen = self._payloads_seen
         sub._nest = self._nest + 1
+        _claimed = sub.shell_pid
         sub.shell_pid = self.shell_pid   # bash: $$ is the parent's
+        self._inherit_session(_claimed)
         # ...but a subshell is a fork, so $BASHPID is its own.
         sub.forked_pid = self.fs.next_pid
         self.fs.next_pid += 1
