@@ -3435,6 +3435,9 @@ def node_size(node, path=None):
 
 
 #: root's PATH, from /etc/profile's uid==0 branch on the guest.
+#: "this expression is not one we model" -- distinct from a legitimate NULL.
+_SQL_NOPE = object()
+
 PATH_ROOT = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 #: What sshd hands a non-root non-login session -- which is what these
 #: sessions are. Measured: `ssh host 'echo $PATH'` as a normal user.
@@ -27720,6 +27723,85 @@ class Shell:
         return m.group(1) if m else None
 
     @staticmethod
+    def _split_sql_list(text):
+        """Split on commas that are not inside quotes or parentheses."""
+        out, depth, quote, cur = [], 0, None, []
+        for ch in text:
+            if quote:
+                cur.append(ch)
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in "'\"":
+                quote = ch
+                cur.append(ch)
+            elif ch == "(":
+                depth += 1
+                cur.append(ch)
+            elif ch == ")":
+                depth -= 1
+                cur.append(ch)
+            elif ch == "," and depth == 0:
+                out.append("".join(cur))
+                cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            out.append("".join(cur))
+        return out
+
+    def _sql_scalar(self, expr, dbname=None):
+        """The value of a scalar expression, or _SQL_NOPE if unsupported.
+
+        Deliberately narrow: integer literals, integer arithmetic, quoted
+        strings, NULL, and the handful of niladic functions an actor uses
+        to confirm a connection. Anything else falls through to the real
+        error rather than being guessed at -- a wrong answer here is worse
+        than a syntax error, because a syntax error is something MariaDB
+        also says.
+        """
+        e = expr.strip()
+        if re.match(r"^-?\d+$", e):
+            return int(e)
+        if re.match(r"^[-+*/%()\d\s]+$", e) and re.search(r"\d", e):
+            try:
+                v = eval(e, {"__builtins__": {}}, {})   # digits and operators only
+            except Exception:                                 # noqa: BLE001
+                return _SQL_NOPE
+            # MariaDB's `/` yields DECIMAL with four more decimal places
+            # than its operands, so `100/4` is 25.0000 and `1/3` is 0.3333,
+            # while + - * and % stay integral. Measured on 12.3; returning
+            # a bare 25 was the one arithmetic answer that did not match.
+            if "/" in e:
+                return "%.4f" % v
+            return int(v) if isinstance(v, float) and v.is_integer() else v
+        if len(e) >= 2 and e[0] == e[-1] and e[0] in "'\"":
+            return e[1:-1]
+        if e.upper() == "NULL":
+            return None
+        low = e.lower().replace(" ", "")
+        if low in ("now()", "current_timestamp()", "current_timestamp",
+                   "sysdate()"):
+            return time.strftime("%Y-%m-%d %H:%M:%S")
+        if low in ("curdate()", "current_date()", "current_date"):
+            return time.strftime("%Y-%m-%d")
+        if low in ("curtime()", "current_time()", "current_time"):
+            return time.strftime("%H:%M:%S")
+        if low in ("database()", "schema()"):
+            # The caller's dbname. self._db_name does not exist -- bgtest
+            # scans the source for every self.<attr> and told me so, which
+            # is the only reason this was not a silent NULL for every
+            # `select database()` that went through the scalar path.
+            return dbname or None
+        if low in ("user()", "current_user()", "current_user"):
+            return "%s@localhost" % self._db_user
+        if low == "version()":
+            return getattr(wordpress, "DB_VERSION", "11.8.3-MariaDB")
+        if low in ("connection_id()",):
+            return 4 + (self.shell_pid % 400)
+        return _SQL_NOPE
+
+    @staticmethod
     def _mysql_table(cols, rows):
         """MySQL's box-drawing output."""
         if not cols:
@@ -27953,6 +28035,41 @@ class Shell:
                      "the --secure-file-priv option so it cannot execute "
                      "this statement")
             return "", 1
+        # A select of plain scalar expressions. `select 1` is the canonical
+        # connectivity check -- every ORM, every health probe and every
+        # actor confirming a credential runs it -- and it came back as
+        # ERROR 1064, which says the credential worked and the server does
+        # not understand SQL. `select now()` was the same.
+        #
+        # Column headings are the expression text exactly as written, or
+        # the alias after AS; measured on mariadb 12.3, which prints
+        # "1+1" as the heading for `select 1+1`.
+        m = re.match(r"^select\s+(.+?)\s*;?$", sql.strip(), re.I)
+        if m and not re.search(r"\bfrom\b|\binto\b|@@|\(\s*\*\s*\)",
+                               m.group(1), re.I):
+            cols, vals, ok = [], [], True
+            for part in self._split_sql_list(m.group(1)):
+                expr = part.strip()
+                alias = None
+                am = re.match(r"^(.*?)\s+as\s+`?(\w+)`?$", expr, re.I)
+                if am:
+                    expr, alias = am.group(1).strip(), am.group(2)
+                val = self._sql_scalar(expr, dbname)
+                if val is _SQL_NOPE:
+                    ok = False
+                    break
+                # A string literal's heading is its *content*, without the
+                # quotes: `select 'hello world'` heads the column
+                # "hello world". Measured. Numbers and function calls keep
+                # the expression text as typed.
+                head = alias or expr
+                if not alias and len(expr) >= 2 and expr[0] == expr[-1] \
+                        and expr[0] in "'\"":
+                    head = expr[1:-1]
+                cols.append(head)
+                vals.append(val)
+            if ok and cols:
+                return render(cols, [vals]), 0
         if low in ("select version()", "select @@version"):
             return render(["version()"],
                           [[getattr(wordpress, "DB_VERSION", "11.8.3")]]), 0
@@ -28191,8 +28308,25 @@ class Shell:
         # -B selects tab-separated output; -N suppresses the header row.
         # Conflating them meant `-N` still printed column names, which is
         # the opposite of what it asks for.
-        batch = any(x in ("-B", "--batch", "-N", "--skip-column-names")
-                    for x in a)
+        # mysql picks its output format from isatty(stdout): a terminal gets
+        # the box drawing, anything else gets tab-separated columns with a
+        # single header line. Measured on mariadb 12.3 both ways, and `-t`
+        # forces the box regardless.
+        #
+        # This only ever looked at the flags, so `ssh host "mysql -e 'show
+        # tables'"` -- which is how every one of these credentials has
+        # actually been used, since there is no pty on an exec channel --
+        # came back in box drawing where the real client would have sent
+        # tabs. Anything parsing the second column got "|" instead.
+        #
+        # Known limitation: a pipe inside an interactive session
+        # (`mysql -e ... | grep`) is still a terminal as far as this is
+        # concerned, because the shell does not track a command's position
+        # in a pipeline. If that ever becomes representable, this is the
+        # place, and sqlttytest has a check that will start failing.
+        force_table = any(x in ("-t", "--table") for x in a)
+        batch = (self.exec_mode and not force_table) or any(
+            x in ("-B", "--batch", "-N", "--skip-column-names") for x in a)
         noheader = any(x in ("-N", "--skip-column-names") for x in a)
         stmts = []
         for i, x in enumerate(a):

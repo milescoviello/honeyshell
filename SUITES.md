@@ -138,6 +138,7 @@ Run all:  `./run-suites.sh`
 - `skeltest.py` -- What does this box give a new account, and does it match the ones on it?
 - `socktest.py` -- Sockets: four tables, four answers.
 - `splittest.py` -- Word splitting: "$@" versus $@ versus "$*", and whether IFS matters.
+- `sqlttytest.py` -- mysql's output format depends on the terminal, and `select 1` has to work.
 - `sshidtest.py` -- What does the box say about its own SSH identity, and about keys?
 - `ssltest.py` -- Does the box agree with itself about hashing, encoding and its CA store?
 - `sstest.py` -- ss's extended columns and filters, against the socket underneath.
