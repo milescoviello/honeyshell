@@ -274,6 +274,27 @@ def t_the_e2fs_tools_refuse_what_they_cannot_read():
           out == "".join(
               l + "\n" for l in R("tune2fs -l /dev/sda1")[0].splitlines()
               if not l.startswith("tune2fs ")), "differs")
+    # ...and they agree whatever the gap between the two calls. "Last write
+    # time" was rendered from the clock at the moment of asking, so the two
+    # readers of one superblock disagreed whenever the calls straddled a
+    # second. Back-to-back they matched, which is why this suite passed
+    # standalone and failed only inside a full gate run -- the one place with
+    # enough elapsed time between them.
+    import time as _t
+    _a = [l for l in R("tune2fs -l /dev/sda1")[0].splitlines()
+          if not l.startswith("tune2fs ")]
+    _t.sleep(1.2)
+    _b = R("dumpe2fs -h /dev/sda1")[0].splitlines()
+    check("the two readers agree across a second boundary",
+          set(_a) == set(_b), repr(sorted(set(_a) ^ set(_b))[:2]))
+    # s_wtime is a stored field: it moves when something writes, not when
+    # someone looks.
+    _w1 = [l for l in _a if "Last write time" in l]
+    R("echo payload > /tmp/wtime_probe")
+    _w2 = [l for l in R("tune2fs -l /dev/sda1")[0].splitlines()
+           if "Last write time" in l]
+    check("a write advances the last-write time", _w1 != _w2,
+          "%r vs %r" % (_w1[:1], _w2[:1]))
 
 
 # ---------------------------------------------------------------------------

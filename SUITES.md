@@ -103,6 +103,7 @@ Run all:  `./run-suites.sh`
 - `procsubtest.py` -- Process substitution, and the loop that could not see it.
 - `proctest.py` -- Does the box agree with itself about what is running?
 - `psmisctest.py` -- Does every binary the box says it has actually run?
+- `quotectxtest.py` -- Does an operator inside quotes stay inside quotes?
 - `quotetest.py` -- Filenames that need quoting, and the contexts that render them.
 - `rctest.py` -- Do commands *fail* the same way the real ones do?
 - `readtest.py` -- Reading a list, and what a loop exits with.

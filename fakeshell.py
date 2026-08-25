@@ -4116,6 +4116,18 @@ class VFS:
         # a tampered binary pristine -- the one answer that must never be
         # wrong here. Paths are cheap; contents are what the cap is for.
         self.pkg_touched = {}
+        # The superblock's s_wtime. It was rendered as time.localtime() with
+        # no argument, i.e. the clock at the moment you asked -- so tune2fs
+        # -l and dumpe2fs -h, two readers of ONE superblock, printed
+        # different "Last write time" values whenever the two calls happened
+        # to straddle a second. Back-to-back they agreed, which is why 170
+        # suites never caught it; it only failed when the machine was busy
+        # enough to put a second between them.
+        #
+        # On a real box this is a stored field: two readers get the same
+        # number, and it advances when something writes, not when someone
+        # looks. Captured once here and advanced by write().
+        self.sb_wtime = time.time()
         # Paths an attacker deleted. seed_binaries runs from Shell.__init__,
         # which happens *after* the journal is replayed -- fs_for() builds a
         # VFS, replays, and only then is a Shell constructed -- and it
@@ -7650,6 +7662,7 @@ class VFS:
                 return False
         if not getattr(self, "_seeding", False):
             self.pkg_touched[path] = True
+            self.sb_wtime = time.time()
         # The VFS is byte-oriented, but several callers hand over str. Coerce
         # once here rather than at every call site; latin-1 is lossless 1:1 for
         # bytes, which is the same mapping used for reads.
@@ -10246,6 +10259,49 @@ def find_subst_end(text, start):
             i += 1; continue
         i += 1
     return n
+
+
+def find_unquoted(text, needle, start=0):
+    """Index of the first UNQUOTED occurrence of `needle`, or -1.
+
+    Three places tested for an operator with a plain substring search and so
+    fired on text that merely contained the characters:
+
+        if "$'" in word          swallowed the $ in `echo 'a$'`, so
+                                 `grep -o 'b$'` matched twice and
+                                 `tr -d '$'` deleted nothing
+        if "|&" in text          rewrote `echo 'a|&b'` into a pipeline with
+                                 stderr merged -- a different command, not a
+                                 mangled word
+        text.find("<(")          expanded `echo 'x<(y)'` to x/dev/fd/63
+
+    The first was found because a real /etc/profile exercised it. The other
+    two were found by grepping for the shape rather than waiting for the
+    symptom, which took two minutes and turned up twice as many.
+    """
+    i, n = start, len(text)
+    q = None
+    while i < n:
+        c = text[i]
+        if q:
+            if c == "\\" and q == '"' and i + 1 < n:
+                i += 2
+                continue
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if c in "'\"":
+            q = c
+            i += 1
+            continue
+        if text.startswith(needle, i):
+            return i
+        i += 1
+    return -1
 
 
 def split_top(text, seps):
@@ -12966,8 +13022,9 @@ class Shell:
         # and the consumer got nothing: `ls /nope |& wc -l` counted 0 while
         # the error it was opened to catch went to the terminal. Rewritten
         # before the list is split, which is where the `&` was being lost.
-        if "|&" in text:
-            segs = [x.strip() for x in text.split("|&")]
+        if find_unquoted(text, "|&") >= 0:
+            _parts = split_top(text, ["|&"])
+            segs = [x.strip() for x in _parts if x != "|&"]
             text = " | ".join(
                 (sg + (" 2>&1" if i < len(segs) - 1 and "2>&1" not in sg
                        else ""))
@@ -13337,7 +13394,8 @@ class Shell:
         # `while read x; do ...; done < <(cmd)` are both common in real
         # scripts, and both produced nothing at all.
         _had_sinks = False
-        if "<(" in text or ">(" in text:
+        if (find_unquoted(text, "<(") >= 0
+                or find_unquoted(text, ">(") >= 0):
             text = self._procsub(text)
             _had_sinks = bool(self._procsub_sinks)
 
@@ -15059,9 +15117,9 @@ class Shell:
         """
         made = 0
         while made < self._PROCSUB_MAX:
-            i = text.find("<(")
+            i = find_unquoted(text, "<(")
             out_dir = False
-            j = text.find(">(")
+            j = find_unquoted(text, ">(")
             if j >= 0 and (i < 0 or j < i):
                 i, out_dir = j, True
             if i < 0:
@@ -16326,7 +16384,9 @@ class Shell:
             ("Filesystem created", time.strftime(fmt,
                                                  time.localtime(created))),
             ("Last mount time", time.strftime(fmt, time.localtime(BOOT_TS))),
-            ("Last write time", time.strftime(fmt, time.localtime())),
+            ("Last write time",
+             time.strftime(fmt, time.localtime(
+                 getattr(self.fs, "sb_wtime", BOOT_TS)))),
             ("Mount count", "7"),
             ("Maximum mount count", "-1"),
             ("Last checked", time.strftime(fmt, time.localtime(created))),
