@@ -33,15 +33,20 @@ That last one I got wrong twice. I first measured it on the guest with an
 outer `2>&1`, which captured the inner stderr and made z look like stdout;
 jobtest, which separates the streams, was the thing that caught it.
 
-One combination is still wrong and is asserted as such rather than hidden:
-`ls /nope 2>&1 1>/dev/null` should put the error on *stdout* -- fd2 copied
-stdout while it still meant the terminal, then fd1 went to the bin -- and
-we put it on stderr. The flag set the executor consumes can say "merge the
-two streams" or "discard stdout", and this needs "discard stdout, and send
-stderr where stdout used to go", which it has no way to express. Saying it
-properly means giving the executor real descriptors rather than four
-booleans. Over an ssh exec channel both streams reach the attacker either
-way, so the text is not lost -- only its stream is wrong.
+`ls /nope 2>&1 1>/dev/null` puts the error on *stdout* -- fd2 copied stdout
+while it still meant the terminal, then fd1 went to the bin. This used to
+put it on stderr, and said so here, because the flag set the executor
+consumes could say "merge the two streams" or "discard stdout" but had no
+way to say "discard stdout, and send stderr where stdout used to go". The
+model was right and the interface was too narrow to express it, which is a
+better disguise than a wrong model: the scanner already ended with fd1 on
+the file and fd2 on the terminal, and there was a comment saying so.
+
+Fixed in sweep 157 with an explicit `err_to_term`, held aside and returned
+after the redirect has taken stdout -- appending it to the output first
+would write the errors into the file, which is the thing the ordering
+exists to avoid. The note that used to live here asked for exactly that and
+left a check that would fail once it arrived; it did, and this is it.
 
 Reference measured on the guest, as root:
 
@@ -168,13 +173,13 @@ def t_two_to_one_survives_a_pipe():
 
 
 def t_dup_then_null_stdout_keeps_the_error_visible():
-    """The error survives -- but on the wrong stream, see the note above."""
+    """And on the right stream: stdout, where fd2 was pointed."""
     out, err, _rc = run("ls /nope 2>&1 1>/dev/null")
     check("the error still shows", "cannot access" in (out + err),
           repr(out + err))
-    check("known divergence: it is on stderr, the guest puts it on stdout",
-          "cannot access" in err, "if this starts failing, the flag set "
-          "grew a way to say it and the docstring note can go")
+    check("it is on stdout, where fd2 was duplicated to",
+          "cannot access" in out, repr(out))
+    eq("and nothing is left on stderr", err.strip(), "")
 
 
 def t_null_stdout_then_dup_swallows_everything():

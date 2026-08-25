@@ -176,6 +176,35 @@ def t_pending_fd_does_not_depend_on_chunking():
               "%r %r %r" % (per_char, bulk, half))
 
 
+def t_dup_order_against_real_bash():
+    """`2>&1 >file` is not `>file 2>&1`, and the difference is the point.
+
+    A dup copies the *destination* at the moment it is written, so
+    `2>&1 >/dev/null` leaves stderr on the terminal and sends stdout to the
+    bin, while `>/dev/null 2>&1` sends both. This emulator got the file half
+    right -- the redirect correctly took stdout only -- and then dropped the
+    duplicated stderr instead of returning it, so `cmd 2>&1 >/dev/null`,
+    which is the standard way to keep the errors and discard the output,
+    printed nothing at all.
+
+    Found while writing holdtest: the check for apt-mark's error message
+    used that idiom and came back empty, and the suite was wrong for a
+    moment before the shell turned out to be.
+    """
+    for script in (
+            "ls /etc/hostname /nosuchfile",
+            "ls /etc/hostname /nosuchfile 2>&1",
+            "ls /etc/hostname /nosuchfile 2>/dev/null",
+            "ls /etc/hostname /nosuchfile >/dev/null",
+            "ls /etc/hostname /nosuchfile >/dev/null 2>&1",
+            "ls /etc/hostname /nosuchfile 2>&1 >/dev/null",
+            "ls /nosuchfile 2>&1 >/dev/null",
+            "ls /etc/hostname 2>&1 >/dev/null",
+            "ls /nosuchfile 2>&1 1>/dev/null",
+    ):
+        differential("dup order", script)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("t_") and callable(fn):

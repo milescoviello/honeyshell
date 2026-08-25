@@ -10337,8 +10337,17 @@ def strip_redirections(text):
     if err_to_out:
         err_file = None
     out_to_err = (d1 == ("term", 2))
+    # `2>&1 >file`: the dup copied fd1's destination -- the terminal -- into
+    # fd2, and the later redirect then moved fd1 to the file. So stderr is
+    # still on the terminal the command started with, while stdout is not.
+    # The tuple could say "stderr rides stdout" or "stderr is binned" and had
+    # no way to say this, so the caller pushed it back onto the shell's own
+    # stderr and the output was simply lost. `cmd 2>&1 >/dev/null` is the
+    # standard way to keep the errors and discard the output; it printed
+    # nothing at all.
+    err_to_term = (d2 == ("term", 1) and d1 != ("term", 1))
     return ("".join(out).strip(), err_to_out, err_devnull, out_devnull, redir,
-            mode, stdin_file, err_file, err_mode, out_to_err)
+            mode, stdin_file, err_file, err_mode, out_to_err, err_to_term)
 
 
 def find_kw_top(text, kws, start=0):
@@ -14211,7 +14220,8 @@ class Shell:
             text = (text[:_hd.start()] + " " + text[_hd.end():]).strip()
         # redirection. Order matters: 2>&1 means "stderr joins stdout".
         text, err_to_out, err_devnull, out_devnull, redir, mode, stdin_file, \
-            err_file, err_mode, out_to_err = strip_redirections(text)
+            err_file, err_mode, out_to_err, err_to_term = \
+            strip_redirections(text)
         if _hd:
             _body, _quoted = self._hd_bodies.get(int(_hd.group(1)), ("", True))
             # bash expands an unquoted-delimiter body when the command runs,
@@ -14563,8 +14573,16 @@ class Shell:
         produced_err = "".join(self._err)
         self._err = saved_err
         self.last_rc = rc
+        # `cmd 2>&1 >file`: stderr stayed on the terminal the command
+        # started with and stdout went to the file. Held aside here and
+        # returned after the redirect has taken stdout, because appending it
+        # to `out` first would put the errors in the file -- the exact thing
+        # the ordering is chosen to avoid.
+        term_err = ""
         if produced_err and not err_devnull:
-            if err_to_out:
+            if err_to_term:
+                term_err = produced_err
+            elif err_to_out:
                 out = produced_err + out
             elif err_file:
                 # `2>errors.log`: the text goes to the file, not to the
@@ -14592,21 +14610,21 @@ class Shell:
             p, mode = self._resolve_fd_path(p, mode)
             if p is None:
                 self.last_rc = 1
-                return ""
+                return term_err
             prev = self.fs.read(p, atime=False) or b"" \
                 if mode == "a" else b""
             if self._noclobber_refused(p, redir, mode):
                 self.last_rc = 1
-                return ""
+                return term_err
             _sp = self._redirect_open(p, redir)
             if _sp is not None:
                 self.last_rc = _sp
-                return ""
+                return term_err
             if not self.fs.write(p, prev + out.encode("latin-1", "replace"),
                                  mode=self._new_mode()):
                 self.last_rc = self._write_fail(p, redir)
-            return ""
-        return out
+            return term_err
+        return term_err + out
 
     # -- command dispatch ---------------------------------------------------
     # (package, upstream version) for everything we claim to ship. dpkg -l,
@@ -35086,8 +35104,36 @@ class Shell:
             return "".join(out), rc
 
         if has("--get-selections"):
-            return "".join("%-40s install\n" % n
-                           for n, _v, _a in self._installed_packages()), 0
+            # Patterns filter, as dpkg's do. This ignored its arguments and
+            # dumped all 104 packages, so `dpkg --get-selections procps`
+            # answered with the whole box -- and a script reading the second
+            # field got whichever package sorted first.
+            pats = [x for x in a[1:] if not x.startswith("-")]
+            rows = [(n, self._pkg_selection(n))
+                    for n, _v, _a in self._installed_packages()]
+            if pats:
+                rows = [r for r in rows
+                        if any(self._glob_ok(pt, r[0]) for pt in pats)]
+                if not rows:
+                    # stderr, and rc 0: measured on trixie.
+                    self.err("dpkg: no packages found matching %s" % pats[0])
+                    return "", 0
+            return "".join(self._selection_line(n, st) for n, st in rows), 0
+        if has("--set-selections"):
+            # Reads "<package> <state>" from stdin. It fell through to the
+            # "need an action option" branch and exited 2, so the twenty-odd
+            # holds the SRBMiner installer set on 2026-08-25 -- one per tool
+            # it had replaced -- every one of them errored, on a box where
+            # the real dpkg would have recorded them and apt-mark showhold
+            # would have listed them.
+            sel = self._pkg_selections()
+            for line in (stdin or "").splitlines():
+                f = line.split()
+                if len(f) != 2:
+                    continue
+                if f[1] in ("install", "hold", "deinstall", "purge"):
+                    sel[f[0]] = f[1]
+            return "", 0
         if has("--print-architecture"):
             return "amd64\n", 0
         if has("--print-foreign-architectures"):
@@ -35195,16 +35241,77 @@ class Shell:
         sub = next((x for x in a if not x.startswith("-")), "")
         if sub in ("showmanual", "showauto", "showhold", "showinstall"):
             if sub == "showhold":
-                return "", 0
+                # Read the same table dpkg --get-selections writes. This
+                # returned "" unconditionally, so a hold set one command
+                # earlier was invisible here -- two commands, one question,
+                # and the one an admin runs to find tampering said nothing.
+                sel = self._pkg_selections()
+                return "".join(n + "\n" for n, _v, _a
+                               in self._installed_packages()
+                               if sel.get(n) == "hold"), 0
             auto = {"libc6", "libssl3", "zlib1g", "libpcre2-8-0", "perl-base",
                     "libgcc-s1", "libstdc++6", "libcrypt1", "libtinfo6"}
             names = [n for n, _v, _a in self._installed_packages()
                      if (n in auto) == (sub == "showauto")]
             return "".join(n + "\n" for n in names), 0
         if sub in ("manual", "auto", "hold", "unhold"):
-            return "", 0
+            # Measured on trixie: "coreutils set on hold." / "Canceled hold
+            # on coreutils." on stdout with rc 0, and for a name that is not
+            # a package, two E: lines on stderr with rc 100. All four of
+            # these were a silent "" and rc 0, so a script checking whether
+            # its hold took could not tell success from a typo.
+            targets = [x for x in a if not x.startswith("-")][1:]
+            known = {n for n, _v, _a in self._installed_packages()}
+            sel = self._pkg_selections()
+            out, bad = [], []
+            for t in targets:
+                if t not in known:
+                    bad.append(t)
+                    continue
+                if sub == "hold":
+                    sel[t] = "hold"
+                    out.append("%s set on hold.\n" % t)
+                elif sub == "unhold":
+                    if sel.get(t) == "hold":
+                        sel[t] = "install"
+                    out.append("Canceled hold on %s.\n" % t)
+            if bad:
+                for t in bad:
+                    self.err("E: Unable to locate package %s" % t)
+                self.err("E: No packages found")
+                return "".join(out), 100
+            return "".join(out), 0
         self.err("apt-mark: missing operand")
         return "", 1
+
+    def _pkg_selections(self):
+        """dpkg's selection states, on the VFS so they outlive one command.
+
+        An attacker holding a package is persistence: it stops the tool they
+        replaced being repaired by an upgrade. It has to survive the session
+        the way their files do.
+        """
+        sel = getattr(self.fs, "pkg_selections", None)
+        if sel is None:
+            sel = {}
+            self.fs.pkg_selections = sel
+        return sel
+
+    def _pkg_selection(self, name):
+        return self._pkg_selections().get(name, "install")
+
+    @staticmethod
+    def _selection_line(name, state):
+        """dpkg pads the name with TABS to column 48, not with spaces.
+
+        Measured: "apt" gets six tabs, "base-passwd" five, both landing the
+        state at column 48. This printed "%-40s install", which is a
+        different number of a different character -- `dpkg --get-selections
+        | cat -A` shows it immediately, and so does any diff against a
+        second box.
+        """
+        pad = max(1, (48 - len(name) + 7) // 8)
+        return "%s%s%s\n" % (name, "\t" * pad, state)
 
     @staticmethod
     def _glob_ok(pattern, name):

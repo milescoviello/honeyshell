@@ -59,6 +59,7 @@ Run all:  `./run-suites.sh`
 - `greptest.py` -- grep kept only the last -e.
 - `hardlinktest.py` -- Hard links: the two ways of asking, and only one answered.
 - `heredoctest.py` -- Here-documents: quoted ones were real, and real ones lost their block.
+- `holdtest.py` -- Holding a package is persistence. Do the two commands that show it agree?
 - `hostassumetest.py` -- Do the differential suites know a host difference from an emulator bug?
 - `hugetest.py` -- Hugepages: one number, five places that report it.
 - `hwprofiletest.py` -- How much hardware is this, and do the answers agree?
