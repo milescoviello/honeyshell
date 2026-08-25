@@ -4235,6 +4235,8 @@ class VFS:
         # replaced by the sketch in the second. One file, two writers, and
         # the wrong one last is the same shape as everything else here.
         self._install_whole_files()
+        self._install_account_backups()
+        self._install_motd_chain()
         # Captured LAST, once the image is finished. It used to be taken
         # straight after _seed(), while _seed_gaps() and the whole-file
         # install still had writes to make -- so any file touched after
@@ -4816,6 +4818,107 @@ class VFS:
                                          mtime=self._dir_mtime)
                 made += 1
         return made
+
+    #: The generators behind the dynamic MOTD, measured off the guest.
+    MOTD_SCRIPTS = {
+        "/etc/update-motd.d/10-uname": "#!/bin/sh\nuname -snrvm\n",
+        "/etc/update-motd.d/92-unattended-upgrades": '#!/bin/sh\n\nif [ -x /usr/share/unattended-upgrades/update-motd-unattended-upgrades ]; then\n    exec /usr/share/unattended-upgrades/update-motd-unattended-upgrades\nfi\n',
+    }
+
+    def _install_motd_chain(self):
+        """/etc/pam.d names a file that has to exist.
+
+        Both /etc/pam.d/login and /etc/pam.d/sshd carry
+
+            session optional pam_motd.so motd=/run/motd.dynamic
+
+        and /run/motd.dynamic did not exist -- nor did /etc/update-motd.d,
+        the directory whose scripts generate it. A config file pointing at a
+        path the box does not have is a one-command tell, and reading
+        /etc/pam.d/* is a normal step when working out how a login is put
+        together.
+
+        Note this does NOT conflict with `PrintMotd no` in sshd_config, which
+        is correct and must stay: on Debian the MOTD is printed by pam_motd,
+        not by sshd, so `PrintMotd no` alongside a visible banner is exactly
+        what a real box looks like. The defect was never that a banner
+        appears -- it is that the machinery the PAM stack names was missing.
+
+        The content is generated rather than copied: /run/motd.dynamic holds
+        this persona's own `uname -snrvm` output, which is what 10-uname
+        produces.
+        """
+        self.nodes["/etc/update-motd.d"] = FileNode(
+            mode=0o755, uid=0, gid=0, is_dir=True, mtime=BOOT_TS - 40 * 86400)
+        for path, body in self.MOTD_SCRIPTS.items():
+            self.nodes[path] = FileNode(body.encode(), mode=0o755, uid=0,
+                                        gid=0, mtime=BOOT_TS - 40 * 86400)
+        # Built from the same constants uname reads, so the file and the
+        # command that generates it cannot drift apart. This is `uname -snrvm`
+        # -- kernel name, hostname, release, version, machine -- which is
+        # exactly what 10-uname runs.
+        dyn = "Linux %s %s %s %s\n" % (self.hostname, KERNEL, KERNEL_VER, ARCH)
+        self.nodes["/run/motd.dynamic"] = FileNode(
+            dyn.encode("latin-1", "replace"), mode=0o644, uid=0, gid=0,
+            mtime=BOOT_TS)
+
+    def _install_account_backups(self):
+        """passwd-, group-, shadow-, gshadow- -- the copies useradd leaves.
+
+        Every Debian box that has ever had an account added or changed carries
+        these four, and this one carried none. They matter more than most
+        absences:
+
+          * `ls -la /etc` shows them, and the dash-suffixed pairs are a shape
+            people recognise without looking for.
+          * /etc/shadow- is a credential target in its own right: it holds the
+            PREVIOUS hashes, so on a real box it sometimes yields an older
+            password that still works somewhere else. Reading /etc/shadow and
+            finding no /etc/shadow- says something.
+          * They are evidence of history. Their absence claims no account has
+            ever been added, on a box whose /etc/passwd plainly contains a
+            `deploy` account that was added after the image was built.
+
+        Each backup is the state before that file's LAST write, and the two
+        pairs were written by different commands -- so they are snapshots of
+        different moments, which is what makes the set internally consistent:
+
+          useradd deploy            wrote passwd and shadow
+          usermod -aG sudo deploy   wrote group and gshadow
+
+        So passwd- and shadow- predate the account entirely, while group- and
+        gshadow- already have the deploy group but do not yet have deploy in
+        sudo. `diff /etc/group /etc/group-` shows exactly the sudo membership,
+        which is what a real pair shows after one usermod.
+        """
+        def _lines(path):
+            return (self.read(path) or b"").decode("latin-1").splitlines(True)
+
+        def _put(path, body, mode, gid, mtime):
+            self.nodes[path] = FileNode(body.encode("latin-1", "replace"),
+                                        mode=mode, uid=0, gid=gid,
+                                        mtime=mtime)
+
+        live = self.nodes.get("/etc/passwd")
+        base = live.mtime if live is not None else BOOT_TS
+        # The guest's backups sit about five minutes behind their live file.
+        older = base - 300
+
+        pw = "".join(l for l in _lines("/etc/passwd")
+                     if not l.startswith("deploy:"))
+        sh = "".join(l for l in _lines("/etc/shadow")
+                     if not l.startswith("deploy:"))
+        # group/gshadow keep the deploy group -- useradd had already made it --
+        # and lose only the sudo membership that usermod added afterwards.
+        gr = "".join(l.replace("sudo:x:27:deploy", "sudo:x:27:")
+                     for l in _lines("/etc/group"))
+        gs = "".join(l.replace("sudo:*::deploy", "sudo:*::")
+                     for l in _lines("/etc/gshadow"))
+
+        _put("/etc/passwd-", pw, 0o644, 0, older)
+        _put("/etc/group-", gr, 0o644, 0, older)
+        _put("/etc/shadow-", sh, 0o640, 42, older)
+        _put("/etc/gshadow-", gs, 0o640, 42, older)
 
     def _install_whole_files(self):
         """Replace the sketched /etc files with the guest's real contents.

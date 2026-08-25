@@ -45,6 +45,7 @@ Run all:  `./run-suites.sh`
 - `environtest.py` -- What does this box say about the processes running on it?
 - `envtest.py` -- The environment, from four directions.
 - `errtest.py` -- set -e, set -u, pipefail and trap -- does the shell stop when told to?
+- `etcbackuptest.py` -- Files the box's own configuration says exist.
 - `exectest.py` -- How execution fails, and what the box says about it.
 - `failtest.py` -- The wording and exit status of every way a command can fail.
 - `fdtest.py` -- What files does this process have open, and does /proc agree?
