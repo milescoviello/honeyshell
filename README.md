@@ -1,6 +1,6 @@
 # honeyshell — a Debian 13 shell emulator, and the test suite that proves it
 
-A shell emulator faithful enough to put behind an SSH honeypot, with **166
+A shell emulator faithful enough to put behind an SSH honeypot, with **167
 test suites** that check it against the real thing rather than against
 expectations written by hand.
 
@@ -31,10 +31,10 @@ it buys.
 
 | | |
 |---|---:|
-| Emulator | 39,526 lines |
+| Emulator | 39,553 lines |
 | Commands | 348 |
-| Suites | 166 |
-| Test code | 45,442 lines |
+| Suites | 167 |
+| Test code | 45,613 lines |
 
 Command count is `cmd_*` entry points on `Shell` — 348 `def cmd_` definitions
 plus 17 aliases such as `cmd_mawk = cmd_awk`; dispatch is
@@ -48,7 +48,7 @@ every sweep, so treat them as the size of the thing rather than a constant.
 
 | File | Lines | Job |
 |---|---:|---|
-| `fakeshell.py` | 39,526 | The emulator: the VFS, the shell language, and every command |
+| `fakeshell.py` | 39,553 | The emulator: the VFS, the shell language, and every command |
 | `awkemu.py` | 1,304 | awk — attackers pipe nearly everything through it |
 | `localedb.py` | 1,164 | Locale data, so `LC_ALL=` actually changes what commands print |
 | `sedemu.py` | 792 | sed |
@@ -56,7 +56,7 @@ every sweep, so treat them as the size of the thing rather than a constant.
 | `tzdb.py` | 536 | Timezone data |
 | `skeldb.py` | 29 | `/etc/skel` |
 
-`SUITES.md` lists all 166 suites and the one question each asks. It is
+`SUITES.md` lists all 167 suites and the one question each asks. It is
 generated from the suites' own docstrings, so it cannot drift from them.
 
 ```sh

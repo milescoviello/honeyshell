@@ -15999,6 +15999,33 @@ class Shell:
             # found because the dot was left in the attribute name.
             fn = getattr(self, "cmd_" + cmd.replace("-", "_").replace(
                 ".", "_"), None)
+        # ...and a command answers as *itself* only if the file behind it is
+        # still the one the package installed. Every stock binary here is an
+        # ELF stub with no content; a file with content and no ELF header at
+        # that path is one the attacker put there.
+        #
+        # This is the whole point of the anti-forensics step every miner
+        # runs. One actor replaced 23 binaries in a single session -- ps,
+        # top, htop, pgrep, pkill, killall, lsof, strace, netstat, ss, w,
+        # who, last, id, uptime, watch -- then installed its miner and ran
+        # `ps`. It got the real process list back, with its own miner in it,
+        # from a file it had just overwritten. `cat /usr/bin/ps` showed
+        # their script, `file` said "POSIX shell script", `stat -c %s` said
+        # 22 bytes, and `ps` behaved like procps. Four readers, two answers.
+        if (fn is not None and "/" not in cmd and not from_path
+                and cmd not in self._BUILTINS
+                and cmd not in self._SHELL_KEYWORDS
+                and cmd not in self.funcs):
+            _hit = self.path_lookup(cmd)
+            if _hit:
+                _n = self.fs.nodes.get(_hit) or self.fs.nodes.get(
+                    self.fs.resolve(_hit))
+                if _n is not None and _n.elf is None and _n.content:
+                    self.log(event="replaced_binary_run", command=cmd,
+                             path=_hit, size=len(_n.content), notable=True)
+                    return self.dispatch(_hit, args, stdin, raw,
+                                         from_path=True)
+
         # A command answers only if the box has a file for it. We implement
         # more than this persona installs, so `write`, `python`, `zsh`, `ash`
         # and `yum` all ran while `command -v` said they did not exist and

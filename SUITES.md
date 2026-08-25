@@ -123,6 +123,7 @@ Run all:  `./run-suites.sh`
 - `rectest.py` -- Which commands actually walk the tree?
 - `redirfdtest.py` -- Which file descriptor is that, and does the whole parser agree?
 - `redirtest.py` -- Where does the output go?
+- `replacedbintest.py` -- A binary the attacker replaced has to be the binary that runs.
 - `replaytest.py` -- Replay the fingerprinting probes attackers actually sent, against real Debian.
 - `restest.py` -- Does the box agree about how much of everything it has?
 - `rmpersisttest.py` -- A binary an attacker deleted has to still be gone when they come back.
