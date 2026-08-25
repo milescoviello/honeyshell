@@ -2611,6 +2611,27 @@ CPU_CACHES = (
 # a PAM service, and the PAM sweep seeded /etc/pam.d from a container that
 # did not have cron, so the one service whose stack was missing was the one
 # whose package we claim to have installed.
+#: The real cron scripts, byte-for-byte off the guest. All four names were
+#: 17-byte stubs holding a shebang and 'set -e', which is exactly what a
+#: gutted script looks like after an attacker's cleaner has run. Listing
+#: /etc/cron.daily is a normal move when hunting cron persistence, and four
+#: identical 17-byte files is not what a real box looks like.
+#:
+#: It also explains a capture. 203.0.113.24's clean.sh strips every line
+#: matching its downloader pattern and writes back the remainder, which for
+#: these scripts is the shebang and 'set -e'. Against stubs that was a
+#: no-op, so the write logged unchanged=True: the attacker spent its visit
+#: cleaning files that were already empty.
+#:
+#: /etc/cron.daily/logrotate is deliberately absent -- the guest has no such
+#: file, because logrotate runs from a systemd timer on trixie.
+CRON_SCRIPTS = {
+    '/etc/cron.daily/apt-compat': (1750746300, '#!/bin/sh\n\nset -e\n\n# Systemd systems use a systemd timer unit which is preferable to\n# run. We want to randomize the apt update and unattended-upgrade\n# runs as much as possible to avoid hitting the mirrors all at the\n# same time. The systemd time is better at this than the fixed\n# cron.daily time\nif [ -d /run/systemd/system ]; then\n    exit 0\nfi\n\ncheck_power()\n{\n    # laptop check, on_ac_power returns:\n    #       0 (true)    System is on main power\n    #       1 (false)   System is not on main power\n    #       255 (false) Power status could not be determined\n    # Desktop systems always return 255 it seems\n    if command -v on_ac_power >/dev/null; then\n        if on_ac_power; then\n            :\n        elif [ $? -eq 1 ]; then\n            return 1\n        fi\n    fi\n    return 0\n}\n\n# sleep for a random interval of time (default 30min)\n# (some code taken from cron-apt, thanks)\nrandom_sleep()\n{\n    RandomSleep=1800\n    eval $(apt-config shell RandomSleep APT::Periodic::RandomSleep)\n    if [ $RandomSleep -eq 0 ]; then\n\treturn\n    fi\n    if [ -z "$RANDOM" ] ; then\n        # A fix for shells that do not have this bash feature.\n\tRANDOM=$(( $(dd if=/dev/urandom bs=2 count=1 2> /dev/null | cksum | cut -d\' \' -f1) % 32767 ))\n    fi\n    TIME=$(($RANDOM % $RandomSleep))\n    sleep $TIME\n}\n\n# delay the job execution by a random amount of time\nrandom_sleep\n\n# ensure we don\'t do this on battery\ncheck_power || exit 0\n\n# run daily job\nexec /usr/lib/apt/apt.systemd.daily\n'),
+    '/etc/cron.daily/dpkg': (1765866300, '#!/bin/sh\n\n# Skip if systemd is running.\nif [ -d /run/systemd/system ]; then\n  exit 0\nfi\n\n/usr/libexec/dpkg/dpkg-db-backup\n'),
+    '/etc/cron.daily/man-db': (1746167100, '#!/bin/sh\n#\n# man-db cron daily\n\nset -e\n\nif [ -d /run/systemd/system ]; then\n    # Skip in favour of systemd timer.\n    exit 0\nfi\n\n# This should be set by cron, but apparently isn\'t always; see\n# https://bugs.debian.org/209185.  Add fallbacks so that start-stop-daemon\n# can be found.\nexport PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"\n\niosched_idle=\n# Don\'t try to change I/O priority in a vserver or OpenVZ.\nif ! grep -Eq \'(envID|VxID):.*[1-9]\' /proc/self/status && \\\n   { [ ! -d /proc/vz ] || [ -d /proc/bc ]; }; then\n    iosched_idle=\'--iosched idle\'\nfi\n\nif ! [ -d /var/cache/man ]; then\n    # Recover from deletion, per FHS.\n    install -d -o man -g man -m 0755 /var/cache/man\nfi\n\n# expunge old catman pages which have not been read in a week\nif [ -d /var/cache/man ]; then\n  cd /\n  # shellcheck disable=SC2086\n  start-stop-daemon --start --pidfile /dev/null --startas /bin/sh \\\n\t--oknodo --chuid man $iosched_idle -- -c \\\n\t"find /var/cache/man -type f -name \'*.gz\' -atime +6 -print0 | \\\n\t xargs -r0 rm -f"\nfi\n\n# regenerate man database\nif [ -x /usr/bin/mandb ]; then\n    # --pidfile /dev/null so it always starts; mandb isn\'t really a daemon,\n    # but we want to start it like one.\n    # shellcheck disable=SC2086\n    start-stop-daemon --start --pidfile /dev/null \\\n\t\t      --startas /usr/bin/mandb --oknodo --chuid man \\\n\t\t      $iosched_idle \\\n\t\t      -- --no-purge --quiet\nfi\n\nexit 0\n'),
+    '/etc/cron.weekly/man-db': (1746167100, '#!/bin/sh\n#\n# man-db cron weekly\n\nset -e\n\nif [ -d /run/systemd/system ]; then\n    # Skip in favour of systemd timer.\n    exit 0\nfi\n\n# This should be set by cron, but apparently isn\'t always; see\n# https://bugs.debian.org/209185.  Add fallbacks so that start-stop-daemon\n# can be found.\nexport PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"\n\niosched_idle=\n# Don\'t try to change I/O priority in a vserver or OpenVZ.\nif ! grep -Eq \'(envID|VxID):.*[1-9]\' /proc/self/status && \\\n   { [ ! -d /proc/vz ] || [ -d /proc/bc ]; }; then\n    iosched_idle=\'--iosched idle\'\nfi\n\nif ! [ -d /var/cache/man ]; then\n    # Recover from deletion, per FHS.\n    install -d -o man -g man -m 0755 /var/cache/man\nfi\n\n# regenerate man database\nif [ -x /usr/bin/mandb ]; then\n    # --pidfile /dev/null so it always starts; mandb isn\'t really a daemon,\n    # but we want to start it like one.\n    # shellcheck disable=SC2086\n    start-stop-daemon --start --pidfile /dev/null \\\n\t\t      --startas /usr/bin/mandb --oknodo --chuid man \\\n\t\t      $iosched_idle \\\n\t\t      -- --quiet\nfi\n\nexit 0\n'),
+}
+
 CRON_FILES = {'/etc/default/cron': '# Cron configuration options\n'
                       '\n'
                       "# Whether to read the system's default "
@@ -8252,9 +8273,10 @@ class VFS:
           "\tcompress\n\tdelaycompress\n\tnotifempty\n}\n")
         w("/etc/cron.d/e2scrub_all",
           "30 3 * * 0 root test -e /run/systemd/system || SERVICE_MODE=1 /usr/lib/x86_64-linux-gnu/e2fsprogs/e2scrub_all_cron\n")
-        for f in ("apt-compat", "dpkg", "logrotate", "man-db"):
-            w("/etc/cron.daily/" + f, "#!/bin/sh\nset -e\n")
-            self.nodes["/etc/cron.daily/" + f].mode = 0o755
+        for _p, (_ts, _body) in CRON_SCRIPTS.items():
+            w(_p, _body)
+            self.nodes[_p].mode = 0o755
+            self.nodes[_p].mtime = _ts
         w("/etc/systemd/system/deploy-worker.service",
           "[Unit]\nDescription=Deploy queue worker\nAfter=network.target mysql.service\n\n"
           "[Service]\nType=simple\nUser=deploy\nWorkingDirectory=/var/www\n"
@@ -12056,8 +12078,50 @@ class Shell:
         ("/etc/profile", "persistence_write", "shell_init"),
     )
 
+    @staticmethod
+    def _cron_lines(data):
+        """The meaningful lines of a cron file or cron.d script.
+
+        Comments and blanks are dropped: a crontab that keeps only its
+        header comment has been emptied, whatever its byte count says.
+        """
+        out = set()
+        for line in (data or b"").decode("latin-1").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                out.add(line)
+        return frozenset(out)
+
+    @staticmethod
+    def _cron_verdict(before, after):
+        """cron_install / cron_stripped / cron_cleared, by line delta.
+
+        One event name covered three opposite actions. Measured on this box:
+        every external cron_install ever recorded was a WIPE. 203.0.113.24's
+        clean.sh greps out every line matching
+        wget|curl|/dev/tcp|/tmp|[.]sh|nc|bash -i|sh -i|base64 -d and writes
+        back what is left, which for Debian's own daily jobs is the shebang
+        and `set -e`. The log called that an install, cron_install is on the
+        push-notify list, and intel.py files it as persistence -- so the
+        highest-signal event class on the box was dominated by its own
+        opposite.
+
+        The delta is the discriminator that works for both file shapes.
+        "Has no schedule line" would not: /etc/cron.daily/* are shell
+        scripts and never have one.
+        """
+        if after == before:
+            return "cron_install"          # a re-assertion of the same lines
+        if not after and before:
+            return "cron_cleared"
+        if before and after < before:
+            return "cron_stripped"
+        return "cron_install"
+
     def _cron_snapshot(self):
-        """path -> (digest, event, kind) for every persistence location."""
+        """path -> (digest, event, kind, lines) for every persistence
+        location. The line set is carried so a write can be classified by
+        what it removed rather than only noticed by its digest changing."""
         snap = {}
         try:
             todo = [(p, ev, kind) for p, ev, kind in self._PERSIST_FILES]
@@ -12068,7 +12132,7 @@ class Shell:
                 data = self.rawfs.read(path)
                 if data is not None:
                     snap[path] = (hashlib.sha256(data).hexdigest()[:16],
-                                  ev, kind)
+                                  ev, kind, self._cron_lines(data))
         except Exception:
             pass
         return snap
@@ -12094,7 +12158,7 @@ class Shell:
         hole exactly where the careful attacker goes.
         """
         after = self._cron_snapshot()
-        for path, (digest, ev, kind) in after.items():
+        for path, (digest, ev, kind, lines) in after.items():
             if before.get(path, (None,))[0] == digest:
                 continue
             if path in self._cron_logged:
@@ -12102,9 +12166,13 @@ class Shell:
                 # action is its own kind of noise.
                 continue
             body = (self.rawfs.read(path) or b"").decode("latin-1")
+            if ev == "cron_install":
+                prev = before.get(path)
+                ev = self._cron_verdict(
+                    prev[3] if prev and len(prev) > 3 else frozenset(), lines)
             self.log(event=ev, path=path, kind=kind, via="file_write",
                      content=body[:2000])
-        for path, (_d, ev, kind) in before.items():
+        for path, (_d, ev, kind, _l) in before.items():
             if path not in after:
                 self.log(event="cron_removed" if ev == "cron_install"
                          else "persistence_removed", path=path, kind=kind)

@@ -321,7 +321,17 @@ def t_etc_cron_locations_still_there():
     check("/etc/crontab exists", out(s, "head -1 /etc/crontab") != "", "")
     check("cron.d has e2scrub_all", "e2scrub_all" in out(s, "ls /etc/cron.d"),
           out(s, "ls /etc/cron.d"))
-    check("cron.daily populated", "logrotate" in out(s, "ls /etc/cron.daily"),
+    # The guest's cron.daily holds apt-compat, dpkg and man-db -- and no
+    # logrotate, which runs from a systemd timer on trixie. This used to
+    # assert logrotate was present, which pinned the emulator's own stub set
+    # rather than anything measured off the box it copies.
+    _daily = sorted(out(s, "ls /etc/cron.daily").split())
+    check("cron.daily holds the guest's three", _daily ==
+          ["apt-compat", "dpkg", "man-db"], _daily)
+    check("...and they are real scripts, not stubs",
+          len(out(s, "cat /etc/cron.daily/man-db")) > 200,
+          out(s, "cat /etc/cron.daily/man-db")[:40])
+    check("cron.daily populated", "man-db" in out(s, "ls /etc/cron.daily"),
           out(s, "ls /etc/cron.daily"))
     eq("cron is running", out(s, "systemctl is-active cron"), "active")
 

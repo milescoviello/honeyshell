@@ -28,6 +28,7 @@ Run all:  `./run-suites.sh`
 - `cgrouptest.py` -- cgroup v2: the tree, and the numbers systemd quotes from it.
 - `colortest.py` -- grep's colour, and the terminal signal that decides it.
 - `cputest.py` -- Does the box describe a CPU that /sys actually contains?
+- `crontamptest.py` -- A wipe, a gutting and an install all logged as cron_install.
 - `crontest.py` -- crontab: one crontab for everyone, and no validation at all.
 - `detect.py` -- Try to prove this box is fake, the way an attacker who just landed would.
 - `devtest.py` -- Does the disk story hold together from /etc/fstab down to /dev?
