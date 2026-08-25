@@ -37,6 +37,7 @@ Run all:  `./run-suites.sh`
 - `difftest2.py` -- Round 2: wider corpus, still machine-independent constructs only.
 - `difftest3.py` -- Round 3: harder constructs + idioms lifted from real bot payloads.
 - `difftest4.py` -- Differential test for the Debian userland added on top of the core shell.
+- `dirlocktest.py` -- An immutable directory freezes its entries, not its files' contents.
 - `disktest.py` -- How big is this disk, and how much of it is gone?
 - `dispatchtest.py` -- How a loader picks its payload: case dispatch and =~ tests.
 - `dltest.py` -- The file the attacker downloaded, and the file we archived.

@@ -8502,6 +8502,18 @@ class VFS:
         if "i" in attrs or "a" in attrs:
             self._remove_denied = True
             return False
+        # And the *parent's* lock. Unlinking is a modification of the
+        # directory, so an immutable directory keeps its contents even when
+        # the contents themselves carry no attribute. Measured on the
+        # guest's ext4: with the directory +i, `rm existing` is EPERM and
+        # the file is still there afterwards, while appending to that same
+        # file succeeds -- the entries are frozen, the bytes are not.
+        # dir_locked() existed and creation consulted it; deletion did not,
+        # so `chattr -R +i /bin` stopped anything being added and let
+        # everything be removed, which is the opposite of the point.
+        if self.dir_locked(path):
+            self._remove_denied = True
+            return False
         if self.nodes[path].is_dir:
             if not recursive:
                 return False
@@ -8527,6 +8539,12 @@ class VFS:
         if path in self.nodes:
             return False
         if not self.isdir(os.path.dirname(path) or "/"):
+            return False
+        # An immutable parent takes new subdirectories too, not just new
+        # files. write() consulted dir_locked() and this did not, so
+        # `chattr +i /usr/bin` stopped a file being dropped there and let a
+        # directory be created beside it.
+        if self.dir_locked(path):
             return False
         # mtime=now: a directory the attacker just made must not inherit the
         # synthetic age used for the pre-existing tree. `mkdir /tmp/.x &&
@@ -19313,7 +19331,8 @@ class Shell:
             path = VFS.norm(f, self.cwd)
             if self.fs.exists(path):
                 if not parents:
-                    self.err("mkdir: cannot create directory '%s': File exists" % f)
+                    self.err("mkdir: cannot create directory "
+                             "\u2018%s\u2019: File exists" % f)
                     rc = 1
                 continue
             if parents:
@@ -19334,12 +19353,28 @@ class Shell:
                         made = False
                         break
                 if not made:
-                    self.err("mkdir: cannot create directory '%s': "
-                             "No such file or directory" % f)
+                    # -p walks the components, so the failure it reports has
+                    # to name the reason for the one that stopped it. An
+                    # immutable parent is EPERM, not ENOENT.
+                    self.err("mkdir: cannot create directory "
+                             "\u2018%s\u2019: %s"
+                             % (f, "Operation not permitted"
+                                if self.fs.dir_locked(path)
+                                else "No such file or directory"))
                     rc = 1
                 continue
             if not self.fs.mkdir(path, mode):
-                self.err("mkdir: cannot create directory '%s': No such file or directory" % f)
+                # GNU mkdir quotes with \u2018 \u2019 -- measured on the
+                # guest for every mkdir error, while rm, rmdir, touch and
+                # mv on the same box all use the ASCII apostrophe. One
+                # style for all of them was wrong for this one.
+                if self.fs.dir_locked(path):
+                    self.err("mkdir: cannot create directory "
+                             "\u2018%s\u2019: Operation not permitted" % f)
+                else:
+                    self.err("mkdir: cannot create directory "
+                             "\u2018%s\u2019: No such file or "
+                             "directory" % f)
                 rc = 1
         return "", rc
 
@@ -19677,6 +19712,20 @@ class Shell:
                 self.err("mv: cannot move '%s' to '%s': Operation not "
                          "permitted" % (srcs[0], srcs[-1] if len(srcs) > 1
                                         else srcs[0]))
+                return "", 1
+            # And the directories at either end. A rename removes a name
+            # from one and adds one to the other, so an immutable directory
+            # refuses both halves even when neither file carries a flag.
+            # Without this the delegation to cp reported cp's failure --
+            # "cp: cannot create regular file 'x': No such file or
+            # directory" -- which names the wrong tool and the wrong
+            # reason, and only the prefix was being rewritten to "mv:".
+            _dst = VFS.norm(srcs[-1], self.cwd) if len(srcs) > 1 else None
+            if _dst is not None and (self.fs.dir_locked(_dst)
+                                     or self.fs.dir_locked(
+                                         VFS.norm(srcs[0], self.cwd))):
+                self.err("mv: cannot move '%s' to '%s': Operation not "
+                         "permitted" % (srcs[0], srcs[-1]))
                 return "", 1
         # A rename preserves the inode's metadata outright -- mode, owner
         # and timestamps, set-id bits included. Going through a plain cp
@@ -28449,11 +28498,32 @@ class Shell:
             elif not self.fs.isdir(path):
                 self.err("rmdir: failed to remove '%s': Not a directory" % f)
                 rc = 1
+            elif self.fs.attr_locked(path) or self.fs.dir_locked(path):
+                # EPERM comes before "Directory not empty": measured on the
+                # guest, a *non-empty* immutable directory still reports
+                # "Operation not permitted". The immutable flag is checked
+                # by the kernel before the emptiness is.
+                self.err("rmdir: failed to remove '%s': Operation not "
+                         "permitted" % f)
+                rc = 1
             elif self.fs.listdir(path):
                 self.err("rmdir: failed to remove '%s': Directory not empty" % f)
                 rc = 1
-            else:
-                self.fs.remove(path)
+            elif not self.fs.remove(path, recursive=True):
+                # recursive=True because remove() refuses a directory
+                # without it -- and it refused silently, because the return
+                # value was thrown away. So `rmdir` has never removed
+                # anything: it reported rc 0 and left the directory, and
+                # `ls` right afterwards still listed it. Two commands
+                # disagreeing about whether a directory exists, one of them
+                # having just claimed to delete it.
+                #
+                # Safe here: the branch above has already established the
+                # directory is empty, so recursive removes exactly the one
+                # node rmdir is allowed to remove.
+                self.err("rmdir: failed to remove '%s': Operation not "
+                         "permitted" % f)
+                rc = 1
         return "", rc
 
     def cmd_env(self, a, stdin=""):
