@@ -7242,6 +7242,8 @@ class VFS:
                 out.append(["b", e[1], e[2], e[3]])
             elif e[0] == "k":
                 out.append(["k", e[1], e[2]])
+            elif e[0] == "a":
+                out.append(["a", e[1], e[2]])
             elif e[0] == "h":
                 out.append(["h", e[1], e[2]])
             elif e[0] == "o":
@@ -7406,6 +7408,11 @@ class VFS:
                         node = self.nodes.get(e[1])
                         if node is not None:
                             node.mode = e[2]
+                    elif e[0] == "a":
+                        node = self.nodes.get(e[1]) or self.nodes.get(
+                            self.resolve(e[1]))
+                        if node is not None:
+                            node.attrs = set(e[2] or "")
                     elif e[0] == "l":
                         self.symlink(e[1], e[2])
                         # A symlink has an mtime of its own, and it was not
@@ -32180,13 +32187,28 @@ class Shell:
                             self.err("Removed '%s'." % link)
                     cur.pop("enabled", None)
                 elif verb == "mask":
+                    # systemd always creates the /dev/null symlink, for a
+                    # known unit as much as an unknown one -- measured on
+                    # the guest against a real timer. Setting only a flag
+                    # meant `ls -l /etc/systemd/system/cron.service` showed
+                    # nothing after masking cron, while is-enabled said
+                    # masked: two readers, one question.
+                    fu = self._unit_full(u)
+                    link = "/etc/systemd/system/%s" % fu
+                    if not self.fs.exists(link):
+                        self.fs.symlink(link, "/dev/null")
+                        self.err("Created symlink '%s' \u2192 '/dev/null'."
+                                 % link)
                     cur["enabled"] = "masked"
                     cur["active"] = False
-                    self.err("Created symlink '/etc/systemd/system/%s.service'"
-                             " -> '/dev/null'." % u)
                 elif verb == "unmask":
+                    fu = self._unit_full(u)
+                    link = "/etc/systemd/system/%s" % fu
+                    if self.fs.nodes.get(link) is not None and getattr(
+                            self.fs.nodes[link], "link", None) == "/dev/null":
+                        self.fs.nodes.pop(link, None)
+                        self.err("Removed '%s'." % link)
                     cur["enabled"] = "enabled"
-                    self.err("Removed '/etc/systemd/system/%s.service'." % u)
                 self.log(event="service_control", verb=verb, unit=u)
             return "", rc
         if verb == "daemon-reload" or verb == "daemon-reexec":
@@ -32226,6 +32248,17 @@ class Shell:
             all. A unit with no [Install] is static; otherwise enablement is
             whether the .wants symlink exists.
             """
+            # A mask is a symlink to /dev/null, and systemd reads that
+            # rather than an internal flag. Checking the file first means a
+            # mask set before a restart is still a mask after one, because
+            # the symlink comes back with the rest of the filesystem -- the
+            # state dict did not, so `systemctl mask` used to be undone by
+            # any restart of the honeypot while the attacker's files
+            # survived.
+            _mask = "/etc/systemd/system/%s" % self._unit_full(u)
+            if self.fs.nodes.get(_mask) is not None and \
+                    getattr(self.fs.nodes[_mask], "link", None) == "/dev/null":
+                return "masked"
             override = state.get(u, {}).get("enabled")
             if override is not None:
                 return override
@@ -35257,13 +35290,12 @@ class Shell:
             # it had replaced -- every one of them errored, on a box where
             # the real dpkg would have recorded them and apt-mark showhold
             # would have listed them.
-            sel = self._pkg_selections()
             for line in (stdin or "").splitlines():
                 f = line.split()
                 if len(f) != 2:
                     continue
                 if f[1] in ("install", "hold", "deinstall", "purge"):
-                    sel[f[0]] = f[1]
+                    self._pkg_set_selection(f[0], f[1])
             return "", 0
         if has("--print-architecture"):
             return "amd64\n", 0
@@ -35393,18 +35425,17 @@ class Shell:
             # its hold took could not tell success from a typo.
             targets = [x for x in a if not x.startswith("-")][1:]
             known = {n for n, _v, _a in self._installed_packages()}
-            sel = self._pkg_selections()
             out, bad = [], []
             for t in targets:
                 if t not in known:
                     bad.append(t)
                     continue
                 if sub == "hold":
-                    sel[t] = "hold"
+                    self._pkg_set_selection(t, "hold")
                     out.append("%s set on hold.\n" % t)
                 elif sub == "unhold":
-                    if sel.get(t) == "hold":
-                        sel[t] = "install"
+                    if self._pkg_selection(t) == "hold":
+                        self._pkg_set_selection(t, "install")
                     out.append("Canceled hold on %s.\n" % t)
             if bad:
                 for t in bad:
@@ -35415,18 +35446,51 @@ class Shell:
         self.err("apt-mark: missing operand")
         return "", 1
 
-    def _pkg_selections(self):
-        """dpkg's selection states, on the VFS so they outlive one command.
+    #: Where dpkg keeps a selection: the first word of the package's
+    #: Status line in /var/lib/dpkg/status. Measured on a trixie --
+    #: "Status: install ok installed" becomes "Status: hold ok installed"
+    #: after `dpkg --set-selections`.
+    _DPKG_STATUS = "/var/lib/dpkg/status"
 
-        An attacker holding a package is persistence: it stops the tool they
-        replaced being repaired by an upgrade. It has to survive the session
-        the way their files do.
+    def _pkg_selections(self):
+        """dpkg's selection states, read out of /var/lib/dpkg/status.
+
+        This was a dict on the VFS. It worked for the length of a session
+        and vanished on a restart, while the attacker's *files* came back
+        from the replay journal -- so a returning actor found the package
+        they had pinned unpinned, with nothing on disk ever having said it
+        was held. Keeping it where the real dpkg keeps it means the journal
+        carries it for free and there is only one copy of the answer.
         """
-        sel = getattr(self.fs, "pkg_selections", None)
-        if sel is None:
-            sel = {}
-            self.fs.pkg_selections = sel
-        return sel
+        out = {}
+        body = (self.fs.read(self._DPKG_STATUS) or b"").decode("latin-1")
+        name = None
+        for line in body.splitlines():
+            if line.startswith("Package: "):
+                name = line[9:].strip()
+            elif line.startswith("Status: ") and name:
+                out[name] = line[8:].split()[0] if line[8:].split() else "install"
+        return out
+
+    def _pkg_set_selection(self, name, state):
+        """Rewrite one package's Status line, as dpkg does."""
+        body = (self.fs.read(self._DPKG_STATUS) or b"").decode("latin-1")
+        lines = body.split("\n")
+        cur, hit = None, False
+        for i, line in enumerate(lines):
+            if line.startswith("Package: "):
+                cur = line[9:].strip()
+            elif line.startswith("Status: ") and cur == name:
+                rest = line[8:].split()
+                lines[i] = "Status: %s %s" % (
+                    state, " ".join(rest[1:]) if len(rest) > 1
+                    else "ok installed")
+                hit = True
+                break
+        if hit:
+            self.fs.write(self._DPKG_STATUS,
+                          "\n".join(lines).encode("latin-1", "replace"))
+        return hit
 
     def _pkg_selection(self, name):
         return self._pkg_selections().get(name, "install")
@@ -36171,16 +36235,48 @@ class Shell:
                          "stat %s" % f)
                 rc = 1
                 continue
+            # -R descends. The real chattr sets the flag on the directory
+            # and on every file and subdirectory beneath it -- measured on
+            # the guest -- and this applied it only to the name given. So
+            # `chattr -R +i /usr/bin`, which is the last thing the miner
+            # installer runs, left every binary in there writable: the
+            # directory lock stopped names being added or removed, and
+            # `echo pwned > /usr/bin/curl` still went through, which the
+            # real flag exists to prevent.
+            # The primary target keeps the node already resolved above --
+            # /bin/ps is reached through the merged-/usr symlink and is not
+            # a key in nodes, so re-looking it up by name here found
+            # nothing and silently set no attribute at all. tampertest
+            # caught it: `chattr +i /bin/ps` then `lsattr` from either
+            # spelling showed the flag missing.
+            targets = [(path, node)]
+            if recursive and node.is_dir:
+                targets += [(k, self.fs.nodes.get(k))
+                            for k in self.fs.node_paths()
+                            if k.startswith(path.rstrip("/") + "/")]
+            for tpath, tnode in targets:
+                if tnode is None:
+                    continue
+                tcur = set(getattr(tnode, "attrs", set()))
+                if mode == "+":
+                    tcur |= set(flags)
+                elif mode == "-":
+                    tcur -= set(flags)
+                else:
+                    tcur = set(flags)
+                tnode.attrs = tcur
+                self.fs._record(("a", tpath, "".join(sorted(tcur))),
+                                len(tpath))
             cur = set(getattr(node, "attrs", set()))
-            if mode == "+":
-                cur |= set(flags)
-            elif mode == "-":
-                cur -= set(flags)
-            else:
-                cur = set(flags)
-            node.attrs = cur
-            # Making a file immutable is an anti-removal step, not a
-            # formatting choice; it belongs in the log next to the write.
+            # Journalled, so it comes back with the file. The attributes
+            # were the one thing about an attacker's file that did not
+            # survive a restart: the bytes returned from the replay, the
+            # mode returned, and the +i did not -- so a returning actor
+            # found the flag they had set gone and `rm` working again. The
+            # honeypot has restarted twenty times this month, so this was
+            # not hypothetical. RedTail's setup.sh runs `chattr -ia` first
+            # precisely because it expects the flag to be there.
+
             if "i" in set(flags) and mode in ("+", "="):
                 self.log(event="persistence_write", kind="immutable",
                          path=path, via="chattr", content=mode + flags)
