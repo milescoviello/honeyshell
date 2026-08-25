@@ -158,6 +158,7 @@ Run all:  `./run-suites.sh`
 - `tmrtest.py` -- What is scheduled on this box, when did it last run, and who agrees?
 - `tztest.py` -- What time is it here, where does the box think it is, and who says so?
 - `unittest2.py` -- If you write a unit file, does the box agree the unit exists?
+- `unitverbtest.py` -- What systemctl says when an attacker installs, enables and masks units.
 - `updalttest.py` -- Which program is this name, and does everything that names it agree?
 - `usertest.py` -- The user databases disagreed once anything changed.
 - `vartest.py` -- What kind of variable is this, and who agrees?

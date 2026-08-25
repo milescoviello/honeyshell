@@ -31967,8 +31967,54 @@ class Shell:
             rc = 0
             for u in targets:
                 if u not in unit_tbl:
-                    self.err("Failed to %s %s.service: Unit %s.service not "
-                             "found." % (verb, u, u))
+                    # One message for eight verbs was wrong for five of
+                    # them. Measured on the guest against a name that is
+                    # not a unit:
+                    #   start/restart/reload  rc 5  "... not found."
+                    #   stop                  rc 5  "... not loaded."
+                    #   enable/disable        rc 1  "Failed to <verb> unit:
+                    #                               Unit X does not exist"
+                    #   mask/unmask           rc 0  -- they proceed anyway,
+                    #                               and mask really does
+                    #                               symlink the name to
+                    #                               /dev/null
+                    fu = self._unit_full(u)
+                    if verb in ("enable", "disable"):
+                        self.err("Failed to %s unit: Unit %s does not exist"
+                                 % (verb, fu))
+                        rc = 1
+                        continue
+                    if verb == "mask":
+                        self.err("Unit %s does not exist, proceeding anyway."
+                                 % fu)
+                        link = "/etc/systemd/system/%s" % fu
+                        if not self.fs.exists(link):
+                            self.fs.symlink(link, "/dev/null")
+                        self.err("Created symlink '%s' \u2192 '/dev/null'."
+                                 % link)
+                        state.setdefault(u, {})["enabled"] = "masked"
+                        continue
+                    if verb == "unmask":
+                        # The notice depends on whether anything is there.
+                        # After a mask the symlink *is* the unit file, so
+                        # systemd no longer calls it non-existent and prints
+                        # only "Removed". On a never-masked name it prints
+                        # only the notice. Measured both ways round -- the
+                        # first version printed both lines always, which is
+                        # neither.
+                        link = "/etc/systemd/system/%s" % fu
+                        if self.fs.exists(link):
+                            self.fs.nodes.pop(link, None)
+                            self.err("Removed '%s'." % link)
+                        else:
+                            self.err("Unit %s does not exist, proceeding "
+                                     "anyway." % fu)
+                        state.setdefault(u, {}).pop("enabled", None)
+                        continue
+                    self.err("Failed to %s %s: Unit %s %s."
+                             % (verb, fu, fu,
+                                "not loaded" if verb == "stop"
+                                else "not found"))
                     rc = 5
                     continue
                 cur = state.setdefault(u, {})
@@ -32048,7 +32094,10 @@ class Shell:
                     # into the wants directory and making the unit vanish.
                     if not self.fs.exists(link) and self.fs.exists(tgt):
                         self.fs.symlink(link, tgt)
-                        self.err("Created symlink '%s' -> '%s'."
+                        # U+2192, which is what systemd prints -- measured
+                        # as the bytes e2 86 92. "->" is close enough to read
+                        # and not close enough to match.
+                        self.err("Created symlink '%s' \u2192 '%s'."
                                  % (link, tgt))
                     cur.pop("enabled", None)
                 elif verb == "disable":
@@ -32277,7 +32326,8 @@ class Shell:
                        unit, pid,
                        (_drop[unit][3] if unit in _drop else comm))
                     + self._status_log_tail(unit), 0)
-        if verb in ("restart", "start", "stop", "reload", "enable", "disable", "daemon-reload"):
+        if verb in ("restart", "start", "stop", "reload", "enable", "disable",
+                    "daemon-reload"):
             if unit and not known:
                 self.err("Failed to %s %s.service: Unit %s.service not found."
                          % (verb, unit, unit))
@@ -32353,8 +32403,19 @@ class Shell:
             if props:
                 # systemd omits properties it does not know rather than
                 # printing an empty assignment for them.
+                # --value prints the value alone, which is the whole
+                # reason scripts pass it: `systemctl show X -p MainPID
+                # --value` is how you get a bare pid. It was ignored, so
+                # the caller got "MainPID=412" and any arithmetic on it
+                # failed. Measured on the guest: with --value, one value
+                # per line and no names, for one property or several.
+                if "--value" in a:
+                    return "".join("%s\n" % values[k]
+                                   for k in props if k in values), 0
                 return "".join("%s=%s\n" % (k, values[k])
                                for k in props if k in values), 0
+            if "--value" in a:
+                return "".join("%s\n" % v for v in values.values()), 0
             return "".join("%s=%s\n" % (k, v)
                            for k, v in values.items()), 0
         if verb == "cat":
