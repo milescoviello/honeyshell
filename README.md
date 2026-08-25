@@ -1,6 +1,6 @@
 # honeypot — a Debian 13 shell emulator, and the test suite that proves it
 
-A shell emulator faithful enough to put behind an SSH honeypot, with **151
+A shell emulator faithful enough to put behind an SSH honeypot, with **153
 test suites** that check it against the real thing rather than against
 expectations written by hand.
 
@@ -38,16 +38,16 @@ and it is why there are more lines of test than of implementation.
 
 | | |
 |---|---:|
-| Emulator | 37,895 lines |
+| Emulator | 38,464 lines |
 | Commands | ~365 |
-| Suites | 151 |
-| Test code | 42,076 lines |
+| Suites | 153 |
+| Test code | 42,627 lines |
 
 ## What is in here
 
 | File | Lines | Job |
 |---|---:|---|
-| `fakeshell.py` | 37,895 | The emulator: the VFS, the shell language, and every command |
+| `fakeshell.py` | 38,464 | The emulator: the VFS, the shell language, and every command |
 | `awkemu.py` | 1,304 | awk — attackers pipe nearly everything through it |
 | `localedb.py` | 1,164 | Locale data, so `LC_ALL=` actually changes what commands print |
 | `sedemu.py` | 792 | sed |
@@ -55,7 +55,7 @@ and it is why there are more lines of test than of implementation.
 | `tzdb.py` | | Timezone data |
 | `skeldb.py` | | `/etc/skel` |
 
-`SUITES.md` lists all 151 suites and the one question each asks.
+`SUITES.md` lists all 153 suites and the one question each asks.
 
 ## Running the tests
 

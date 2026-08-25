@@ -61,6 +61,7 @@ Run all:  `./run-suites.sh`
 - `heredoctest.py` -- Here-documents: quoted ones were real, and real ones lost their block.
 - `hostassumetest.py` -- Do the differential suites know a host difference from an emulator bug?
 - `hugetest.py` -- Hugepages: one number, five places that report it.
+- `hwprofiletest.py` -- How much hardware is this, and do the answers agree?
 - `hwtest.py` -- What hardware does this box say it has?
 - `idtest.py` -- Does the box agree about who you are, who owns what, and what you may do?
 - `idtest2.py` -- Does the box agree with itself about who it is?
@@ -118,6 +119,7 @@ Run all:  `./run-suites.sh`
 - `restest.py` -- Does the box agree about how much of everything it has?
 - `rootcmdtest.py` -- The box's record of who ran what as root.
 - `rottest.py` -- The logs that were rotated away -- can anything read them?
+- `rotwindowtest.py` -- When did the logs rotate, and does everything that records it agree?
 - `runningtest.py` -- Does the box remember what it is running?
 - `runtest.py` -- systemd-run and the sysv helpers -- scheduling that leaves a trace.
 - `schedtest.py` -- What priority is this process, and does changing it change anything?

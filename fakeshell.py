@@ -534,6 +534,17 @@ CPU_MODEL = "Intel(R) Xeon(R) CPU E5-2670 v2 @ 2.50GHz"
 NCPU = 4
 MEM_TOTAL_KB = 2035124
 
+
+def _psr_of(pid):
+    """Which CPU a process last ran on.
+
+    One rule, because there are two readers. /proc/<pid>/stat field 39 had
+    this and `ps -eo psr` did not -- psr was not in the column table at all,
+    so it fell through to "-" for every process while /proc/1/stat said 1.
+    Anyone sizing a box for a miner reads one or the other.
+    """
+    return pid % NCPU
+
 # The whole memory picture, in kB, defined once. /proc/meminfo, /proc/vmstat,
 # free, top and vmstat all derive from this table, because when they each
 # carried their own numbers they disagreed: /proc/vmstat's nr_free_pages said
@@ -614,6 +625,35 @@ def _meminfo_line(key, val):
     if key in MEMINFO_NO_UNIT:
         return "%s%*d\n" % (label, 24 - len(label), val)
     return "%-15s %8d kB\n" % (label, val)
+
+
+#: When /etc/crontab runs the periodic jobs: "25 6 * * *" for cron.daily and
+#: "47 6 * * 7" for cron.weekly. logrotate lives in cron.daily, so these are
+#: also when every rotation happened -- which is the point. The rotation
+#: times were previously three different things: /var/lib/logrotate/status
+#: said local midnight, the rotated files' mtimes said whatever time of day
+#: BOOT_TS happened to be, and the content spans said something else again.
+CRON_DAILY_HM = (6, 25)
+CRON_WEEKLY_HM = (6, 47)
+CRON_WEEKLY_WDAY = 6            # Sunday, as "* * 7" means in crontab(5)
+
+
+def cron_daily_last(now=None):
+    """The most recent cron.daily run, and so the most recent daily rotation."""
+    now = time.time() if now is None else now
+    lt = time.localtime(now)
+    today = time.mktime(lt[:3] + CRON_DAILY_HM + (0, 0, 0, -1))
+    return today if today <= now else today - 86400
+
+
+def cron_weekly_last(now=None):
+    """The most recent cron.weekly run -- Sunday 06:47."""
+    now = time.time() if now is None else now
+    lt = time.localtime(now)
+    today = time.mktime(lt[:3] + CRON_WEEKLY_HM + (0, 0, 0, -1))
+    back = (lt.tm_wday - CRON_WEEKLY_WDAY) % 7
+    cand = today - back * 86400
+    return cand if cand <= now else cand - 7 * 86400
 
 
 # The minute past the hour /etc/crontab runs cron.hourly at. Debian ships 17.
@@ -2606,6 +2646,337 @@ CPU_CACHES = (
 )
 
 
+#: getconf(1) variables, from `getconf -a` on the guest (322 of them).
+#: Name and value, tab separated. A \x00 value is persona-derived and
+#: filled in by cmd_getconf -- the CPU count, the page counts and the
+#: cache sizes have to come from the same place lscpu and /proc/meminfo
+#: read them from, or getconf becomes a second opinion that disagrees.
+_GETCONF_TABLE = """\
+LINK_MAX	65000
+_POSIX_LINK_MAX	65000
+MAX_CANON	255
+_POSIX_MAX_CANON	255
+MAX_INPUT	255
+_POSIX_MAX_INPUT	255
+NAME_MAX	255
+_POSIX_NAME_MAX	255
+PATH_MAX	4096
+_POSIX_PATH_MAX	4096
+PIPE_BUF	4096
+_POSIX_PIPE_BUF	4096
+SOCK_MAXBUF	
+_POSIX_ASYNC_IO	
+_POSIX_CHOWN_RESTRICTED	1
+_POSIX_NO_TRUNC	1
+_POSIX_PRIO_IO	
+_POSIX_SYNC_IO	
+_POSIX_VDISABLE	0
+ARG_MAX	2097152
+ATEXIT_MAX	2147483647
+CHAR_BIT	8
+CHAR_MAX	127
+CHAR_MIN	-128
+CHILD_MAX	7796
+CLK_TCK	100
+INT_MAX	2147483647
+INT_MIN	-2147483648
+IOV_MAX	1024
+LOGNAME_MAX	256
+LONG_BIT	64
+MB_LEN_MAX	16
+NGROUPS_MAX	65536
+NL_ARGMAX	4096
+NL_LANGMAX	2048
+NL_MSGMAX	2147483647
+NL_NMAX	2147483647
+NL_SETMAX	2147483647
+NL_TEXTMAX	2147483647
+NSS_BUFLEN_GROUP	1024
+NSS_BUFLEN_PASSWD	1024
+NZERO	20
+OPEN_MAX	1024
+PAGESIZE	4096
+PAGE_SIZE	4096
+PASS_MAX	8192
+PTHREAD_DESTRUCTOR_ITERATIONS	4
+PTHREAD_KEYS_MAX	1024
+PTHREAD_STACK_MIN	16384
+PTHREAD_THREADS_MAX	
+SCHAR_MAX	127
+SCHAR_MIN	-128
+SHRT_MAX	32767
+SHRT_MIN	-32768
+SSIZE_MAX	32767
+TTY_NAME_MAX	32
+TZNAME_MAX	
+UCHAR_MAX	255
+UINT_MAX	4294967295
+UIO_MAXIOV	1024
+ULONG_MAX	18446744073709551615
+USHRT_MAX	65535
+WORD_BIT	32
+_AVPHYS_PAGES	@PERSONA@
+_NPROCESSORS_CONF	@PERSONA@
+NPROCESSORS_CONF	@PERSONA@
+_NPROCESSORS_ONLN	@PERSONA@
+NPROCESSORS_ONLN	@PERSONA@
+_PHYS_PAGES	@PERSONA@
+_POSIX_ARG_MAX	2097152
+_POSIX_ASYNCHRONOUS_IO	200809
+_POSIX_CHILD_MAX	7796
+_POSIX_FSYNC	200809
+_POSIX_JOB_CONTROL	1
+_POSIX_MAPPED_FILES	200809
+_POSIX_MEMLOCK	200809
+_POSIX_MEMLOCK_RANGE	200809
+_POSIX_MEMORY_PROTECTION	200809
+_POSIX_MESSAGE_PASSING	200809
+_POSIX_NGROUPS_MAX	65536
+_POSIX_OPEN_MAX	1024
+_POSIX_PII	
+_POSIX_PII_INTERNET	
+_POSIX_PII_INTERNET_DGRAM	
+_POSIX_PII_INTERNET_STREAM	
+_POSIX_PII_OSI	
+_POSIX_PII_OSI_CLTS	
+_POSIX_PII_OSI_COTS	
+_POSIX_PII_OSI_M	
+_POSIX_PII_SOCKET	
+_POSIX_PII_XTI	
+_POSIX_POLL	
+_POSIX_PRIORITIZED_IO	200809
+_POSIX_PRIORITY_SCHEDULING	200809
+_POSIX_REALTIME_SIGNALS	200809
+_POSIX_SAVED_IDS	1
+_POSIX_SELECT	
+_POSIX_SEMAPHORES	200809
+_POSIX_SHARED_MEMORY_OBJECTS	200809
+_POSIX_SSIZE_MAX	32767
+_POSIX_STREAM_MAX	16
+_POSIX_SYNCHRONIZED_IO	200809
+_POSIX_THREADS	200809
+_POSIX_THREAD_ATTR_STACKADDR	200809
+_POSIX_THREAD_ATTR_STACKSIZE	200809
+_POSIX_THREAD_PRIORITY_SCHEDULING	200809
+_POSIX_THREAD_PRIO_INHERIT	200809
+_POSIX_THREAD_PRIO_PROTECT	200809
+_POSIX_THREAD_ROBUST_PRIO_INHERIT	
+_POSIX_THREAD_ROBUST_PRIO_PROTECT	
+_POSIX_THREAD_PROCESS_SHARED	200809
+_POSIX_THREAD_SAFE_FUNCTIONS	200809
+_POSIX_TIMERS	200809
+TIMER_MAX	
+_POSIX_TZNAME_MAX	
+_POSIX_VERSION	200809
+_T_IOV_MAX	
+_XOPEN_CRYPT	
+_XOPEN_ENH_I18N	1
+_XOPEN_LEGACY	1
+_XOPEN_REALTIME	1
+_XOPEN_REALTIME_THREADS	1
+_XOPEN_SHM	1
+_XOPEN_UNIX	1
+_XOPEN_VERSION	700
+_XOPEN_XCU_VERSION	4
+_XOPEN_XPG2	1
+_XOPEN_XPG3	1
+_XOPEN_XPG4	1
+BC_BASE_MAX	99
+BC_DIM_MAX	2048
+BC_SCALE_MAX	99
+BC_STRING_MAX	1000
+CHARCLASS_NAME_MAX	2048
+COLL_WEIGHTS_MAX	255
+EQUIV_CLASS_MAX	
+EXPR_NEST_MAX	32
+LINE_MAX	2048
+POSIX2_BC_BASE_MAX	99
+POSIX2_BC_DIM_MAX	2048
+POSIX2_BC_SCALE_MAX	99
+POSIX2_BC_STRING_MAX	1000
+POSIX2_CHAR_TERM	200809
+POSIX2_COLL_WEIGHTS_MAX	255
+POSIX2_C_BIND	200809
+POSIX2_C_DEV	200809
+POSIX2_C_VERSION	200809
+POSIX2_EXPR_NEST_MAX	32
+POSIX2_FORT_DEV	
+POSIX2_FORT_RUN	
+_POSIX2_LINE_MAX	2048
+POSIX2_LINE_MAX	2048
+POSIX2_LOCALEDEF	200809
+POSIX2_RE_DUP_MAX	32767
+POSIX2_SW_DEV	200809
+POSIX2_UPE	
+POSIX2_VERSION	200809
+RE_DUP_MAX	32767
+PATH	/bin:/usr/bin
+CS_PATH	/bin:/usr/bin
+LFS_CFLAGS	
+LFS_LDFLAGS	
+LFS_LIBS	
+LFS_LINTFLAGS	
+LFS64_CFLAGS	-D_LARGEFILE64_SOURCE
+LFS64_LDFLAGS	
+LFS64_LIBS	
+LFS64_LINTFLAGS	-D_LARGEFILE64_SOURCE
+_XBS5_WIDTH_RESTRICTED_ENVS	XBS5_LP64_OFF64
+XBS5_WIDTH_RESTRICTED_ENVS	XBS5_LP64_OFF64
+_XBS5_ILP32_OFF32	
+XBS5_ILP32_OFF32_CFLAGS	
+XBS5_ILP32_OFF32_LDFLAGS	
+XBS5_ILP32_OFF32_LIBS	
+XBS5_ILP32_OFF32_LINTFLAGS	
+_XBS5_ILP32_OFFBIG	
+XBS5_ILP32_OFFBIG_CFLAGS	
+XBS5_ILP32_OFFBIG_LDFLAGS	
+XBS5_ILP32_OFFBIG_LIBS	
+XBS5_ILP32_OFFBIG_LINTFLAGS	
+_XBS5_LP64_OFF64	1
+XBS5_LP64_OFF64_CFLAGS	-m64
+XBS5_LP64_OFF64_LDFLAGS	-m64
+XBS5_LP64_OFF64_LIBS	
+XBS5_LP64_OFF64_LINTFLAGS	
+_XBS5_LPBIG_OFFBIG	
+XBS5_LPBIG_OFFBIG_CFLAGS	
+XBS5_LPBIG_OFFBIG_LDFLAGS	
+XBS5_LPBIG_OFFBIG_LIBS	
+XBS5_LPBIG_OFFBIG_LINTFLAGS	
+_POSIX_V6_ILP32_OFF32	
+POSIX_V6_ILP32_OFF32_CFLAGS	
+POSIX_V6_ILP32_OFF32_LDFLAGS	
+POSIX_V6_ILP32_OFF32_LIBS	
+POSIX_V6_ILP32_OFF32_LINTFLAGS	
+_POSIX_V6_WIDTH_RESTRICTED_ENVS	POSIX_V6_LP64_OFF64
+POSIX_V6_WIDTH_RESTRICTED_ENVS	POSIX_V6_LP64_OFF64
+_POSIX_V6_ILP32_OFFBIG	
+POSIX_V6_ILP32_OFFBIG_CFLAGS	
+POSIX_V6_ILP32_OFFBIG_LDFLAGS	
+POSIX_V6_ILP32_OFFBIG_LIBS	
+POSIX_V6_ILP32_OFFBIG_LINTFLAGS	
+_POSIX_V6_LP64_OFF64	1
+POSIX_V6_LP64_OFF64_CFLAGS	-m64
+POSIX_V6_LP64_OFF64_LDFLAGS	-m64
+POSIX_V6_LP64_OFF64_LIBS	
+POSIX_V6_LP64_OFF64_LINTFLAGS	
+_POSIX_V6_LPBIG_OFFBIG	
+POSIX_V6_LPBIG_OFFBIG_CFLAGS	
+POSIX_V6_LPBIG_OFFBIG_LDFLAGS	
+POSIX_V6_LPBIG_OFFBIG_LIBS	
+POSIX_V6_LPBIG_OFFBIG_LINTFLAGS	
+_POSIX_V7_ILP32_OFF32	
+POSIX_V7_ILP32_OFF32_CFLAGS	
+POSIX_V7_ILP32_OFF32_LDFLAGS	
+POSIX_V7_ILP32_OFF32_LIBS	
+POSIX_V7_ILP32_OFF32_LINTFLAGS	
+_POSIX_V7_WIDTH_RESTRICTED_ENVS	POSIX_V7_LP64_OFF64
+POSIX_V7_WIDTH_RESTRICTED_ENVS	POSIX_V7_LP64_OFF64
+_POSIX_V7_ILP32_OFFBIG	
+POSIX_V7_ILP32_OFFBIG_CFLAGS	
+POSIX_V7_ILP32_OFFBIG_LDFLAGS	
+POSIX_V7_ILP32_OFFBIG_LIBS	
+POSIX_V7_ILP32_OFFBIG_LINTFLAGS	
+_POSIX_V7_LP64_OFF64	1
+POSIX_V7_LP64_OFF64_CFLAGS	-m64
+POSIX_V7_LP64_OFF64_LDFLAGS	-m64
+POSIX_V7_LP64_OFF64_LIBS	
+POSIX_V7_LP64_OFF64_LINTFLAGS	
+_POSIX_V7_LPBIG_OFFBIG	
+POSIX_V7_LPBIG_OFFBIG_CFLAGS	
+POSIX_V7_LPBIG_OFFBIG_LDFLAGS	
+POSIX_V7_LPBIG_OFFBIG_LIBS	
+POSIX_V7_LPBIG_OFFBIG_LINTFLAGS	
+_POSIX_ADVISORY_INFO	200809
+_POSIX_BARRIERS	200809
+_POSIX_BASE	
+_POSIX_C_LANG_SUPPORT	
+_POSIX_C_LANG_SUPPORT_R	
+_POSIX_CLOCK_SELECTION	200809
+_POSIX_CPUTIME	200809
+_POSIX_THREAD_CPUTIME	200809
+_POSIX_DEVICE_SPECIFIC	
+_POSIX_DEVICE_SPECIFIC_R	
+_POSIX_FD_MGMT	
+_POSIX_FIFO	
+_POSIX_PIPE	
+_POSIX_FILE_ATTRIBUTES	
+_POSIX_FILE_LOCKING	
+_POSIX_FILE_SYSTEM	
+_POSIX_MONOTONIC_CLOCK	200809
+_POSIX_MULTI_PROCESS	
+_POSIX_SINGLE_PROCESS	
+_POSIX_NETWORKING	
+_POSIX_READER_WRITER_LOCKS	200809
+_POSIX_SPIN_LOCKS	200809
+_POSIX_REGEXP	1
+_REGEX_VERSION	
+_POSIX_SHELL	1
+_POSIX_SIGNALS	
+_POSIX_SPAWN	200809
+_POSIX_SPORADIC_SERVER	
+_POSIX_THREAD_SPORADIC_SERVER	
+_POSIX_SYSTEM_DATABASE	
+_POSIX_SYSTEM_DATABASE_R	
+_POSIX_TIMEOUTS	200809
+_POSIX_TYPED_MEMORY_OBJECTS	
+_POSIX_USER_GROUPS	
+_POSIX_USER_GROUPS_R	
+POSIX2_PBS	
+POSIX2_PBS_ACCOUNTING	
+POSIX2_PBS_LOCATE	
+POSIX2_PBS_TRACK	
+POSIX2_PBS_MESSAGE	
+SYMLOOP_MAX	
+STREAM_MAX	16
+AIO_LISTIO_MAX	
+AIO_MAX	
+AIO_PRIO_DELTA_MAX	20
+DELAYTIMER_MAX	2147483647
+HOST_NAME_MAX	64
+LOGIN_NAME_MAX	256
+MQ_OPEN_MAX	
+MQ_PRIO_MAX	32768
+_POSIX_DEVICE_IO	
+_POSIX_TRACE	
+_POSIX_TRACE_EVENT_FILTER	
+_POSIX_TRACE_INHERIT	
+_POSIX_TRACE_LOG	
+RTSIG_MAX	32
+SEM_NSEMS_MAX	
+SEM_VALUE_MAX	2147483647
+SIGQUEUE_MAX	7796
+FILESIZEBITS	64
+POSIX_ALLOC_SIZE_MIN	4096
+POSIX_REC_INCR_XFER_SIZE	
+POSIX_REC_MAX_XFER_SIZE	
+POSIX_REC_MIN_XFER_SIZE	4096
+POSIX_REC_XFER_ALIGN	4096
+SYMLINK_MAX	
+GNU_LIBC_VERSION	glibc 2.41
+GNU_LIBPTHREAD_VERSION	NPTL 2.41
+POSIX2_SYMLINKS	1
+LEVEL1_ICACHE_SIZE	32768
+LEVEL1_ICACHE_ASSOC	
+LEVEL1_ICACHE_LINESIZE	64
+LEVEL1_DCACHE_SIZE	32768
+LEVEL1_DCACHE_ASSOC	8
+LEVEL1_DCACHE_LINESIZE	64
+LEVEL2_CACHE_SIZE	@PERSONA@
+LEVEL2_CACHE_ASSOC	16
+LEVEL2_CACHE_LINESIZE	64
+LEVEL3_CACHE_SIZE	@PERSONA@
+LEVEL3_CACHE_ASSOC	16
+LEVEL3_CACHE_LINESIZE	64
+LEVEL4_CACHE_SIZE	
+LEVEL4_CACHE_ASSOC	
+LEVEL4_CACHE_LINESIZE	
+IPV6	200809
+RAW_SOCKETS	200809
+_POSIX_IPV6	200809
+_POSIX_RAW_SOCKETS	200809
+"""
+
+
 # The cron package's own configuration, verbatim from a trixie with cron
 # installed. dpkg said cron 3.0pl1-198 was here and `dpkg -L cron` names
 # all four; none of them existed. /etc/pam.d/cron matters most -- cron is
@@ -2659,6 +3030,11 @@ PROFILE_D = {
 }
 
 WHOLE_ETC = {
+    # The schedule the box states. It was a three-line sketch: no
+    # comment header, PATH in the wrong order, and the cron.daily,
+    # cron.weekly and cron.monthly lines missing entirely -- so the
+    # file that says when logrotate runs never mentioned running it.
+    '/etc/crontab': "# /etc/crontab: system-wide crontab\n# Unlike any other crontab you don't have to run the `crontab'\n# command to install the new version when you edit this file\n# and files in /etc/cron.d. These files also have username fields,\n# that none of the other crontabs do.\n\nSHELL=/bin/sh\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\n# Example of job definition:\n# .---------------- minute (0 - 59)\n# |  .------------- hour (0 - 23)\n# |  |  .---------- day of month (1 - 31)\n# |  |  |  .------- month (1 - 12) OR jan,feb,mar,apr ...\n# |  |  |  |  .---- day of week (0 - 6) (Sunday=0 or 7) OR sun,mon,tue,wed,thu,fri,sat\n# |  |  |  |  |\n# *  *  *  *  * user-name command to be executed\n17 *\t* * *\troot\tcd / && run-parts --report /etc/cron.hourly\n25 6\t* * *\troot\ttest -x /usr/sbin/anacron || { cd / && run-parts --report /etc/cron.daily; }\n47 6\t* * 7\troot\ttest -x /usr/sbin/anacron || { cd / && run-parts --report /etc/cron.weekly; }\n52 6\t1 * *\troot\ttest -x /usr/sbin/anacron || { cd / && run-parts --report /etc/cron.monthly; }\n#\n",
     '/etc/bash.bashrc': '# System-wide .bashrc file for interactive bash(1) shells.\n\n# To enable the settings / commands in this file for login shells as well,\n# this file has to be sourced in /etc/profile.\n\n# If not running interactively, don\'t do anything\n[ -z "${PS1-}" ] && return\n\n# check the window size after each command and, if necessary,\n# update the values of LINES and COLUMNS.\nshopt -s checkwinsize\n\n# set variable identifying the chroot you work in (used in the prompt below)\nif [ -z "${debian_chroot:-}" ] && [ -r /etc/debian_chroot ]; then\n    debian_chroot=$(< /etc/debian_chroot)\nfi\n\n# set a fancy prompt (non-color, overwrite the one in /etc/profile)\n# but only if not SUDOing and have SUDO_PS1 set; then assume smart user.\nif ! [ -n "${SUDO_USER-}" -a -n "${SUDO_PS1-}" ]; then\n  PS1=\'${debian_chroot:+($debian_chroot)}\\u@\\h:\\w\\$ \'\nfi\n\n# Commented out, don\'t overwrite xterm -T "title" -n "icontitle" by default.\n# If this is an xterm set the title to user@host:dir\n#case "$TERM" in\n#xterm*|rxvt*)\n#    PROMPT_COMMAND=\'echo -ne "\\033]0;${USER}@${HOSTNAME}: ${PWD}\\007"\'\n#    ;;\n#*)\n#    ;;\n#esac\n\n# enable bash completion in interactive shells\n#if ! shopt -oq posix; then\n#  if [ -f /usr/share/bash-completion/bash_completion ]; then\n#    . /usr/share/bash-completion/bash_completion\n#  elif [ -f /etc/bash_completion ]; then\n#    . /etc/bash_completion\n#  fi\n#fi\n\n# if the command-not-found package is installed, use it\nif [ -x /usr/lib/command-not-found -o -x /usr/share/command-not-found/command-not-found ]; then\n\tfunction command_not_found_handle {\n\t        # check because c-n-f could\'ve been removed in the meantime\n                if [ -x /usr/lib/command-not-found ]; then\n\t\t   /usr/lib/command-not-found -- "$1"\n                   return $?\n                elif [ -x /usr/share/command-not-found/command-not-found ]; then\n\t\t   /usr/share/command-not-found/command-not-found -- "$1"\n                   return $?\n\t\telse\n\t\t   printf "%s: command not found\\n" "$1" >&2\n\t\t   return 127\n\t\tfi\n\t}\nfi\n',
     '/etc/nsswitch.conf': '# /etc/nsswitch.conf\n#\n# Example configuration of GNU Name Service Switch functionality.\n# If you have the `glibc-doc-reference\' and `info\' packages installed, try:\n# `info libc "Name Service Switch"\' for information about this file.\n\npasswd:         files\ngroup:          files\nshadow:         files\ngshadow:        files\n\nhosts:          files myhostname resolve [!UNAVAIL=return] dns\nnetworks:       files\n\nprotocols:      db files\nservices:       db files\nethers:         db files\nrpc:            db files\n\nnetgroup:       nis\n',
     '/etc/profile': '# /etc/profile: system-wide .profile file for the Bourne shell (sh(1))\n# and Bourne compatible shells (bash(1), ksh(1), ash(1), ...).\n\nif [ "$(id -u)" -eq 0 ]; then\n  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\nelse\n  PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"\nfi\nexport PATH\n\nif [ "${PS1-}" ]; then\n  if [ "${BASH-}" ] && [ "$BASH" != "/bin/sh" ]; then\n    # The file bash.bashrc already sets the default PS1.\n    # PS1=\'\\h:\\w\\$ \'\n    if [ -f /etc/bash.bashrc ]; then\n      . /etc/bash.bashrc\n    fi\n  else\n    if [ "$(id -u)" -eq 0 ]; then\n      PS1=\'# \'\n    else\n      PS1=\'$ \'\n    fi\n  fi\nfi\n\nif [ -d /etc/profile.d ]; then\n  for i in $(run-parts --list --regex \'^[a-zA-Z0-9_][a-zA-Z0-9._-]*\\.sh$\' /etc/profile.d); do\n    if [ -r $i ]; then\n      . $i\n    fi\n  done\n  unset i\nfi\n',
@@ -4555,15 +4931,25 @@ class VFS:
         `zgrep` is what anyone runs to check whether their traces survived
         rotation. Four readers, three answers.
         """
-        day = self._rotation_start(n - 1)
+        # Daily windows, because /etc/logrotate.d/rsyslog says syslog rotates
+        # daily. This used _rotation_start(), which counts in *weeks* and is
+        # auth.log's anchor -- so syslog.2.gz carried content from eight days
+        # before the mtime `ls -l` showed for it, and syslog.1 overlapped the
+        # live file completely. One rotation, three answers.
+        day = cron_daily_last() - (n - 1) * 86400
         out = []
         # The same schedule the live file and the crontab use. Stepping from
         # midnight put these on the hour, so a rotated log disagreed with
         # /etc/crontab about the minute cron.hourly runs at.
-        for t in cron_hourly_runs(day - 86400, day):
-            out.append("%s %s CRON[%d]: (root) CMD (cd / && run-parts "
-                       "--report /etc/cron.hourly)"
-                       % (self._logstamp(t), HOST, 18000 + int(t) % 4000))
+        rows = [(t, "CRON[%d]: (root) CMD (cd / && run-parts "
+                    "--report /etc/cron.hourly)" % (18000 + int(t) % 4000))
+                for t in cron_hourly_runs(day - 86400, day)]
+        # The timers fired on these days too. Leaving them out made every
+        # rotated file cron-only, so a weekly unit's firing survived
+        # nowhere once the live file was correctly one day long.
+        rows += self._timer_lines(day - 86400, day)
+        rows.sort(key=lambda r: r[0])
+        out = ["%s %s %s" % (self._logstamp(t), HOST, msg) for t, msg in rows]
         return "\n".join(out) + "\n"
 
     def _rotated_auth(self, n):
@@ -4583,13 +4969,48 @@ class VFS:
                        % (self._logstamp(t + 1), HOST, pid))
         return "\n".join(out) + "\n"
 
+    def _timer_lines(self, lo, hi):
+        """(ts, message) for every systemd timer firing in [lo, hi).
+
+        Shared by the live syslog and the rotated copies. The rotated files
+        used to carry only cron.hourly lines, so once syslog was correctly
+        limited to one day, a weekly timer's firing existed nowhere on the
+        box -- and `journalctl -u man-db.service`, which is built from these
+        files, said "-- No entries --" for a unit `systemctl list-timers`
+        reported as having run. Two commands, one question, two answers.
+        """
+        out = []
+        for _tm, _per in sorted(Shell._TIMER_PERIOD.items()):
+            _svc = _tm[:-6] + ".service"
+            _desc = Shell._OTHER_UNITS.get(_tm, (_tm,))[0]
+            if hi - BOOT_TS < _per:
+                continue
+            _k = int((hi - BOOT_TS) // _per)
+            while _k >= 0:
+                _fired = BOOT_TS + _k * _per
+                if _fired < lo:
+                    break
+                if _fired < hi:
+                    out.append((_fired, "systemd[1]: Starting %s - %s..."
+                                % (_svc, _desc)))
+                    out.append((_fired + 9, "systemd[1]: %s: Deactivated "
+                                "successfully." % _svc))
+                _k -= 1
+        return out
+
     @staticmethod
     def _rotation_start(back):
-        """Start of a weekly rotation window, `back` windows ago. Anchored
-        to midnight so the boundary does not drift with the clock."""
-        midnight = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
-        weekday = time.localtime(midnight).tm_wday      # Monday == 0
-        return midnight - ((weekday + 1) % 7) * 86400 - back * 7 * 86400
+        """Start of a weekly rotation window, `back` windows ago.
+
+        Anchored to the cron.weekly run rather than to midnight. logrotate
+        runs from cron, and /etc/crontab puts cron.weekly at 06:47 on
+        Sunday -- so midnight was a moment at which this box does nothing.
+        Every weekly rotation reads from here (auth.log live and rotated,
+        kern.log, wtmp, btmp, nginx), so moving the anchor moves them
+        together; when only the rotated copy was moved, auth.log.1 ended
+        six hours after auth.log began and the two overlapped.
+        """
+        return cron_weekly_last() - back * 7 * 86400
 
     def _kern_log(self, back):
         """One rotation window of kernel messages, as rsyslog writes them."""
@@ -4678,25 +5099,44 @@ class VFS:
 
     def _syslog(self):
         now = time.time()
+        # Everything in this file postdates the last rotation. It used to
+        # start at a sliding `now - 47h`, on a file whose own logrotate
+        # config says it rotates daily -- so it held two days of messages,
+        # overlapped syslog.1 entirely, and its first line moved whenever
+        # anyone looked. A log that rewrites its own history is worse than
+        # a missing one.
+        rot = cron_daily_last(now)
         lines = []
         # The schedule the crontab states, like auth.log and the rotated
         # copies. Stepping from now put these at whatever minute it happened
         # to be, so syslog and auth.log disagreed with each other and with
         # /etc/crontab about when the same cron run happened.
-        for t in cron_hourly_runs(now - 47 * 3600, now - 600):
+        for t in cron_hourly_runs(rot, now - 600):
             lines.append((t, "CRON[%d]: (root) CMD (cd / && run-parts --report "
                           "/etc/cron.hourly)" % (18000 + int(t) % 4000)))
+        # logrotate ran at the rotation, not at some offset from now: this
+        # file exists *because* of that run, so the line that records it is
+        # the first thing in it. At 46h from now it sat two days before the
+        # rotation it performed.
+        _ng = rot + 2 * 3600 + 1361
+        if _ng > now:
+            _ng = rot + 60
+        _ngtxt = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(_ng))
         for off, msg in (
-                (46 * 3600, "systemd[1]: Starting logrotate.service - "
+                (now - rot, "systemd[1]: Starting logrotate.service - "
                  "Rotate log files..."),
-                (46 * 3600 - 4, "systemd[1]: logrotate.service: Deactivated "
+                (now - rot - 4, "systemd[1]: logrotate.service: Deactivated "
                  "successfully."),
-                (46 * 3600 - 5, "systemd[1]: Finished logrotate.service - "
+                (now - rot - 5, "systemd[1]: Finished logrotate.service - "
                  "Rotate log files."),
-                (38 * 3600, "nginx[701]: 2026/08/18 04:12:41 [error] 702#702: "
+                # The date inside the message has to be the message's own
+                # timestamp. It was a hardcoded 2026/08/18 next to a syslog
+                # stamp of now-38h, so nginx's idea of when it logged and
+                # syslog's disagreed by whatever today happened to be.
+                (now - _ng, "nginx[701]: %s [error] 702#702: "
                  "*18841 open() \"/var/www/html/.git/HEAD\" failed (2: No such file "
                  "or directory), client 203.0.113.41, server: _, request: "
-                 "\"GET /.env HTTP/1.1\""),
+                 "\"GET /.env HTTP/1.1\"" % _ngtxt),
                 # apt-daily used to be the only timer-activated service
                 # with journal lines, so `list-timers` said
                 # systemd-tmpfiles-clean had run fifteen minutes ago and
@@ -4708,26 +5148,19 @@ class VFS:
                  "User root."),
         ):
             lines.append((now - off, msg))
-        for _tm, _per in sorted(Shell._TIMER_PERIOD.items()):
-            _svc, _desc = _tm[:-6] + ".service", Shell._OTHER_UNITS.get(
-                _tm, (_tm,))[0]
-            if now - BOOT_TS < _per:
-                continue
-            _fired = BOOT_TS + int((now - BOOT_TS) // _per) * _per
-            lines.append((_fired, "systemd[1]: Starting %s - %s..."
-                          % (_svc, _desc)))
-            lines.append((_fired + 9, "systemd[1]: %s: Deactivated "
-                          "successfully." % _svc))
+        lines.extend(self._timer_lines(rot, now))
         # rsyslog.conf here routes *.* to syslog, so the kernel's messages
         # land in this file too -- and they have to be the ring buffer's,
         # not a separate invention. There used to be one hand-written
         # "SYN flooding on port 80" line in here that `dmesg` had never
         # heard of, and it was computed from now, so it moved every time
         # anyone looked. syslog rotates daily, so this file carries today's.
-        midnight = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+        # The same window as everything else here. This used local midnight
+        # while the rest of the file used now-47h, so the file had two
+        # different ideas of when it began.
         for off, _fac, _lvl, text in kmsg_records():
             when = BOOT_TS + off
-            if midnight <= when <= now:
+            if rot <= when <= now:
                 lines.append((when, "kernel: %s" % text))
         lines.sort(key=lambda x: x[0])
         return "".join("%s %s %s\n" % (self._logstamp(ts), HOST, msg)
@@ -6318,7 +6751,7 @@ class VFS:
                  # $40}' /proc/self/stat` and `chrt -p` described different
                  # things about one process.
                  "94070000001000", "140730000000000", "0", "0", "0", "0", "0",
-                 "0", "0", "0", "0", "17", str(pid % NCPU), "0", "0",
+                 "0", "0", "0", "0", "17", str(_psr_of(pid)), "0", "0",
                  "0", "0", "0",
                  "94070000002000", "94070000003000", "94070000004000",
                  "140730000001000", "140730000002000", "140730000003000",
@@ -8624,14 +9057,19 @@ class VFS:
           'logrotate state -- version 2\n'
           + "".join('"%s" %s\n' % (f, time.strftime(
               "%Y-%m-%d-%H:%M:%S", time.localtime(t)))
+              # From the cron schedule, because logrotate runs inside
+              # cron.daily and that is what /etc/crontab says. These said
+              # local midnight, which is a time nothing on this box does
+              # anything at -- and the rotated files' own mtimes said 05:08.
+              # The state file and the files it describes now agree.
               for f, t in (
-                  ("/var/log/syslog", _midnight_ts()),
-                  ("/var/log/auth.log", self._rotation_start(0)),
-                  ("/var/log/kern.log", self._rotation_start(0)),
-                  ("/var/log/nginx/access.log", _midnight_ts()),
-                  ("/var/log/nginx/error.log", _midnight_ts()),
-                  ("/var/log/wtmp", self._rotation_start(0)),
-                  ("/var/log/btmp", self._rotation_start(0)),
+                  ("/var/log/syslog", cron_daily_last()),
+                  ("/var/log/auth.log", cron_weekly_last()),
+                  ("/var/log/kern.log", cron_weekly_last()),
+                  ("/var/log/nginx/access.log", cron_daily_last()),
+                  ("/var/log/nginx/error.log", cron_daily_last()),
+                  ("/var/log/wtmp", cron_weekly_last()),
+                  ("/var/log/btmp", cron_weekly_last()),
               )))
         w("/var/log/kern.log.1", self._kern_log(1), mode=0o640, gid=4)
         # A log's mtime is when it was last written, and for these two that
@@ -8705,26 +9143,43 @@ class VFS:
         # syslog.1 holds the previous period's messages. Writing the current
         # file's content verbatim left the two byte-identical, which one
         # md5sum exposes.
-        _cur = self._syslog().splitlines(True)
-        _prev = "".join(_cur[:max(1, len(_cur) * 3 // 5)])
-        w("/var/log/syslog.1", _prev, mode=0o640, gid=4)
+        # syslog.1 is the previous *rotation window*, not a slice of the
+        # live file. Taking three fifths of the current content left the
+        # two files sharing every one of those lines, so `zgrep` across
+        # syslog* reported each CRON run twice and the live file's first
+        # line sat in the middle of syslog.1.
+        #
+        # mtimes come from the rotation times, not from BOOT_TS + n days:
+        # the offset form put them at whatever time of day the box happened
+        # to boot, so `ls -l` said 05:08 while /var/lib/logrotate/status
+        # said midnight and /etc/crontab said cron.daily runs at 06:25.
+        _rot_d = cron_daily_last()
+        # No explicit mtime: sync_log_mtimes() sets it from the last
+        # entry, which is right. logrotate *renames* the live file, so
+        # the rotated copy keeps the mtime of its final write -- setting
+        # it to the rotation instant would have been a second opinion
+        # that sync_log_mtimes overwrote anyway.
+        w("/var/log/syslog.1", self._rotated_syslog(1), mode=0o640, gid=4)
         for n in range(2, 8):
+            _when = _rot_d - (n - 1) * 86400
             self.nodes["/var/log/syslog.%d.gz" % n] = FileNode(
                 gzip_bytes(self._rotated_syslog(n), "syslog.%d" % (n - 1),
-                           BOOT_TS + (41 - n) * 86400),
-                mode=0o640, gid=4, mtime=BOOT_TS + (41 - n) * 86400)
+                           _when),
+                mode=0o640, gid=4, mtime=_when)
         # _rotated_auth(1), not _auth_log(): this was seeded with the *live*
         # log, so auth.log.1 held the same lines as auth.log -- same first
         # line, last line half an hour apart. A rotated file ends where the
         # live one begins, and anything reading across the boundary saw every
         # event twice. syslog.1 above uses its own previous window; this was
         # the only rotation copying the file it is supposed to precede.
+        _rot_w = self._rotation_start(0)
         w("/var/log/auth.log.1", self._rotated_auth(1), mode=0o640, gid=4)
         for n in range(2, 5):
+            _when = _rot_w - (n - 1) * 7 * 86400
             self.nodes["/var/log/auth.log.%d.gz" % n] = FileNode(
                 gzip_bytes(self._rotated_auth(n), "auth.log.%d" % (n - 1),
-                           BOOT_TS + (41 - n * 7) * 86400),
-                mode=0o640, gid=4, mtime=BOOT_TS + (41 - n * 7) * 86400)
+                           _when),
+                mode=0o640, gid=4, mtime=_when)
         # /etc/logrotate.d/nginx says `daily rotate 14 compress
         # delaycompress`, and /var/lib/logrotate/status names both nginx
         # logs as rotated -- and the directory held only the two live
@@ -17521,6 +17976,9 @@ class Shell:
             # said nothing about a box whose chrt reports SCHED_OTHER.
             "cls": "TS", "class": "TS", "policy": "TS",
             "rtprio": "-",
+            # psr printed "-" for every process while /proc/<pid>/stat
+            # field 39 carried the real number. Same rule, one source.
+            "psr": str(_psr_of(pid)), "processor": str(_psr_of(pid)),
             "sid": str(pid), "pgid": str(pid),
             "nlwp": "1", "wchan": "-", "flags": "0",
             "lstart": time.strftime("%a %b %e %H:%M:%S %Y",
@@ -17678,7 +18136,8 @@ class Shell:
                 widths.append(w)
             out = []
             right = {"pid", "ppid", "uid", "gid", "vsz", "rss", "%cpu",
-                     "%mem", "ni", "pri", "sid", "pgid", "nlwp", "time"}
+                     "%mem", "ni", "pri", "sid", "pgid", "nlwp", "time",
+                     "psr"}
             if not bare and not no_header:
                 out.append(" ".join(
                     ("%*s" if keys[i] in right else "%-*s")
@@ -24078,9 +24537,30 @@ class Shell:
                          time.strftime("%b %e %H:%M:%S",
                                        time.localtime(BOOT_TS + off)),
                          HOST, "kernel", "", text))
-        for path in ("/var/log/syslog", "/var/log/auth.log"):
+        # The rotated copies too, because journald is not rsyslog: it keeps
+        # its own ring and a log rotation does not truncate it. While syslog
+        # was built from a sliding 47-hour window this did not show, but
+        # once syslog correctly held only the day since its rotation, the
+        # journal inherited that horizon and `journalctl -u man-db.service`
+        # -- a *weekly* timer -- answered "-- No entries --" for a unit
+        # list-timers said had run. The journal has to be a superset of
+        # syslog, which is what the docstring above already claimed.
+        #
+        # Read from the files rather than re-running the generators: a
+        # third path to the same content is a third thing that can drift.
+        _paths = ["/var/log/syslog", "/var/log/auth.log",
+                  "/var/log/syslog.1", "/var/log/auth.log.1"]
+        _paths += ["/var/log/syslog.%d.gz" % n for n in range(2, 8)]
+        _paths += ["/var/log/auth.log.%d.gz" % n for n in range(2, 5)]
+        for path in _paths:
             try:
-                body = (self.fs.read(path) or b"").decode("latin-1")
+                raw = self.fs.read(path) or b""
+                if path.endswith(".gz"):
+                    try:
+                        raw = zlib.decompress(raw, 16 + zlib.MAX_WBITS)
+                    except Exception:                         # noqa: BLE001
+                        continue
+                body = raw.decode("latin-1")
             except PermissionDenied:
                 # journald's files are readable by root and group adm, and
                 # this user is in neither: they see their own journal, which
@@ -36185,12 +36665,101 @@ class Shell:
                 return val(row) + "\n", 0
         return "unlimited\n", 0
 
+    #: Variables getconf will only answer with a pathname, because they are
+    #: pathconf() rather than sysconf(). They still appear in `getconf -a`
+    #: with a value, which is the quirk: `getconf -a | grep NAME_MAX` shows
+    #: 255 while `getconf NAME_MAX` is a usage error. Measured on the guest.
+    _GETCONF_PATHCONF = (
+        "LINK_MAX", "_POSIX_LINK_MAX", "MAX_CANON", "_POSIX_MAX_CANON",
+        "MAX_INPUT", "_POSIX_MAX_INPUT", "NAME_MAX", "_POSIX_NAME_MAX",
+        "PATH_MAX", "_POSIX_PATH_MAX", "PIPE_BUF", "_POSIX_PIPE_BUF",
+        "SOCK_MAXBUF", "FILESIZEBITS", "POSIX_ALLOC_SIZE_MIN",
+        "POSIX_REC_INCR_XFER_SIZE", "POSIX_REC_MAX_XFER_SIZE",
+        "POSIX_REC_MIN_XFER_SIZE", "POSIX_REC_XFER_ALIGN", "SYMLINK_MAX",
+        "CHOWN_RESTRICTED", "_POSIX_CHOWN_RESTRICTED", "NO_TRUNC",
+        "_POSIX_NO_TRUNC", "VDISABLE", "_POSIX_VDISABLE",
+    )
+
+    _GETCONF_USAGE = ("Usage: getconf [-v specification] variable_name "
+                      "[pathname]\n       getconf -a [pathname]\n")
+
+    def _getconf_values(self):
+        """The variable table with the persona-derived entries filled in.
+
+        Every dynamic value comes from the same place another command reads
+        it from. _PHYS_PAGES is MemTotal/4 and _AVPHYS_PAGES is MemFree/4
+        (measured: on the guest _AVPHYS_PAGES*4kB tracks MemFree, not
+        MemAvailable), the processor counts are NCPU, and the cache sizes
+        come out of CPU_CACHES -- which is what lscpu renders from too.
+
+        The rule for the caches was measured rather than assumed: lscpu
+        prints the total across instances and getconf prints one instance,
+        so guest lscpu "L2 8 MiB (2 instances)" goes with getconf
+        LEVEL2_CACHE_SIZE 4194304, and 8 MiB / 2 is exactly that.
+        """
+        cache = {}
+        for lvl, kind, size, assoc, _sets, _shared in CPU_CACHES:
+            kb = int(str(size).rstrip("K") or 0)
+            if lvl == 1:
+                stem = "LEVEL1_" + ("DCACHE" if kind == "Data" else "ICACHE")
+            else:
+                stem = "LEVEL%d_CACHE" % lvl
+            cache[stem + "_SIZE"] = str(kb * 1024)
+            cache[stem + "_ASSOC"] = str(assoc)
+            cache[stem + "_LINESIZE"] = "64"
+        dyn = {
+            "_NPROCESSORS_CONF": str(NCPU), "NPROCESSORS_CONF": str(NCPU),
+            "_NPROCESSORS_ONLN": str(NCPU), "NPROCESSORS_ONLN": str(NCPU),
+            "_PHYS_PAGES": str(MEMINFO["MemTotal"] // 4),
+            "_AVPHYS_PAGES": str(MEMINFO["MemFree"] // 4),
+        }
+        dyn.update(cache)
+        out = []
+        for line in _GETCONF_TABLE.strip("\n").split("\n"):
+            name, _, val = line.partition("\t")
+            if val == "@PERSONA@":
+                val = dyn.get(name, "")
+            elif name in dyn:
+                val = dyn[name]
+            out.append((name, val))
+        return out
+
     def cmd_getconf(self, a, stdin=""):
-        table = {"LONG_BIT": "64", "PAGESIZE": "4096", "PAGE_SIZE": "4096",
-                 "_NPROCESSORS_ONLN": str(NCPU), "ARG_MAX": "2097152"}
-        if a and a[0] in table:
-            return table[a[0]] + "\n", 0
-        return "", 0
+        """getconf(1). It was five variables and silence for the rest.
+
+        Silence is the problem. `getconf _NPROCESSORS_ONLN` answered 4 while
+        `getconf _NPROCESSORS_CONF` answered nothing and /proc/cpuinfo
+        answered 4 -- three ways of asking one question, one of them mute.
+        `getconf -a` printed zero lines where the real one prints 322.
+
+        A miner's installer reads CLK_TCK to turn jiffies into seconds and
+        _PHYS_PAGES to size its own allocation; both were empty, and an
+        empty answer is not a wrong number, it is an obviously fake box.
+        """
+        args = list(a)
+        # -v SPEC selects a standard; the values we carry do not differ
+        # between specifications, so it is accepted and ignored.
+        if len(args) >= 2 and args[0] == "-v":
+            args = args[2:]
+        if not args:
+            self.err(self._GETCONF_USAGE.rstrip("\n"))
+            return "", 2
+        vals = self._getconf_values()
+        if args[0] == "-a":
+            # A pathname after -a is allowed and changes nothing here.
+            return "".join("%-34s %s\n" % (n, v) for n, v in vals), 0
+        name = args[0]
+        table = dict(vals)
+        if name not in table:
+            self.err("getconf: Unrecognized variable `%s'" % name)
+            return "", 2
+        if len(args) == 1 and name in self._GETCONF_PATHCONF:
+            self.err(self._GETCONF_USAGE.rstrip("\n"))
+            return "", 2
+        val = table[name]
+        # An entry with no value is a variable the platform does not define.
+        # Real getconf says so rather than printing a blank line.
+        return (val if val else "undefined") + "\n", 0
 
     def cmd_history(self, a, stdin=""):
         """`history`, and the clearing of it that follows.
