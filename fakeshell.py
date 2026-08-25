@@ -6516,12 +6516,16 @@ class VFS:
             proc_start = (self.proc_started or {}).get(pid, BOOT_TS)
             uid = next((u for u, n in UID_NAMES.items() if n == user), 0)
             base = "/proc/%d" % pid
+            # proc_start, not BOOT_TS. The fd links were fixed to use it and
+            # the directory holding them was not, so `stat /proc/<pid>` and
+            # `stat /proc/<pid>/exe` dated a process the attacker had just
+            # launched to six weeks ago while `ps -o etime` said 00:00.
             self.nodes[base] = FileNode(mode=0o555, is_dir=True, uid=uid, gid=uid,
-                                        mtime=BOOT_TS, ino=self._alloc_ino())
+                                        mtime=proc_start, ino=self._alloc_ino())
             for d in self.PROC_DIRS:
                 self.nodes[base + "/" + d] = FileNode(
                     mode=0o500 if d in ("fd", "map_files") else 0o555,
-                    is_dir=True, uid=uid, gid=uid, mtime=BOOT_TS,
+                    is_dir=True, uid=uid, gid=uid, mtime=proc_start,
                     ino=self._alloc_ino())
             # The namespaces this process is in. Same inode for everything
             # on the box, which is what "not in a container" looks like,
@@ -6536,25 +6540,25 @@ class VFS:
                     ino = PRIVATE_MNT_NS.get(comm_ns, ino)
                 self.nodes["%s/ns/%s" % (base, ns)] = FileNode(
                     mode=0o777, link="%s:[%d]" % (kind, ino),
-                    uid=uid, gid=uid, mtime=BOOT_TS, ino=self._alloc_ino())
+                    uid=uid, gid=uid, mtime=proc_start, ino=self._alloc_ino())
             # The LSM attribute files. They exist on every box with a
             # security module loaded -- and this one says apparmor in
             # /sys/kernel/security/lsm -- but /proc/<pid>/attr was an empty
             # directory, so `cat /proc/self/attr/current`, which is how you
             # ask what confines you, said no such file.
             self.nodes[base + "/attr/apparmor"] = FileNode(
-                mode=0o555, is_dir=True, uid=uid, gid=uid, mtime=BOOT_TS,
+                mode=0o555, is_dir=True, uid=uid, gid=uid, mtime=proc_start,
                 ino=self._alloc_ino())
             for f in ("current", "exec", "fscreate", "keycreate", "prev",
                       "sockcreate", "apparmor/current", "apparmor/exec",
                       "apparmor/prev"):
                 self.nodes[base + "/attr/" + f] = FileNode(
-                    b"", mode=0o666, uid=uid, gid=uid, mtime=BOOT_TS,
+                    b"", mode=0o666, uid=uid, gid=uid, mtime=proc_start,
                     ino=self._alloc_ino())
             for f in self.PROC_FILES:
                 mode = 0o400 if f in ("environ", "io", "syscall", "maps") else 0o444
                 self.nodes[base + "/" + f] = FileNode(
-                    b"", mode=mode, uid=uid, gid=uid, mtime=BOOT_TS,
+                    b"", mode=mode, uid=uid, gid=uid, mtime=proc_start,
                     ino=self._alloc_ino())
             kern = _is_kthread(cmd)
             comm_of = (derived or {}).get(pid, (None, None))[0]
@@ -6583,7 +6587,7 @@ class VFS:
             links.append(("cwd", home if interactive else "/"))
             for name, target in links:
                 self.nodes[base + "/" + name] = FileNode(
-                    mode=0o777, link=target, uid=uid, gid=uid, mtime=BOOT_TS,
+                    mode=0o777, link=target, uid=uid, gid=uid, mtime=proc_start,
                     ino=self._alloc_ino())
             # A kernel thread holds no file descriptors, so its fd directory
             # is empty. Ours listed 0, 1 and 2 pointing at /dev/null.
@@ -6707,8 +6711,14 @@ class VFS:
         uid = next((u for u, n in UID_NAMES.items() if n == user), 0)
         pages = max(1, rss // 4)
         up = max(1.0, time.time() - BOOT_TS)
-        # starttime is in clock ticks since boot; keep it inside our uptime.
-        starttime = int((pid % 97) * 100 + 250)
+        # starttime is in clock ticks since boot, and it has to be *this
+        # process's* start. It was (pid % 97) * 100 + 250 -- a number derived
+        # from the pid, so /proc/<pid>/stat disagreed with `ps -o etime` for
+        # every process on the box. The standard way to age a process by hand
+        # is `uptime - starttime/100`, and that answered ~29 seconds for a
+        # shell ps said had been up 41 days.
+        starttime = int(max(0.0, (self.proc_started or {}).get(pid, BOOT_TS)
+                            - BOOT_TS) * 100)
         st = state[0] if state else "S"
         if what == "cmdline":
             # A kernel thread has an *empty* cmdline -- that emptiness is
@@ -12026,8 +12036,15 @@ class Shell:
             # The descriptors this shell has open, so /proc shows what the
             # shell's own table holds rather than a fixed 0/1/2.
             self.fs.shell_fds = dict(self.fds)
-            self.fs.proc_started = {self.shell_pid: self.started,
-                                    self.sshd_pid: self.started}
+            # Every start we know, in one table, so the VFS and ps cannot
+            # read different ones. proc_meta carries starts for anything the
+            # attacker launched; the session's own two come from login.
+            _starts = {self.shell_pid: self.started,
+                       self.sshd_pid: self.started}
+            for _p, _m in (meta or {}).items():
+                if isinstance(_m, dict) and _m.get("start"):
+                    _starts[_p] = _m["start"]
+            self.fs.proc_started = _starts
             self.fs.sync_proc(rows, {r[1]: (self._comm_of(r, meta.get(r[1])),
                                             self._ps_ppid(r))
                                      for r in rows})
@@ -17906,12 +17923,27 @@ class Shell:
                 return int(f[3])
         return 0
 
+    def _proc_start(self, pid):
+        """When this process started, for every reader that needs it.
+
+        There were two tables holding this one fact. proc_meta[pid]["start"]
+        was consulted by etime; self.fs.proc_started -- which already held
+        {shell_pid: session start, sshd_pid: session start} -- was consulted
+        by nothing except the fd link timestamps. So `w` reported the login
+        at 08:30 and `ps -p $$ -o etime` reported 41 days for the same shell,
+        which is one command each and the most natural pair to run.
+        """
+        meta = getattr(self.fs, "proc_meta", {}).get(pid)
+        if meta and meta.get("start"):
+            return meta["start"]
+        started = getattr(self.fs, "proc_started", None) or {}
+        if pid in started:
+            return started[pid]
+        return BOOT_TS
+
     def _ps_age(self, row):
         """Seconds since this process started."""
-        meta = getattr(self.fs, "proc_meta", {}).get(row[1])
-        if meta and meta.get("start"):
-            return int(max(0, time.time() - meta["start"]))
-        return int(max(0, time.time() - BOOT_TS))
+        return int(max(0, time.time() - self._proc_start(row[1])))
 
     def _ps_cpu_secs(self, row):
         """CPU seconds, read back off the TIME column so the two agree."""
@@ -17981,8 +18013,12 @@ class Shell:
             "psr": str(_psr_of(pid)), "processor": str(_psr_of(pid)),
             "sid": str(pid), "pgid": str(pid),
             "nlwp": "1", "wchan": "-", "flags": "0",
+            # Was a constant BOOT_TS for every process, so `ps -eo
+            # lstart,etime` printed a start 41 days ago beside an elapsed
+            # time of 00:00 -- a pairing that cannot happen, and the two
+            # columns anyone puts side by side to spot exactly that.
             "lstart": time.strftime("%a %b %e %H:%M:%S %Y",
-                                    time.gmtime(BOOT_TS)),
+                                    time.gmtime(self._proc_start(pid))),
         }.get(key, "-")
 
     def cmd_ps(self, a, stdin=""):
