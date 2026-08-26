@@ -30,6 +30,7 @@ Run all:  `./run-suites.sh`
 - `concurtest.py` -- Several channels on one connection, all touching one filesystem.
 - `cpuloadtest.py` -- A process that uses CPU has to use it everywhere.
 - `cputest.py` -- Does the box describe a CPU that /sys actually contains?
+- `cronranstest.py` -- A cron job the attacker installed has to appear in cron's own log.
 - `crontamptest.py` -- A wipe, a gutting and an install all logged as cron_install.
 - `crontest.py` -- crontab: one crontab for everyone, and no validation at all.
 - `detect.py` -- Try to prove this box is fake, the way an attacker who just landed would.

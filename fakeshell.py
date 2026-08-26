@@ -689,6 +689,99 @@ def cron_weekly_last(now=None):
 CRON_HOURLY_MINUTE = 17
 
 
+def _cron_field(spec, value, lo, hi):
+    """One crontab field against one value. `*`, `*/n`, lists and ranges."""
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        step = 1
+        if "/" in part:
+            part, _, st = part.partition("/")
+            try:
+                step = max(1, int(st))
+            except ValueError:
+                step = 1
+        if part in ("*", ""):
+            start, end = lo, hi
+        elif "-" in part:
+            a, _, b = part.partition("-")
+            try:
+                start, end = int(a), int(b)
+            except ValueError:
+                continue
+        else:
+            try:
+                start = end = int(part)
+            except ValueError:
+                continue
+        if start <= value <= end and (value - start) % step == 0:
+            return True
+    return False
+
+
+def cron_user_runs(entries, since, until, limit=400):
+    """(time, user, command) for every firing of a user crontab in a window.
+
+    Nothing is executed and nothing can be: this only works out *when* cron
+    would have written a log line, from the schedule and the clock. The
+    payload is never run here or anywhere else.
+
+    Capped from the newest end. A `* * * * *` job over a full rotation
+    window is 1,440 lines, which is what a real syslog would hold and more
+    than is worth synthesising on every read.
+    """
+    out = []
+    start = int(since) - int(since) % 60 + 60
+    for t in range(start, int(until), 60):
+        tm = time.localtime(t)
+        for user, fields, cmd, first in entries:
+            if t < first:
+                continue
+            m, h, dom, mon, dow = fields
+            if not _cron_field(m, tm.tm_min, 0, 59):
+                continue
+            if not _cron_field(h, tm.tm_hour, 0, 23):
+                continue
+            if not _cron_field(mon, tm.tm_mon, 1, 12):
+                continue
+            # cron ORs day-of-month against day-of-week unless both are *.
+            wd = (tm.tm_wday + 1) % 7
+            dom_star = dom.strip() == "*"
+            dow_star = dow.strip() == "*"
+            if dom_star and dow_star:
+                pass
+            elif dom_star:
+                if not _cron_field(dow, wd, 0, 7):
+                    continue
+            elif dow_star:
+                if not _cron_field(dom, tm.tm_mday, 1, 31):
+                    continue
+            elif not (_cron_field(dom, tm.tm_mday, 1, 31)
+                      or _cron_field(dow, wd, 0, 7)):
+                continue
+            out.append((t, user, cmd))
+    return out[-limit:]
+
+
+def _syslog_key(line):
+    """The epoch time of a `Mon DD HH:MM:SS ...` syslog line.
+
+    The stamp carries no year, so it is read against this one and pushed
+    back a year if that would put it more than half a day in the future --
+    which is only ever the case across a New Year boundary.
+    """
+    try:
+        tm = time.strptime("%d %s" % (time.localtime().tm_year, line[:15]),
+                           "%Y %b %d %H:%M:%S")
+        t = time.mktime(tm)
+    except (ValueError, OverflowError):
+        return 0.0
+    if t - time.time() > 43200:
+        t -= 365 * 86400
+    return t
+
+
 def cron_hourly_runs(since, until):
     """The times cron.hourly actually fired in [since, until).
 
@@ -5132,6 +5225,41 @@ class VFS:
         lines.sort(key=lambda x: x[0])
         return "".join("%s %s %s\n" % (self._logstamp(ts), HOST, msg)
                        for ts, msg in lines[-400:])
+
+    def _user_cron_entries(self):
+        """Every user crontab installed on this box, parsed.
+
+        (user, (min, hour, dom, mon, dow), command, installed_at). The
+        install time comes from the spool file's own mtime, so a job cannot
+        appear to have fired before it existed -- which is the first thing
+        that would look wrong about a synthesised history.
+        """
+        out = []
+        spool = "/var/spool/cron/crontabs"
+        try:
+            names = [k[len(spool) + 1:] for k in self.node_paths()
+                     if k.startswith(spool + "/") and "/" not in
+                     k[len(spool) + 1:]]
+        except Exception:                                     # noqa: BLE001
+            return out
+        for user in sorted(names):
+            path = "%s/%s" % (spool, user)
+            node = self.nodes.get(path)
+            if node is None or node.is_dir:
+                continue
+            first = getattr(node, "mtime", 0) or 0
+            body = (self.read(path, atime=False) or b"").decode(
+                "utf-8", "replace")
+            for line in body.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" in line.split(
+                        " ")[0]:
+                    continue
+                parts = line.split(None, 5)
+                if len(parts) < 6:
+                    continue
+                out.append((user, tuple(parts[:5]), parts[5], first))
+        return out
 
     def _syslog(self):
         now = time.time()
@@ -12303,6 +12431,11 @@ class Shell:
         self._close_stale_sessions()
         self._record_failed_attempts()
         self._record_own_login()
+        # After the journal has been replayed, so a crontab the attacker
+        # installed on a previous visit is on disk and its firings can be
+        # written into the log. The seeding pass that builds syslog runs
+        # before any of that exists.
+        self._replay_cron_runs()
         # (was: resync then publish. Kept the note because the ordering is
         # load-bearing and not obvious.) This call was missing entirely:
         # /proc/net/tcp had no ESTABLISHED row in a real session even though
@@ -18159,6 +18292,54 @@ class Shell:
                        for ln in lines)
         node.content = node.content + body.encode("latin-1", "replace")
         node.mtime = time.time()
+        node.ctime = max(node.ctime, node.mtime)
+
+    def _replay_cron_runs(self):
+        """Write the CRON lines the installed jobs would have produced.
+
+        Called once per session, after the journal has been replayed -- the
+        crontab only exists by then, so the seeding pass that builds syslog
+        cannot see it. Deduplicated against what is already in the file so a
+        second channel on the same connection does not double them.
+
+        Nothing is executed. This works out when cron *would have written a
+        line* from the schedule and the clock, which is a different thing
+        from running the payload, and the payload is never run.
+        """
+        entries = self.fs._user_cron_entries()
+        if not entries:
+            return
+        path = "/var/log/syslog"
+        node = (self.fs.nodes.get(path)
+                or self.fs.nodes.get(self.fs.resolve(path)))
+        if node is None or node.is_dir:
+            return
+        have = node.content.decode("latin-1", "replace")
+        rot = cron_daily_last(time.time())
+        add = []
+        for t, user, cmd in cron_user_runs(entries, rot, time.time() - 5):
+            line = ("%s %s CRON[%d]: (%s) CMD (%s)"
+                    % (time.strftime("%b %e %H:%M:%S", time.localtime(t)),
+                       HOST, 19000 + int(t) % 4000, user, cmd))
+            if line not in have:
+                add.append((t, line))
+        if not add:
+            return
+        # Merged in timestamp order, not appended. A syslog is strictly
+        # chronological -- `tail` means "the newest events" and nothing
+        # else -- and these lines start hours before the file's last entry,
+        # so appending them put an hour of cron history after tonight's
+        # nginx errors. The file was monotonic before this and has to stay
+        # so; the first version of this change broke it, and `tail -1` was
+        # then answering with a two-hour-old line.
+        merged = sorted(
+            [(_syslog_key(l), i, l)
+             for i, l in enumerate(have.splitlines()) if l.strip()]
+            + [(t, 10 ** 9, ln) for (t, ln) in add],
+            key=lambda r: (r[0], r[1]))
+        node.content = ("\n".join(r[2] for r in merged) + "\n").encode(
+            "latin-1", "replace")
+        node.mtime = max(node.mtime, time.time())
         node.ctime = max(node.ctime, node.mtime)
 
     def _unit_files(self):
