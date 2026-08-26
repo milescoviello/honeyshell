@@ -49,6 +49,7 @@ Run all:  `./run-suites.sh`
 - `dnstest.py` -- Resolving a name: a crash, and three views that never agreed.
 - `dupetest.py` -- No definition may silently shadow another.
 - `echotest.py` -- `curl ipinfo.io/org` answered with an ELF binary.
+- `enospctest.py` -- Can this disk run out of space?
 - `environtest.py` -- What does this box say about the processes running on it?
 - `envtest.py` -- The environment, from four directions.
 - `errtest.py` -- set -e, set -u, pipefail and trap -- does the shell stop when told to?

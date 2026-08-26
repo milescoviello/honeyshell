@@ -302,6 +302,10 @@ ROOT_INODES = 4112384
 ROOT_IUSED = 96218
 ESP_BLOCKS = 999424
 BIOS_BOOT_BLOCKS = 4096          # sda14, the BIOS boot partition
+#: /tmp is a tmpfs on trixie, sized at half of RAM. It fills and runs out
+#: on its own, independently of the root filesystem, which is why the two
+#: are accounted separately everywhere.
+TMPFS_BLOCKS = 1017560
 # The GPT disk GUID fdisk prints. Fixed, because a disk identifier
 # that changes between two runs of `fdisk -l` is not a disk.
 DISK_GUID = "9C4F1A2B-3D5E-4F60-8A71-B2C3D4E5F607"
@@ -3717,11 +3721,37 @@ def written_kb(vfs, under=None):
 
 
 def root_space(vfs):
-    """(total, used, free, avail) for / in 1K blocks."""
+    """(total, used, free, avail) for / in 1K blocks.
+
+    Clamped, because used was unbounded: `dd if=/dev/zero of=/root/d
+    bs=1M count=70000` on a 63 GiB disk exited 0 and left df reporting
+    "63G total, 72G used, 0 avail, 100%". A filesystem with more used
+    than it has is arithmetic nobody has to check twice. write() now
+    refuses to grow past the end, so this clamp is a backstop rather than
+    the fix.
+    """
     grown = written_kb(vfs) - written_kb(vfs, "/tmp")
-    used = ROOT_USED + grown
+    used = min(ROOT_USED + grown, ROOT_BLOCKS)
     return (ROOT_BLOCKS, used, ROOT_BLOCKS - used,
             max(0, ROOT_AVAIL - grown))
+
+
+def fs_free_kb(vfs, path):
+    """Free 1K blocks on whichever filesystem this path is on.
+
+    /tmp is a tmpfs with its own size, so filling it does not touch / --
+    and filling / does not touch it. Anything else on this box is on the
+    root filesystem.
+    """
+    if path == "/tmp" or path.startswith("/tmp/"):
+        return max(0, TMPFS_BLOCKS - written_kb(vfs, "/tmp"))
+    # ROOT_BLOCKS, not ROOT_AVAIL: ext4 holds 5% back from ordinary users
+    # and df's Avail column excludes it, but root writes straight through
+    # the reserve. Every session on this box is root, so the limit is the
+    # size of the filesystem -- and stopping 5% short would have left df
+    # reporting free space that nothing could use.
+    return max(0, ROOT_BLOCKS - (ROOT_USED + written_kb(vfs)
+                                 - written_kb(vfs, "/tmp")))
 
 
 def root_inodes_used(vfs):
@@ -9447,9 +9477,14 @@ class VFS:
     # ENOENT read very differently to someone deciding whether their
     # loader landed.
     _write_denied = False
+    #: Set when a write was cut short because the filesystem is full, so
+    #: the caller can print its own ENOSPC line. Distinct from
+    #: _write_denied, which is a permission or attribute refusal.
+    _write_enospc = False
 
     def write(self, path, data, mode=0o644, mtime=None):
         self._write_denied = False
+        self._write_enospc = False
         # chattr +i means the kernel refuses the write, whoever you are --
         # root included. Ignoring it made the attribute cosmetic, and the
         # attribute is the point: a loader sets it so its key cannot be
@@ -9498,6 +9533,27 @@ class VFS:
         real_parent = self.resolve(parent)
         if real_parent != parent:
             path = real_parent.rstrip("/") + "/" + os.path.basename(path)
+        # A filesystem runs out. `dd if=/dev/zero of=/root/d bs=1M
+        # count=70000` used to exit 0 on a 63 GiB disk and leave df saying
+        # 72G used of 63G, and with the box reporting 100% full a further
+        # `echo x > file` still succeeded. Checking free space before
+        # dropping a payload, and filling a disk to knock a service over,
+        # are both things we watch people do.
+        #
+        # Short write, not a refusal: the real kernel writes what fits and
+        # returns ENOSPC for the rest, which is why dd reports fewer
+        # records out and cp leaves a truncated file behind.
+        if not getattr(self, "_seeding", False) and data:
+            _old = self.nodes.get(path)
+            _have = len(_old.content or b"") if (
+                _old is not None and not _old.is_dir and not _old.elf
+                and not _old.blob) else 0
+            _grow = len(data) - _have
+            if _grow > 0:
+                _room = fs_free_kb(self, path) * 1024
+                if _grow > _room:
+                    data = data[:_have + max(0, _room)]
+                    self._write_enospc = True
         keep = self.nodes.get(path)
         if keep is not None and not keep.is_dir and keep.link is None:
             # Mutate in place rather than rebinding the name to a new node.
@@ -16452,6 +16508,16 @@ class Shell:
             if not self.fs.write(p, prev + out.encode("latin-1", "replace"),
                                  mode=self._new_mode()):
                 self.last_rc = self._write_fail(p, redir)
+            elif getattr(self.fs, "_write_enospc", False):
+                # A full filesystem took part of the write and dropped the
+                # rest, and the box said nothing: `echo x > /root/f` on a
+                # 100%-full disk exited 0 and left a 0-byte file. bash
+                # reports it against the builtin that was writing.
+                # Measured: "bash: line 1: echo: write error: No space left
+                # on device".
+                self.err("bash: %secho: write error: No space left on "
+                         "device" % self.where())
+                self.last_rc = 1
             return term_err
         return term_err + out
 
@@ -19441,10 +19507,12 @@ class Shell:
             for dev, mnt, fstype, tot, used, avail in rows:
                 if mnt == "/tmp":
                     extra = self._written_kb("/tmp")
-                    used, avail = used + extra, max(0, avail - extra)
+                    used, avail = min(used + extra, tot), max(0, avail
+                                                              - extra)
                 elif mnt == "/":
                     extra = grown - self._written_kb("/tmp")
-                    used, avail = used + extra, max(0, avail - extra)
+                    used, avail = min(used + extra, tot), max(0, avail
+                                                              - extra)
                 itot, iused = inodes.get(mnt, (254389, 1))
                 pct = int(round(used * 100.0 / tot)) if tot else 0
                 ipct = int(round(iused * 100.0 / itot)) if itot else 0
@@ -19495,8 +19563,13 @@ class Shell:
                 avail = max(0, avail - tmp_grown)
             if mnt == "/" and grown:
                 # What has been written since boot shows up in the root
-                # filesystem's usage, as it would on a real box.
-                used += grown
+                # filesystem's usage, as it would on a real box -- and
+                # never more than the filesystem holds. df did this sum
+                # itself while root_space() did it with a clamp, so a
+                # `mkdir` on a full disk pushed df's Used one block past
+                # Size while stat -f and tune2fs, reading the same
+                # filesystem, still said it was exactly full.
+                used = min(used + grown, tot)
                 avail = max(0, avail - grown)
             pct = int(round(100.0 * used / (used + avail))) if used + avail else 0
             if human:
@@ -21793,6 +21866,15 @@ class Shell:
                          % (dest, self._deny_reason(dst)))
                 rc = 1
                 continue
+            if getattr(self.fs, "_write_enospc", False):
+                # The file exists and is short. cp's wording separates
+                # "could not create it" from "ran out part-way through",
+                # and it is the second one that tells an operator the disk
+                # is full rather than the path being wrong.
+                self.err("cp: error writing '%s': No space left on device"
+                         % dest)
+                rc = 1
+                continue
             if preserve and src in self.fs.nodes:
                 snode = self.fs.nodes[src]
                 self.fs.chmod(dst, snode.mode)
@@ -22165,6 +22247,12 @@ class Shell:
             if not self.fs.write(p, prev + stdin.encode("latin-1")):
                 self.err("tee: %s: %s" % (f, self._deny_reason(
                     VFS.norm(f, self.cwd))))
+                return stdin, 1
+            if getattr(self.fs, "_write_enospc", False):
+                # tee still writes its copy to stdout and complains about
+                # the file. Measured on a full tmpfs: "hi" on stdout, then
+                # "tee: /mnt/tiny/z: No space left on device".
+                self.err("tee: %s: No space left on device" % f)
                 return stdin, 1
         return stdin, 0
 
@@ -26990,6 +27078,15 @@ class Shell:
             held = node_alloc(node, path) if node is not None else 0
             self._alloc_file(path, size, data,
                              alloc=max(held, offset + length))
+            # fallocate reserves blocks up front, so it either gets them
+            # all or it fails -- there is no short fallocate. Measured:
+            # "fallocate: fallocate failed: No space left on device", rc 1,
+            # and the file is left at whatever length it already had.
+            if getattr(self.fs, "_write_enospc", False):
+                self._alloc_file(path, cur, data, alloc=held)
+                self.err("fallocate: fallocate failed: No space left on "
+                         "device")
+                return "", 1
         return "", 0
 
     # Above this, a file is recorded as a sparse allocation rather than
@@ -27012,6 +27109,36 @@ class Shell:
         """
         keep = self.fs.nodes.get(p) or self.fs.nodes.get(self.fs.resolve(p))
         held = node_alloc(keep, p) if keep is not None else 0
+        # The large path goes through set_extent, which writes 4 KiB and
+        # records a length -- so the free-space check in VFS.write() never
+        # saw the other 70 GiB. This is the funnel for dd, fallocate and
+        # truncate, and it is where a filesystem runs out.
+        #
+        # A hole costs nothing, which is why `truncate -s 100G` succeeds on
+        # a full disk and `fallocate -l 100G` does not.
+        short = False
+        want = size if alloc is None else alloc
+        if want > held:
+            room = fs_free_kb(self.fs, p) * 1024 + held
+            if want > room:
+                short = True
+                # A fully-allocated file cannot be longer than what fits;
+                # only a sparse one can. dd passes alloc == size, so both
+                # stop at the same place and `ls -l` shows what was
+                # actually written rather than what was asked for.
+                if alloc is None or alloc == size:
+                    size = max(0, room)
+                alloc = max(0, room)
+        # Set *after* the writes below, because VFS.write() clears the flag
+        # on entry -- setting it first meant the caller always saw False and
+        # dd reported a full 70000 records out beside a file that stopped
+        # at 56 GiB.
+        try:
+            return self._alloc_file_inner(p, size, data, alloc, held)
+        finally:
+            self.fs._write_enospc = short
+
+    def _alloc_file_inner(self, p, size, data, alloc, held):
         if size > self.SPARSE_MIN:
             self.fs.write(p, data[:4096])
             self.fs.set_extent(p, size,
@@ -33346,12 +33473,30 @@ class Shell:
                     else b""
                 size = seek * bs + total
                 self._alloc_file(path, size, prev, alloc=size)
-                self.err("%d+0 records in" % count)
-                self.err("%d+0 records out" % count)
+                # A short write is what a full filesystem gives back. dd
+                # reports the blocks that made it, the byte count that
+                # made it, and exits 1 -- measured on a 2 MiB tmpfs asked
+                # for 5 MiB: "3+0 records in / 2+0 records out", rc 1.
+                short = getattr(self.fs, "_write_enospc", False)
+                if short:
+                    node = self.fs.nodes.get(path) or self.fs.nodes.get(
+                        self.fs.resolve(path))
+                    total = max(0, node_size(node, path) - seek * bs)
+                    done = total // bs
+                    self.err("%d+0 records in" % min(count, done + 1))
+                    self.err("%d+0 records out" % done)
+                    total = done * bs
+                else:
+                    self.err("%d+0 records in" % count)
+                    self.err("%d+0 records out" % count)
                 secs = max(total / 4.7e9, 1e-5)
                 self.err("%s copied, %s s, %s"
                          % (_dd_units(total), _dd_secs(secs),
                             _dd_rate(total, secs)))
+                if short:
+                    self.err("dd: error writing '%s': No space left on "
+                             "device" % dest_early)
+                    return "", 1
                 return "", 0
         if src:
             # Ask for what was requested. A character device is a stream, and

@@ -155,22 +155,45 @@ def t_no_swap_means_no_swap_anywhere():
 # -- fallocate and truncate ----------------------------------------------
 
 def t_fallocate_reads_suffixes():
+    """On / -- /tmp is a 970 MiB tmpfs and 1G does not fit in it.
+
+    These ran in /tmp and asked for a gigabyte, which was fine while the
+    disk was infinite. Sweep 185 gave the filesystems their real sizes and
+    this started failing correctly: measured on the guest, `fallocate -l
+    1G /tmp/fa` answers "fallocate: fallocate failed: No space left on
+    device" with rc 1 and leaves a 0-byte file. A swapfile goes on /
+    anyway -- the recipe is `fallocate -l 1G /swapfile`.
+    """
     s = shell()
     for spec, want in (("4096", 4096), ("1M", 1048576), ("512K", 524288),
                        ("1G", 1073741824), ("2MiB", 2097152),
                        ("1MB", 1000000)):
-        out(s, "rm -f /tmp/fa")
+        out(s, "rm -f /var/fa")
         eq("fallocate -l %s" % spec,
-           out(s, "fallocate -l %s /tmp/fa; stat -c '%%s' /tmp/fa" % spec),
+           out(s, "fallocate -l %s /var/fa; stat -c '%%s' /var/fa" % spec),
            str(want))
+
+
+def t_fallocate_respects_the_tmpfs_size():
+    """The other half: a gigabyte does not fit in /tmp, and it says so."""
+    s = shell()
+    out(s, "rm -f /tmp/fa")
+    eq("1G on a 970M tmpfs is refused",
+       out(s, "fallocate -l 1G /tmp/fa 2>&1"),
+       "fallocate: fallocate failed: No space left on device")
+    eq("...leaving a 0-byte file",
+       out(s, "stat -c '%s' /tmp/fa"), "0")
+    eq("...and 100M still fits",
+       out(s, "rm -f /tmp/fb; fallocate -l 100M /tmp/fb; "
+              "stat -c '%s' /tmp/fb"), str(100 * 1024 ** 2))
 
 
 def t_truncate_and_fallocate_agree():
     s = shell()
     for spec in ("4096", "1M", "64M", "1G"):
-        out(s, "rm -f /tmp/t1 /tmp/t2")
-        a = out(s, "truncate -s %s /tmp/t1; stat -c '%%s' /tmp/t1" % spec)
-        b = out(s, "fallocate -l %s /tmp/t2; stat -c '%%s' /tmp/t2" % spec)
+        out(s, "rm -f /var/t1 /var/t2")
+        a = out(s, "truncate -s %s /var/t1; stat -c '%%s' /var/t1" % spec)
+        b = out(s, "fallocate -l %s /var/t2; stat -c '%%s' /var/t2" % spec)
         eq("same size for %s" % spec, b, a)
 
 
@@ -181,9 +204,12 @@ def t_a_huge_allocation_costs_no_memory():
     eq("reports the full size",
        out(s, "truncate -s 100G /tmp/huge; stat -c '%s' /tmp/huge"),
        str(100 * 1024 ** 3))
-    out(s, "rm -f /tmp/huge2; fallocate -l 40G /tmp/huge2")
+    # On /, because 40G does not fit in a 970 MiB tmpfs -- and the point
+    # of this case is the memory cost of a large allocation, not where it
+    # lands.
+    out(s, "rm -f /var/huge2; fallocate -l 40G /var/huge2")
     eq("fallocate too",
-       out(s, "stat -c '%s' /tmp/huge2"), str(40 * 1024 ** 3))
+       out(s, "stat -c '%s' /var/huge2"), str(40 * 1024 ** 3))
     after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     grew = (after - before) // 1024
     check("RSS barely moved", grew < 64, "grew %d MB" % grew)
