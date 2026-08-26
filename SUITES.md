@@ -74,6 +74,7 @@ Run all:  `./run-suites.sh`
 - `iptest.py` -- iproute2's filters and output modes.
 - `jobspectest.py` -- Naming a background job: do %+, %-, %N and %prefix all resolve?
 - `jobtest.py` -- Does the shell know about the jobs it just started?
+- `journalstoretest.py` -- The journal says how much disk it uses. The disk has to agree.
 - `jrnltest.py` -- journalctl's output modes and filters, against the journal underneath.
 - `killtest.py` -- Killing one process is not stopping the service.
 - `kmsgtest.py` -- Three commands read the kernel's messages. Do they agree?

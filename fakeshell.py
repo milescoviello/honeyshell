@@ -233,6 +233,9 @@ def unix_rows(fs):
         ("STREAM", "CONNECTED", ino, "", 0o600, 0, 0) for ino in extra)
 
 
+JOURNALD_CONF = '#  This file is part of systemd.\n#\n#  systemd is free software; you can redistribute it and/or modify it under the\n#  terms of the GNU Lesser General Public License as published by the Free\n#  Software Foundation; either version 2.1 of the License, or (at your option)\n#  any later version.\n#\n# Entries in this file show the compile time defaults. Local configuration\n# should be created by either modifying this file (or a copy of it placed in\n# /etc/ if the original file is shipped in /usr/), or by creating "drop-ins" in\n# the /etc/systemd/journald.conf.d/ directory. The latter is generally\n# recommended. Defaults can be restored by simply deleting the main\n# configuration file and all drop-ins located in /etc/.\n#\n# Use \'systemd-analyze cat-config systemd/journald.conf\' to display the full config.\n#\n# See journald.conf(5) for details.\n\n[Journal]\n#Storage=auto\n#Compress=yes\n#Seal=yes\n#SplitMode=uid\n#SyncIntervalSec=5m\n#RateLimitIntervalSec=30s\n#RateLimitBurst=10000\n#SystemMaxUse=\n#SystemKeepFree=\n#SystemMaxFileSize=\n#SystemMaxFiles=100\n#RuntimeMaxUse=\n#RuntimeKeepFree=\n#RuntimeMaxFileSize=\n#RuntimeMaxFiles=100\n#MaxRetentionSec=0\n#MaxFileSec=1month\n#ForwardToSyslog=no\n#ForwardToKMsg=no\n#ForwardToConsole=no\n#ForwardToWall=yes\n#TTYPath=/dev/console\n#MaxLevelStore=debug\n#MaxLevelSyslog=debug\n#MaxLevelKMsg=notice\n#MaxLevelConsole=info\n#MaxLevelWall=emerg\n#MaxLevelSocket=debug\n#LineMax=48K\n#ReadKMsg=yes\n#Audit=yes\n'
+
+
 def _hex_addr(ip):
     """An IPv4 address as /proc/net/* writes it: little-endian, uppercase.
 
@@ -6123,6 +6126,60 @@ class VFS:
                 self.nodes.pop(path, None)
                 self.nodes.pop(twin, None)
 
+    #: The persistent journal as the guest actually has it: one directory
+    #: per machine-id, owned root:systemd-journal, holding files of the
+    #: sizes journald rotates at.
+    #:
+    #: `journalctl --disk-usage` said 72M while /var/log/journal did not
+    #: exist -- `ls -ld` and `du` both answered No such file or directory to
+    #: the same question, and `--vacuum-time` named a path inside it. A
+    #: store that is quoted by size and absent from the filesystem is the
+    #: first thing anyone clearing their tracks looks at.
+    _JOURNAL_FILES = (
+        ("system.journal", 25165824, 0),
+        ("system@00065948ed128863-6bb2f474fed33ac8.journal~", 8388608,
+         8 * 86400),
+        ("system@000659492682364f-b10220470123ee4b.journal~", 8388608,
+         8 * 86400),
+        ("system@MACHINE-0000000000000fb5-000659492680f483.journal",
+         67108864, 2 * 86400),
+        ("user-1000.journal", 50331648, 0),
+    )
+
+    def _seed_journal(self, w):
+        """/var/log/journal, /run/log/journal and journald.conf."""
+        jr = "/var/log/journal"
+        self.nodes[jr] = FileNode(mode=0o2755, is_dir=True, uid=0, gid=101,
+                                  mtime=BOOT_TS - 8 * 86400)
+        mdir = "%s/%s" % (jr, MACHINE_ID)
+        self.nodes[mdir] = FileNode(mode=0o2755, is_dir=True, uid=0, gid=101,
+                                    mtime=BOOT_TS - 2 * 86400)
+        for name, size, age in self._JOURNAL_FILES:
+            name = name.replace("MACHINE", MACHINE_ID)
+            n = FileNode(mode=0o640, uid=0, gid=101,
+                         mtime=(BOOT_TS - age) if age else BOOT_TS)
+            # Sized, not filled: journald files are megabytes of binary and
+            # nothing here reads their contents. ls, du, df and
+            # --disk-usage all price them from this.
+            n.blob = ("zero", size)
+            n.alloc = size
+            self.nodes["%s/%s" % (mdir, name)] = n
+        # Storage=auto with /var/log/journal present means the runtime
+        # directory exists and is empty, which is what the guest shows.
+        self.nodes["/run/log/journal"] = FileNode(
+            mode=0o2755, is_dir=True, uid=0, gid=101, mtime=BOOT_TS)
+        # /etc/systemd does not exist yet at this point in the seed, and
+        # write() will not create a missing parent -- so this silently wrote
+        # nothing until the directory was made first. The file being absent
+        # is its own small tell: Debian ships journald.conf with 49 lines of
+        # commented defaults, including the `#Storage=auto` that decides
+        # whether the directory above is used at all.
+        for d in ("/etc/systemd",):
+            if not self.isdir(d):
+                self.nodes[d] = FileNode(mode=0o755, is_dir=True,
+                                         mtime=BOOT_TS - 86400)
+        w("/etc/systemd/journald.conf", JOURNALD_CONF)
+
     def _seed_ca_store(self, w):
         def d(path, mode=0o755):
             self.nodes[path] = FileNode(mode=mode, is_dir=True,
@@ -9213,6 +9270,7 @@ class VFS:
         self.nodes["/etc/shadow"] = n
         w("/etc/resolv.conf", "nameserver 1.1.1.1\nnameserver 1.0.0.1\n")
         w("/etc/machine-id", MACHINE_ID + "\n")
+        self._seed_journal(w)
         self._seed_ca_store(w)
 
         w("/etc/crontab",
@@ -25590,8 +25648,30 @@ class Shell:
             if x == "--disk-usage":
                 # systemd prints "96M", not "96.0M": the size goes through
                 # FORMAT_BYTES, which drops a trailing .0.
-                return ("Archived and active journals take up 72M "
-                        "in the file system.\n"), 0
+                #
+                # Summed from the files rather than stated. It was the
+                # literal "72M" on a box where /var/log/journal did not
+                # exist, so `du -sh /var/log/journal` answered "No such file
+                # or directory" to the same question. Measured on the guest:
+                # --disk-usage 141.5M against du 142M -- the same bytes,
+                # rounded two different ways, which is the agreement to aim
+                # for rather than an identical string.
+                total = 0
+                for base in ("/var/log/journal", "/run/log/journal"):
+                    for k in self.fs.node_paths():
+                        if not k.startswith(base + "/"):
+                            continue
+                        n = self.fs.nodes.get(k)
+                        if n is not None and not n.is_dir:
+                            total += node_size(n, k)
+                v = float(total)
+                for unit in ("B", "K", "M", "G"):
+                    if v < 1024 or unit == "G":
+                        break
+                    v /= 1024.0
+                txt = ("%.1f" % v).rstrip("0").rstrip(".") + unit
+                return ("Archived and active journals take up %s "
+                        "in the file system.\n" % txt), 0
             if x == "--list-boots":
                 # A table with a header and two separate timestamp columns.
                 # Ours was one line with an em-dash and no header, which is

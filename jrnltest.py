@@ -179,9 +179,26 @@ def main():
           s.run("journalctl --vacuum-size=1M").splitlines()[0],
           vac.splitlines()[0])
     check("--rotate is silent", s.run("journalctl --rotate"), "")
-    check("--disk-usage has no trailing .0",
-          s.run("journalctl --disk-usage").strip(),
-          "Archived and active journals take up 72M in the file system.")
+    # Was pinned to the literal "72M" on a box where /var/log/journal did
+    # not exist at all, so `du` answered "No such file or directory" to the
+    # same question. The number is summed from the files now, and the check
+    # is the agreement rather than the constant: measured on the guest,
+    # --disk-usage says 141.5M where du says 142M -- the same bytes rounded
+    # two different ways, which is what agreement looks like here.
+    du = s.run("du -sh /var/log/journal").split()[0]
+    usage = s.run("journalctl --disk-usage").strip()
+    check("--disk-usage names a size", usage.startswith(
+        "Archived and active journals take up "), True)
+    check("...in the file system", usage.endswith("in the file system."), True)
+    size = usage.split("take up ")[1].split(" in ")[0]
+    check("--disk-usage has no trailing .0", ".0" in size, False)
+
+    def _bytes(t):
+        mult = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+        return float(t[:-1]) * mult.get(t[-1].upper(), 1)
+
+    check("--disk-usage agrees with du on the journal directory",
+          abs(_bytes(size) - _bytes(du)) < _bytes(du) * 0.02, True)
     boots = s.run("journalctl --list-boots")
     check("--list-boots has a header",
           boots.splitlines()[0].split()[:3], ["IDX", "BOOT", "ID"])
