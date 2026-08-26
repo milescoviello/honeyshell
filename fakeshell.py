@@ -14,6 +14,7 @@ so all of those behave the way bash does.
 """
 
 import base64
+import calendar
 import fnmatch
 import hashlib
 import ipaddress
@@ -23926,32 +23927,85 @@ class Shell:
             self.err("passwd: user '%s' does not exist" % user)
             return "", 1
         self.log(event="passwd", target=user, argv=" ".join(a)[:200])
+        # All of these print "passwd: password changed." on the guest --
+        # measured for -d, -l, -e and the aging flags. "password expiry
+        # information changed" is a message this shadow does not have.
         if {"-d", "--delete"} & set(flags):
             self._shadow_set(user, "")
-            return "passwd: password expiry information changed.\n", 0
+            return "passwd: password changed.\n", 0
         if {"-l", "--lock"} & set(flags):
             self._shadow_set(user, "!")
-            return "passwd: password expiry information changed.\n", 0
+            return "passwd: password changed.\n", 0
         if {"-u", "--unlock"} & set(flags):
+            row = self._shadow_row(user)
+            # Unlocking an account whose only content is the lock marker
+            # would leave it open to anyone. shadow refuses, with two
+            # lines and rc 3 -- not a silent success.
+            if row is not None and row[1].lstrip("!") == "":
+                self.err("passwd: unlocking the password would result in a "
+                         "passwordless account.")
+                self.err("You should set a password with usermod -p to "
+                         "unlock the password of this account.")
+                return "", 3
             self._shadow_set(user, None, unlock=True)
-            return "passwd: password expiry information changed.\n", 0
+            return "passwd: password changed.\n", 0
         if {"-e", "--expire"} & set(flags):
-            return "passwd: password expiry information changed.\n", 0
+            # -e means "must change at next login", which is a last-change
+            # of 0 in the file. It reported success and wrote nothing, so
+            # `chage -l` afterwards still showed the old date.
+            self._shadow_age_set(user, last=0)
+            self.log(event="chage", target=user, argv=" ".join(a)[:200],
+                     fields="last")
+            return "passwd: password changed.\n", 0
         if {"-S", "--status"} & set(flags):
+            # The four aging columns were the literals "0 99999 7 -1", so
+            # setting a maximum moved /etc/shadow and chage -l and left
+            # this command still saying 99999. And the date was in US
+            # format: shadow 4.17 on the guest prints 2026-08-10, not
+            # 08/10/2026.
             raw = (self.fs.read("/etc/shadow") or b"").decode("latin-1")
-            for line in raw.splitlines():
-                f = line.split(":")
-                if f[0] != user:
+            want = ([l.split(":")[0] for l in raw.splitlines() if ":" in l]
+                    if {"-a", "--all"} & set(flags) else [user])
+            out = []
+            for name in want:
+                f = self._shadow_row(name)
+                if f is None:
                     continue
-                state = "L" if f[1].startswith("!") else (
+                state = "L" if f[1].startswith(("!", "*")) else (
                     "NP" if not f[1] else "P")
-                return ("%s %s %s 0 99999 7 -1\n"
-                        % (user, state,
-                           time.strftime("%m/%d/%Y",
-                                         time.gmtime(int(f[2]) * 86400
-                                                     if f[2].isdigit() else 0))
-                           )), 0
-            return "", 1
+                age = self._shadow_age(name)
+                out.append("%s %s %s %s %s %s %s\n"
+                           % (name, state,
+                              time.strftime("%Y-%m-%d",
+                                            time.gmtime((age["last"] or 0)
+                                                        * 86400)),
+                              0 if age["min"] is None else age["min"],
+                              -1 if age["max"] is None else age["max"],
+                              -1 if age["warn"] is None else age["warn"],
+                              -1 if age["inactive"] is None
+                              else age["inactive"]))
+            if not out:
+                return "", 1
+            return "".join(out), 0
+        # -n, -x, -w and -i are the aging flags passwd shares with chage,
+        # and they were parsed and dropped: `passwd -x 60 bob` reported
+        # success and left the file alone.
+        _AGE_FLAGS = {"-n": "min", "--mindays": "min",
+                      "-x": "max", "--maxdays": "max",
+                      "-w": "warn", "--warndays": "warn",
+                      "-i": "inactive", "--inactive": "inactive"}
+        setting = {}
+        for i, x in enumerate(a):
+            col = _AGE_FLAGS.get(x)
+            if col and i + 1 < len(a):
+                ok, val = self._chage_value(a[i + 1])
+                if ok:
+                    setting[col] = val
+        if setting:
+            self._shadow_age_set(user, **setting)
+            self.log(event="chage", target=user, argv=" ".join(a)[:200],
+                     fields=",".join(sorted(setting)))
+            return "passwd: password changed.\n", 0
         # --stdin, or a password piped in
         if stdin.strip():
             self._shadow_set(user, self._fake_hash(stdin.strip().splitlines()[0]))
@@ -24326,7 +24380,8 @@ class Shell:
             a, value_opts=("-u", "-g", "-G", "-d", "-s", "-c", "-l", "-e",
                            "-f", "-p"),
             long_value=("--uid", "--gid", "--groups", "--home", "--shell",
-                        "--comment", "--login", "--password"))
+                        "--comment", "--login", "--password",
+                        "--expiredate", "--inactive"))
         self.log(event="usermod", argv=" ".join(a)[:200])
         if self._shadow_needs_root("usermod"):
             return "", 1
@@ -24359,6 +24414,26 @@ class Shell:
             f[0] = newname
         lines[idx] = ":".join(f)
         self.fs.write("/etc/passwd", ("\n".join(lines) + "\n").encode("latin-1"))
+        # -e and -f are shadow columns, not passwd ones, and they were
+        # parsed and thrown away: `usermod -e 2027-01-31 bob` exited 0 and
+        # left the file untouched, so `chage -l bob` still said the account
+        # never expires. That is worse than chage's honest refusal, because
+        # this one agreed. -1 clears the column, as it does for chage.
+        _age = {}
+        for _flag, _long, _col in (("-e", "--expiredate", "expire"),
+                                   ("-f", "--inactive", "inactive")):
+            if _flag in vals or _long in vals:
+                _ok, _val = self._chage_value(
+                    str(vals.get(_flag, vals.get(_long))))
+                if not _ok:
+                    self.err("usermod: invalid date '%s'"
+                             % vals.get(_flag, vals.get(_long)))
+                    return "", 3
+                _age[_col] = _val
+        if _age:
+            self._shadow_age_set(user, **_age)
+            self.log(event="chage", target=user, argv=" ".join(a)[:200],
+                     fields=",".join(sorted(_age)))
         groups = vals.get("-G", vals.get("--groups"))
         if groups:
             if not ({"-a", "--append"} & set(flags)):
@@ -24380,6 +24455,75 @@ class Shell:
         if {"-U", "--unlock"} & set(flags):
             self._shadow_set(f[0], None, unlock=True)
         return "", 0
+
+    #: The aging columns of /etc/shadow, by field index. Anything that
+    #: reads or writes them goes through here, because chage -l, passwd -S
+    #: and the file itself are three views of one row and used to be three
+    #: separate opinions: passwd -S printed "0 99999 7 -1" as a literal,
+    #: so setting a maximum with chage moved the file and chage -l and left
+    #: passwd -S saying 99999.
+    SHADOW_AGE = {"last": 2, "min": 3, "max": 4, "warn": 5,
+                  "inactive": 6, "expire": 7}
+
+    def _shadow_row(self, user):
+        """This account's shadow line as a list of fields, or None."""
+        for line in (self.fs.read("/etc/shadow")
+                     or b"").decode("latin-1").splitlines():
+            f = line.split(":")
+            if f and f[0] == user:
+                while len(f) < 9:
+                    f.append("")
+                return f
+        return None
+
+    def _shadow_age(self, user):
+        """The aging fields as ints, with None for an empty column.
+
+        An empty column is not a zero: an empty max means the password
+        never expires and a max of 0 means it expired the day it was set.
+        """
+        f = self._shadow_row(user)
+        if f is None:
+            return None
+        out = {}
+        for name, idx in self.SHADOW_AGE.items():
+            raw = f[idx].strip()
+            try:
+                out[name] = int(raw)
+            except ValueError:
+                out[name] = None
+        return out
+
+    def _shadow_age_set(self, user, **fields):
+        """Write aging columns. A value of None clears the column.
+
+        chage refused every setting flag with "PAM: Authentication token
+        manipulation error" where a real chage rewrites the file and exits
+        0, and `usermod -e` returned 0 and changed nothing -- which is
+        worse, because the box agreed to it. Both are the persistence step
+        after adding an account: stop it expiring, then check.
+        """
+        raw = (self.fs.read("/etc/shadow") or b"").decode("latin-1")
+        lines = raw.splitlines()
+        for i, line in enumerate(lines):
+            f = line.split(":")
+            if not f or f[0] != user:
+                continue
+            while len(f) < 9:
+                f.append("")
+            for name, val in fields.items():
+                idx = self.SHADOW_AGE[name]
+                f[idx] = "" if val is None else str(int(val))
+            lines[i] = ":".join(f[:9])
+            self.fs.write("/etc/shadow",
+                          ("\n".join(lines) + "\n").encode("latin-1"))
+            return True
+        return False
+
+    @staticmethod
+    def _age_date(days):
+        """A shadow day-count as chage -l prints it: "Aug 26, 2026"."""
+        return time.strftime("%b %d, %Y", time.gmtime(days * 86400))
 
     def _shadow_set(self, user, value, unlock=False):
         raw = (self.fs.read("/etc/shadow") or b"").decode("latin-1")
@@ -40579,30 +40723,137 @@ class Shell:
     # The setuid helpers that ship with passwd(1) and util-linux. The files are
     # on the disk because a real Debian has them; without handlers, running one
     # produced silence, and an existing invariant flagged them as orphaned.
+    #: chage's setting flags and the shadow column each one writes.
+    _CHAGE_OPTS = {"-d": "last", "--lastday": "last",
+                   "-E": "expire", "--expiredate": "expire",
+                   "-I": "inactive", "--inactive": "inactive",
+                   "-m": "min", "--mindays": "min",
+                   "-M": "max", "--maxdays": "max",
+                   "-W": "warn", "--warndays": "warn"}
+
+    @staticmethod
+    def _chage_value(text):
+        """-1 clears a column; a date is converted to days since the epoch.
+
+        chage takes either a day count or a YYYY-MM-DD for -d and -E, and
+        -1 for "no value" on any of them. Returns (ok, value-or-None).
+        """
+        text = text.strip()
+        if text in ("-1", ""):
+            return True, None
+        if re.match(r"^-?\d+$", text):
+            return True, int(text)
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", text)
+        if not m:
+            return False, None
+        try:
+            epoch = calendar.timegm((int(m.group(1)), int(m.group(2)),
+                                     int(m.group(3)), 0, 0, 0, 0, 0, 0))
+        except (ValueError, OverflowError):
+            return False, None
+        return True, epoch // 86400
+
     def cmd_chage(self, a, stdin=""):
-        if "-l" in a:
-            user = [x for x in a if not x.startswith("-")]
-            user = user[-1] if user else self.user
-            line = [l for l in (self.fs.read("/etc/shadow") or b"")
-                    .decode("latin-1").splitlines() if l.startswith(user + ":")]
-            if not line:
-                self.err("chage: user '%s' does not exist in /etc/passwd" % user)
-                return "", 1
-            f = line[0].split(":")
-            last = int(f[2]) if len(f) > 2 and f[2].isdigit() else 0
+        """Password aging: read it, and -- now -- change it.
+
+        Every setting flag answered "chage: PAM: Authentication token
+        manipulation error" and exited 1, where a real chage rewrites
+        /etc/shadow and exits 0. `chage -I -1 -m 0 -M 99999 -E -1 <user>`
+        is the line an operator runs after adding an account so it cannot
+        expire out from under them, and the box refused it -- while
+        `usermod -e` next door returned 0 and silently changed nothing,
+        which is worse, because that one agreed.
+
+        The listing was three literals: "never", "0 99999 7". It read the
+        last-change column out of the file and invented the other six, so
+        the file and the command that prints the file disagreed about
+        every field but one.
+
+        Measured on the guest, for a row of 20600:3:30:5:10:20900:
+
+            Last password change   : May 27, 2026     (20600)
+            Password expires       : Jun 26, 2026     (last + max)
+            Password inactive      : Jul 06, 2026     (last + max + inactive)
+            Account expires        : Mar 23, 2027     (20900)
+
+        and with a last-change of 0 all three of the first lines read
+        "password must be changed".
+        """
+        setting, i = {}, 0
+        while i < len(a):
+            x = a[i]
+            col = self._CHAGE_OPTS.get(x)
+            if col and i + 1 < len(a):
+                ok, val = self._chage_value(a[i + 1])
+                if not ok:
+                    self.err("chage: invalid date '%s'" % a[i + 1])
+                    return "", 1
+                setting[col] = val
+                i += 2
+                continue
+            i += 1
+        names = [x for x in a if not x.startswith("-")]
+        # The operands are whatever is left once each flag has taken its
+        # value, so `chage -E 2027-01-31 bob` does not treat the date as
+        # the username.
+        consumed = set()
+        for i, x in enumerate(a):
+            if self._CHAGE_OPTS.get(x) and i + 1 < len(a):
+                consumed.add(a[i + 1])
+        names = [x for x in names if x not in consumed]
+        user = names[-1] if names else self.user
+        age = self._shadow_age(user)
+        if age is None:
+            self.err("chage: user '%s' does not exist in /etc/passwd" % user)
+            return "", 1
+        if "-l" in a or "--list" in a:
+            last = age["last"]
+            if not last:
+                # A last-change of 0 means the password must be changed at
+                # the next login, and chage says so instead of printing
+                # Jan 01, 1970 three times.
+                shown = expires = inactive = "password must be changed"
+            else:
+                # A maximum of 10000 or more is shadow's "never", not a
+                # date in 2053. Measured on the guest: 9999 gives Oct 11,
+                # 2053 and 10000 gives never, so the box's own 99999 must
+                # print never and not Dec 31, 2297. The inactive line has
+                # no such ceiling of its own -- it inherits this one, and
+                # an inactive of 0 or less is never on its own.
+                shown = self._age_date(last)
+                capped = age["max"] is None or age["max"] >= 10000
+                expires = ("never" if capped
+                           else self._age_date(last + age["max"]))
+                inactive = ("never"
+                            if capped or age["inactive"] is None
+                            or age["inactive"] < 0
+                            else self._age_date(last + age["max"]
+                                                + age["inactive"]))
+            acct = ("never" if age["expire"] is None
+                    else self._age_date(age["expire"]))
             return ("Last password change\t\t\t\t\t: %s\n"
-                    "Password expires\t\t\t\t\t: never\n"
-                    "Password inactive\t\t\t\t\t: never\n"
-                    "Account expires\t\t\t\t\t\t: never\n"
-                    "Minimum number of days between password change\t\t: 0\n"
-                    "Maximum number of days between password change\t\t: 99999\n"
-                    "Number of days of warning before password expires\t: 7\n"
-                    % time.strftime("%b %d, %Y", time.gmtime(last * 86400)), 0)
+                    "Password expires\t\t\t\t\t: %s\n"
+                    "Password inactive\t\t\t\t\t: %s\n"
+                    "Account expires\t\t\t\t\t\t: %s\n"
+                    "Minimum number of days between password change\t\t: %s\n"
+                    "Maximum number of days between password change\t\t: %s\n"
+                    "Number of days of warning before password expires\t: %s\n"
+                    % (shown, expires, inactive, acct,
+                       0 if age["min"] is None else age["min"],
+                       -1 if age["max"] is None else age["max"],
+                       -1 if age["warn"] is None else age["warn"])), 0
         if self.user != "root":
             self.err("chage: Permission denied.")
             return "", 1
-        self.err("chage: PAM: Authentication token manipulation error")
-        return "", 1
+        if not setting:
+            # Bare `chage <user>` is interactive, and there is no terminal
+            # on the other end of an exec channel.
+            self.err("chage: PAM: Authentication token manipulation error")
+            return "", 1
+        self._shadow_age_set(user, **setting)
+        self.log(event="chage", target=user, argv=" ".join(a)[:200],
+                 fields=",".join(sorted(setting)))
+        return "", 0
 
     def cmd_chsh(self, a, stdin=""):
         self.log(event="chsh", argv=" ".join(a)[:200])

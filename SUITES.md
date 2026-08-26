@@ -8,6 +8,7 @@ Run one:  `python3 -W ignore <suite>.py`
 
 Run all:  `./run-suites.sh`
 
+- `agetest.py` -- Password aging: when does this account expire, and can it be changed?
 - `alttest.py` -- Does the box agree with itself about what `editor` actually runs?
 - `apttest.py` -- If the box can reach the archive, what happens when you install?
 - `archtest.py` -- Does the box agree with itself about what is inside an archive?
