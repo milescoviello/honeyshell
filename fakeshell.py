@@ -12494,6 +12494,14 @@ class Shell:
         # written into the log. The seeding pass that builds syslog runs
         # before any of that exists.
         self._replay_cron_runs()
+        # Warm journald's own store before anyone can truncate rsyslog's
+        # copy of the same events. Doing it lazily meant an attacker who
+        # ran `> /var/log/syslog` and then `journalctl` built the snapshot
+        # from the file they had just emptied.
+        try:
+            self._journal_entries()
+        except Exception:                                     # noqa: BLE001
+            pass
         # (was: resync then publish. Kept the note because the ordering is
         # load-bearing and not obvious.) This call was missing entirely:
         # /proc/net/tcp had no ESTABLISHED row in a real session even though
@@ -25514,7 +25522,41 @@ class Shell:
         "dbus-daemon": "dbus.service",
     }
 
+    def _journal_files_present(self):
+        """True if there is a journal on disk for journalctl to read."""
+        for base in ("/var/log/journal", "/run/log/journal"):
+            for k in self.fs.node_paths():
+                if k.startswith(base + "/"):
+                    n = self.fs.nodes.get(k)
+                    if n is not None and not n.is_dir:
+                        return True
+        return False
+
     def _journal_entries(self):
+        """journald's own store, not a view of rsyslog's text files.
+
+        On a systemd box these are two stores of the same events, and the
+        whole reason anyone checks `journalctl` after `> /var/log/syslog` is
+        that truncating rsyslog's copy does not touch journald's. Here the
+        entries were read out of the text files on every call, so
+
+            > /var/log/syslog        journalctl lost 178 lines
+            rm -rf /var/log/journal/*  journalctl lost nothing
+
+        -- exactly backwards, in both directions at once. The second one got
+        sharper in the sweep before this: once --disk-usage was summed from
+        the files, the box would say the journal took 0B on disk and then
+        print three thousand lines out of it.
+
+        Snapshotted at session start, before the attacker can truncate
+        anything, and thrown away entirely when the files it claims to come
+        from are gone.
+        """
+        if not self._journal_files_present():
+            return []
+        return self._build_journal_entries()
+
+    def _build_journal_entries(self):
         """The journal, built from the logs the box already shows.
 
         It used to be six canned lines cycling on a 37-second step, starting
@@ -25554,9 +25596,32 @@ class Shell:
                   "/var/log/syslog.1", "/var/log/auth.log.1"]
         _paths += ["/var/log/syslog.%d.gz" % n for n in range(2, 8)]
         _paths += ["/var/log/auth.log.%d.gz" % n for n in range(2, 5)]
-        for path in _paths:
+        # Snapshotted as *text*, once per session, before anyone can
+        # truncate rsyslog's copy. Keeping parsed entries instead cost about
+        # 3 MB per source -- 3,163 tuples -- which fsbudgettest caught as a
+        # narrowed margin between an idle source and a writing one, on a
+        # service that runs under MemoryMax=256M. The bodies are ~200 KB.
+        #
+        # The live files are read as well and the two merged: the line dedup
+        # below collapses the overlap, so a truncation loses nothing (the
+        # snapshot still has it) and a new line still arrives (the live file
+        # has it). journald's relationship to rsyslog, stated as a union --
+        # which also gets the same-second case right for free, where a rule
+        # about "newer than the newest entry" did not.
+        snap = getattr(self.fs, "journal_text", None)
+        if snap is None:
+            snap = {}
             try:
-                raw = self.fs.read(path) or b""
+                for _p in _paths:
+                    snap[_p] = self.fs.read(_p) or b""
+            except PermissionDenied:
+                snap = {}
+            self.fs.journal_text = snap
+        for path, frozen in ([(p, False) for p in _paths]
+                             + [(p, True) for p in _paths]):
+            try:
+                raw = snap.get(path, b"") if frozen else (
+                    self.fs.read(path) or b"")
                 if path.endswith(".gz"):
                     try:
                         raw = zlib.decompress(raw, 16 + zlib.MAX_WBITS)
