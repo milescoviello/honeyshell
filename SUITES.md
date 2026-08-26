@@ -26,6 +26,7 @@ Run all:  `./run-suites.sh`
 - `bytetest.py` -- Does the box tell the same story about the same bytes?
 - `captest.py` -- The privilege-escalation recon surface, and whether it agrees with itself.
 - `cgrouptest.py` -- cgroup v2: the tree, and the numbers systemd quotes from it.
+- `clocksettest.py` -- Setting the clock has to move the clock, and only the clock.
 - `colortest.py` -- grep's colour, and the terminal signal that decides it.
 - `concurtest.py` -- Several channels on one connection, all touching one filesystem.
 - `cpuloadtest.py` -- A process that uses CPU has to use it everywhere.

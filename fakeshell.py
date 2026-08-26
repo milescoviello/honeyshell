@@ -7489,7 +7489,7 @@ class VFS:
         if (self._sealed and path not in self.nodes
                 and (path.startswith("/proc/") or path.startswith("/sys/"))):
             return False
-        self.nodes[path] = FileNode(mode=0o777, link=target, mtime=time.time(),
+        self.nodes[path] = FileNode(mode=0o777, link=target, mtime=self.now(),
                                     ino=self._alloc_ino())
         self._record(("l", path, target, self.nodes[path].mtime),
                      len(path) + len(target))
@@ -7930,6 +7930,20 @@ class VFS:
         pid currently alive."""
         rows = getattr(self, "proc_rows", None) or {}
         return (max(rows) + 3) if rows else 1
+
+    def now(self):
+        """The box's wall clock, including any skew `date -s` set.
+
+        Only new timestamps come from here. Existing ones are stored numbers
+        and a real box does not rewrite them when the clock moves, and the
+        monotonic clock -- which uptime and /proc/uptime read -- does not
+        move at all. So after `date -s "last year"`, `date` says last year,
+        a file touched now says last year, a file written before still says
+        today, and uptime is unchanged. That combination is what an operator
+        who has just moved the clock sees, and each part of it on its own
+        would look wrong.
+        """
+        return time.time() + getattr(self, "clock_skew", 0.0)
 
     def proc_cpu_rate(self, pid):
         """What fraction of a core this process is using.
@@ -8768,7 +8782,7 @@ class VFS:
         node = self.nodes.get(path)
         if node is None:
             return False
-        now = time.time()
+        now = self.now()
         when = now if when is None else when
         if set_a:
             node.atime = when
@@ -8894,7 +8908,7 @@ class VFS:
             # it an ordinary file.
             keep.elf = None
             keep.blob = None
-            keep.mtime = time.time() if mtime is None else mtime
+            keep.mtime = self.now() if mtime is None else mtime
             # Writing changes the inode, so ctime moves to now even when the
             # caller pinned an mtime. atime does not: writing is not reading.
             keep.ctime = time.time()
@@ -8905,7 +8919,7 @@ class VFS:
         self.nodes[path] = FileNode(
             data, mode=keep.mode if keep else mode,
             uid=keep.uid if keep else 0, gid=keep.gid if keep else 0,
-            mtime=time.time() if mtime is None else mtime,
+            mtime=self.now() if mtime is None else mtime,
             ino=keep.ino if keep and keep.ino else self._alloc_ino())
         self._record_write(path, data, self.nodes[path])
         if path == "/proc/sys/vm/nr_hugepages":
@@ -9080,7 +9094,7 @@ class VFS:
         # mtime=now: a directory the attacker just made must not inherit the
         # synthetic age used for the pre-existing tree. `mkdir /tmp/.x &&
         # ls -ld /tmp/.x` showing a date months back is an instant tell.
-        now = time.time()
+        now = self.now()
         self.nodes[path] = FileNode(mode=mode, is_dir=True, mtime=now,
                                     ino=self._alloc_ino())
         self._record(("d", path, now, mode), len(path))
@@ -17517,7 +17531,7 @@ class Shell:
         n = len(self._utmp())
         return (" %s up %d days, %2d:%02d,  %d user%s,"
                 "  load average: %.2f, %.2f, %.2f\n"
-                % (time.strftime("%H:%M:%S"), d, h, m, n,
+                % (time.strftime("%H:%M:%S", time.localtime(self.wall())), d, h, m, n,
                    "" if n == 1 else "s", la[0], la[1], la[2]))
 
     def _utmp_sessions(self, path):
@@ -26282,12 +26296,25 @@ class Shell:
         The zone is read out of /etc/localtime, which is where timedatectl
         gets it, rather than restated here.
         """
-        stamp = time.strftime("%a %Y-%m-%d %H:%M:%S UTC", time.localtime())
+        # `set-time` fell through to the status branch, so the command an
+        # attacker runs to move the clock printed the clock instead -- the
+        # same shape as `journalctl --vacuum-time` dumping the journal.
+        # Measured on the guest, which has NTP on exactly as this persona
+        # claims: "Failed to set time: Automatic time synchronization is
+        # enabled", and nothing moves.
+        verb = next((x for x in a if not x.startswith("-")), "")
+        if verb in ("set-time", "set-timezone", "set-local-rtc"):
+            if verb == "set-time":
+                self.err("Failed to set time: Automatic time "
+                         "synchronization is enabled")
+                return "", 1
+        now = self.wall()
+        stamp = time.strftime("%a %Y-%m-%d %H:%M:%S UTC", time.localtime(now))
         rows = [("Local time", stamp),
                 ("Universal time", time.strftime(
-                    "%a %Y-%m-%d %H:%M:%S UTC", time.gmtime())),
+                    "%a %Y-%m-%d %H:%M:%S UTC", time.gmtime(now))),
                 ("RTC time", time.strftime("%a %Y-%m-%d %H:%M:%S",
-                                           time.gmtime())),
+                                           time.gmtime(now))),
                 ("Time zone", "%s (UTC, +0000)" % self._zone_name()),
                 ("System clock synchronized", "yes"),
                 ("NTP service", "active"),
@@ -27936,7 +27963,7 @@ class Shell:
             "MiB Swap:  %7.1f total, %8.1f free, %8.1f used. %8.1f avail Mem\n"
             "\n"
             "    PID USER      PR  NI    VIRT    RES    SHR S  %%CPU  %%MEM     TIME+ COMMAND\n"
-            % (time.strftime("%H:%M:%S"), self._uptime_short(),
+            % (time.strftime("%H:%M:%S", time.localtime(self.wall())), self._uptime_short(),
                la[0], la[1], la[2],
                len(rows), running, len(rows) - running,
                _us, _sy, _id,
@@ -28708,7 +28735,7 @@ class Shell:
         if low in ("curdate()", "current_date()", "current_date"):
             return time.strftime("%Y-%m-%d")
         if low in ("curtime()", "current_time()", "current_time"):
-            return time.strftime("%H:%M:%S")
+            return time.strftime("%H:%M:%S", time.localtime(self.wall()))
         if low in ("database()", "schema()"):
             # The caller's dbname. self._db_name does not exist -- bgtest
             # scans the source for every self.<attr> and told me so, which
@@ -29857,12 +29884,34 @@ class Shell:
                 return None
         return None
 
+    def wall(self):
+        """What the box thinks the time is, including any skew set on it.
+
+        `date -s` printed the *current* time and changed nothing: two
+        consecutive commands, one claiming to have set the clock and the
+        next showing it had not. Setting the clock is what a miner does to
+        defeat a licence check and what an operator does before touching
+        timestamps, so it gets tried.
+
+        Only the wall clock moves. Existing file timestamps keep the value
+        they were written with -- which is what a real box does too, since
+        those are stored numbers and not a view of now -- and the monotonic
+        clock does not move at all, so uptime is unchanged by it.
+        """
+        # rawfs, not fs: the permission wrapper proxies reads but an
+        # attribute set on it is not the one VFS.now() looks at, so the skew
+        # landed on the wrapper and every new file kept the real date while
+        # `date` showed the fake one -- a contradiction introduced by the
+        # fix for a contradiction.
+        return time.time() + getattr(self.rawfs, "clock_skew", 0.0)
+
     def cmd_date(self, a, stdin=""):
         """`date +FORMAT` matters: `date +%s` appears in almost every script,
         and returning the default string where a timestamp belongs breaks the
         arithmetic that follows it."""
         fmt = None
         when = None
+        setspec = None
         i = 0
         while i < len(a):
             x = a[i]
@@ -29873,6 +29922,11 @@ class Shell:
                 i += 1
             elif x.startswith("--date="):
                 when = self._parse_datespec(x.split("=", 1)[1])
+            elif x in ("-s", "--set") and i + 1 < len(a):
+                setspec = a[i + 1]
+                i += 1
+            elif x.startswith("--set="):
+                setspec = x.split("=", 1)[1]
             elif x in ("-r", "--reference") and i + 1 < len(a):
                 node = self.fs.nodes.get(VFS.norm(a[i + 1], self.cwd))
                 when = node.mtime if node else None
@@ -29883,7 +29937,23 @@ class Shell:
         # spellings of one zone, and the guest says UTC to both. TZ is
         # pinned to UTC at import, so localtime is the same instant with
         # the right label on it.
-        base = time.time() if when is None else when
+        if setspec is not None:
+            # Measured on the guest: as a non-root user this is
+            # "date: cannot set date: Operation not permitted" and the
+            # current time is still printed; as root it succeeds and prints
+            # the *new* time. It used to print the old time and set nothing,
+            # whoever ran it.
+            target = self._parse_datespec(setspec)
+            if target is None:
+                self.err("date: invalid date '%s'" % setspec)
+                return "", 1
+            if self.user != "root":
+                self.err("date: cannot set date: Operation not permitted")
+                when = None
+            else:
+                self.rawfs.clock_skew = target - time.time()
+                when = target
+        base = self.wall() if when is None else when
         zone = self._date_zone()
         if fmt is None:
             fmt = "%a %b %e %H:%M:%S %Z %Y"
