@@ -5782,21 +5782,43 @@ class VFS:
         w("/boot/grub/fonts/unicode.pf2", b"FILE\x00\x00\x00\x04PFF2")
         w("/boot/grub/grub.cfg", _grub_cfg())
         w("/boot/grub/grubenv", "# GRUB Environment Block\n" + "#" * 999)
-        # ldd names these; a missing libc.so.6 is not survivable as a story.
+        # The shared libraries. This was thirteen names chosen because ldd
+        # printed three of them; ldd now reads a measured per-binary table,
+        # and every soname it can name has to be here or the box says a
+        # library it links against is missing. SHARED_LIBS is that set.
         libdir = "/usr/lib/x86_64-linux-gnu"
         d(libdir)
-        for lib, size in (("libc.so.6", 1_922_136), ("libm.so.6", 940_560),
-                          ("libdl.so.2", 14_408), ("libpthread.so.0", 21_752),
-                          ("libtinfo.so.6", 216_640), ("libz.so.1", 121_264),
-                          ("libcrypto.so.3", 5_090_264),
-                          ("libssl.so.3", 736_872),
-                          ("libselinux.so.1", 174_064),
-                          ("libpcre2-8.so.0", 620_384),
-                          ("libnsl.so.2", 108_768),
-                          ("libcrypt.so.1", 219_552),
-                          ("ld-linux-x86-64.so.2", 240_936)):
+        for lib, (size, _pkg) in sorted(SHARED_LIBS.items()):
             self.nodes[libdir + "/" + lib] = FileNode(
-                mode=0o755, elf=(libdir + "/" + lib, size), mtime=BOOT_TS - 86400)
+                mode=0o755, elf=(libdir + "/" + lib, size),
+                mtime=BOOT_TS - 86400)
+        # ld.so itself is not in the cache and is not named by soname.
+        self.nodes[libdir + "/ld-linux-x86-64.so.2"] = FileNode(
+            mode=0o755, elf=(libdir + "/ld-linux-x86-64.so.2", 240_936),
+            mtime=BOOT_TS - 86400)
+        for _so, (_p, _sz, _pkg) in sorted(PRIVATE_LIBS.items()):
+            self.nodes[_p] = FileNode(mode=0o644, elf=(_p, _sz),
+                                      mtime=BOOT_TS - 86400)
+        # What the dynamic loader is configured with. /etc/ld.so.preload is
+        # already modelled -- a previous sweep made a command warn when it
+        # is present -- while the three files that decide where libraries
+        # are found at all were missing, on a box whose ldd resolves them
+        # through the cache. Contents measured on the guest.
+        w("/etc/ld.so.conf", "include /etc/ld.so.conf.d/*.conf\n")
+        w("/etc/ld.so.conf.d/libc.conf",
+          "# libc default configuration\n/usr/local/lib\n")
+        w("/etc/ld.so.conf.d/x86_64-linux-gnu.conf",
+          "# Multiarch support\n/usr/local/lib/x86_64-linux-gnu\n"
+          "/lib/x86_64-linux-gnu\n/usr/lib/x86_64-linux-gnu\n")
+        # The cache itself, built at boot the way the postinst builds it.
+        # ldconfig -p reads the directories rather than this file, but
+        # `ls -l /etc/ld.so.cache` is read on its own -- and a box whose
+        # ldd resolves through a cache that does not exist has already
+        # answered the question.
+        w("/etc/ld.so.cache",
+          Shell._ldcache_blob([(so, "/lib/x86_64-linux-gnu/" + so)
+                               for so in sorted(SHARED_LIBS, reverse=True)]),
+          mode=0o644)
         d("/usr/lib64")
         self.nodes["/usr/lib64/ld-linux-x86-64.so.2"] = FileNode(
             mode=0o777, link="/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2")
@@ -11932,6 +11954,503 @@ MANAGER_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
 # now, rendered by lspci and materialised under /sys.
 # (slot, class code, class, vendor string, ids, subsystem, driver, modules,
 #  rev)
+# The shared libraries this box has: soname, size, and the package that
+# ships it. 89 of them -- 85 measured on the guest, 4 in a
+# debian:trixie container for the ones the guest does not install.
+#
+# ldd names these, ldconfig -p lists them, and they exist on disk,
+# because all three read this one table. Before it there were thirteen
+# library files seeded by hand and an ldd that named three of them
+# whatever you asked about.
+SHARED_LIBS = {
+    "libacl.so.1": (38832, "libacl1"),
+    "libapparmor.so.1": (84728, "libapparmor1"),
+    "libapt-pkg.so.7.0": (2580592, "libapt-pkg7.0"),
+    "libapt-private.so.0.0": (781480, "apt"),
+    "libattr.so.1": (26544, "libattr1"),
+    "libaudit.so.1": (153528, "libaudit1"),
+    "libblkid.so.1": (396256, "libblkid1"),
+    "libbpf.so.1": (423952, "libbpf1"),
+    "libbrotlicommon.so.1": (141496, "libbrotli1"),
+    "libbrotlidec.so.1": (51376, "libbrotli1"),
+    "libbsd.so.0": (84904, "libbsd0"),
+    "libbz2.so.1.0": (74688, "libbz2-1.0"),
+    "libc.so.6": (1995216, "libc6"),
+    "libcap-ng.so.0": (30632, "libcap-ng0"),
+    "libcap.so.2": (47288, "libcap2"),
+    "libcom_err.so.2": (18344, "libcom-err2"),
+    "libcrypt.so.1": (206776, "libcrypt1"),
+    "libcrypto.so.3": (6517312, "libssl3t64"),
+    "libcurl.so.4": (983720, "libcurl4t64"),
+    "libdbus-1.so.3": (350360, "libdbus-1-3"),
+    "libe2p.so.2": (45016, "libext2fs2t64"),
+    "libedit.so.2": (220752, "libedit2"),
+    "libelf.so.1": (117352, "libelf1t64"),
+    "libestr.so.0": (14176, "libestr0"),
+    "libexpat.so.1": (186520, "libexpat1"),
+    "libext2fs.so.2": (446800, "libext2fs2t64"),
+    "libfastjson.so.4": (55648, "libfastjson4"),
+    "libffi.so.8": (47576, "libffi8"),
+    "libgcc_s.so.1": (182856, "libgcc-s1"),
+    "libgdbm.so.6": (75800, "libgdbm6t64"),
+    "libgmp.so.10": (566080, "libgmp10"),
+    "libgnutls.so.30": (2246712, "libgnutls30t64"),
+    "libgssapi_krb5.so.2": (346904, "libgssapi-krb5-2"),
+    "libhogweed.so.6": (305144, "libhogweed6t64"),
+    "libidn2.so.0": (202872, "libidn2-0"),
+    "libk5crypto.so.3": (187144, "libk5crypto3"),
+    "libkeyutils.so.1": (22448, "libkeyutils1"),
+    "libkmod.so.2": (108616, "libkmod2"),
+    "libkrb5.so.3": (883984, "libkrb5-3"),
+    "libkrb5support.so.0": (52208, "libkrb5support0"),
+    "liblber.so.2": (63824, "libldap2"),
+    "libldap.so.2": (400912, "libldap2"),
+    "liblz4.so.1": (154096, "liblz4-1"),
+    "liblzma.so.5": (198832, "liblzma5"),
+    "libm.so.6": (977112, "libc6"),
+    "libmagic.so.1": (182504, "libmagic1t64"),
+    "libmd.so.0": (59472, "libmd0"),
+    "libmnl.so.0": (26616, "libmnl0"),
+    "libmount.so.1": (502512, "libmount1"),
+    "libmpfr.so.6": (794992, "libmpfr6"),
+    "libncursesw.so.6": (235520, "libncursesw6"),
+    "libnettle.so.8": (346216, "libnettle8t64"),
+    "libnftnl.so.11": (217312, "libnftnl11"),
+    "libnghttp2.so.14": (199152, "libnghttp2-14"),
+    "libnghttp3.so.9": (173392, "libnghttp3-9"),
+    "libp11-kit.so.0": (1705664, "libp11-kit0"),
+    "libpam.so.0": (67584, "libpam0g"),
+    "libpam_misc.so.0": (14432, "libpam0g"),
+    "libpci.so.3": (84984, "libpci3"),
+    "libpcre2-8.so.0": (711216, "libpcre2-8-0"),
+    "libpipeline.so.1": (71600, "libpipeline1"),
+    "libpopt.so.0": (55784, "libpopt0"),
+    "libproc2.so.0": (207368, "libproc2-0"),
+    "libpsl.so.5": (75616, "libpsl5t64"),
+    "libreadline.so.8": (362728, "libreadline8t64"),
+    "libresolv.so.2": (63936, "libc6"),
+    "librtmp.so.1": (122256, "librtmp1"),
+    "libsasl2.so.2": (109232, "libsasl2-2"),
+    "libseccomp.so.2": (182560, "libseccomp2"),
+    "libselinux.so.1": (202984, "libselinux1"),
+    "libsemanage.so.2": (288768, "libsemanage2"),
+    "libsepol.so.2": (825456, "libsepol2"),
+    "libsigsegv.so.2": (18512, "libsigsegv2"),
+    "libsmartcols.so.1": (313496, "libsmartcols1"),
+    "libssh2.so.1": (297472, "libssh2-1t64"),
+    "libssl.so.3": (1101760, "libssl3t64"),
+    "libstdc++.so.6": (2497768, "libstdc++6"),
+    "libsystemd.so.0": (1131784, "libsystemd0"),
+    "libtasn1.so.6": (88064, "libtasn1-6"),
+    "libtic.so.6": (71768, "libtinfo6"),
+    "libtinfo.so.6": (220464, "libtinfo6"),
+    "libtirpc.so.3": (195024, "libtirpc3t64"),
+    "libudev.so.1": (280936, "libudev1"),
+    "libunistring.so.5": (1996840, "libunistring5"),
+    "libuuid.so.1": (39048, "libuuid1"),
+    "libxtables.so.12": (67504, "libxtables12"),
+    "libxxhash.so.0": (71592, "libxxhash0"),
+    "libz.so.1": (125376, "zlib1g"),
+    "libzstd.so.1": (825336, "libzstd1"),
+}
+
+# Libraries outside the multiarch directories. ldd names these by full
+# path, and ldconfig -p never mentions them -- it lists the cache, and
+# the cache is built from the directories in ld.so.conf.
+PRIVATE_LIBS = {
+    "libman-2.13.1.so":
+        ("/usr/lib/man-db/libman-2.13.1.so",
+         282912, "man-db"),
+    "libmandb-2.13.1.so":
+        ("/usr/lib/man-db/libmandb-2.13.1.so",
+         30712, "man-db"),
+    "libsudo_util.so.0":
+        ("/usr/libexec/sudo/libsudo_util.so.0",
+         137912, "sudo"),
+    "libsystemd-core-257.so":
+        ("/usr/lib/x86_64-linux-gnu/systemd/libsystemd-core-257.so",
+         2455984, "libsystemd-shared"),
+    "libsystemd-shared-257.so":
+        ("/usr/lib/x86_64-linux-gnu/systemd/libsystemd-shared-257.so",
+         4451744, "libsystemd-shared"),
+}
+
+# What each binary links against, grouped by dependency set: 82 sets
+# across 339 binaries, measured by running real ldd on a Debian 13 box
+# that has them. ldd reads this and nothing else, so two binaries with
+# different dependencies can no longer come back with one answer.
+_LIB_DEP_SETS = (
+    (("libc.so.6",),
+     "arch arp b2sum base32 base64 basename basenc bzip2recover cat "
+     "chgrp chmod chown chroot chrt cmp comm crontab csplit cut dash "
+     "date dd df diff diff3 dircolors dirname dmidecode dnsdomainname "
+     "domainname du echo env expand fallocate false flock fmt fold "
+     "fstab-decode fuser getconf getent getopt groups gzip head hostid "
+     "hostname iconv ifconfig ionice ipcs ipmaddr iptunnel ischroot join "
+     "kill killall killall5 lessecho lesskey link ln locale localedef "
+     "logname mktemp nameif nice nisdomainname nl nohup nologin nproc "
+     "numfmt od paste pathchk peekfd pidof pldd plipconfig pr printenv "
+     "printf prtstat pslog ptx pwd pwdx rarp readlink realpath renice "
+     "rev rm rmdir route run-parts scp script sdiff seq setsid sh shred "
+     "shuf slattach sleep sort split stdbuf stty sum sync sysctl tac "
+     "tail taskset tee tempfile test timeout touch tr true truncate "
+     "tsort tty uname unexpand uniq unlink unshare update-alternatives "
+     "wc whereis whoami xargs yes ypdomainname "
+     ),
+    (("libc.so.6", "libcrypto.so.3", "libz.so.1", "libzstd.so.1",),
+     "cksum depmod insmod lsmod md5sum modinfo modprobe rmmod sha1sum "
+     "sha224sum sha256sum sha384sum sha512sum ssh-agent "
+     ),
+    (("libc.so.6", "libtinfo.so.6",),
+     "bash clear dmesg hexdump less more pager pstree pstree.x11 reset "
+     "tput tset ul "
+     ),
+    (("libacl.so.1", "libaudit.so.1", "libblkid.so.1", "libc.so.6",
+      "libcap-ng.so.0", "libcap.so.2", "libcrypt.so.1", "libcrypto.so.3",
+      "libm.so.6", "libmount.so.1", "libpam.so.0", "libpcre2-8.so.0",
+      "libseccomp.so.2", "libselinux.so.1", "libsystemd-shared-257.so",
+      "libz.so.1", "libzstd.so.1",),
+     "busctl hostnamectl journalctl loginctl networkctl systemctl "
+     "systemd-cgls systemd-cgtop systemd-detect-virt systemd-run "
+     "timedatectl "
+     ),
+    (("libc.so.6", "libcap.so.2", "libm.so.6", "libproc2.so.0",
+      "libsystemd.so.0",),
+     "free pgrep pkill pmap ps skill tload uptime vmstat w "
+     ),
+    (("libc.so.6", "libpcre2-8.so.0", "libselinux.so.1",),
+     "chcon id mkdir mkfifo mknod namei netstat nsenter runcon stat "
+     ),
+    (("libc.so.6", "libmnl.so.0", "libnftnl.so.11", "libxtables.so.12",),
+     "ip6tables ip6tables-restore ip6tables-save iptables iptables- "
+     "restore iptables-save xtables-nft-multi "
+     ),
+    (("libc.so.6", "liblzma.so.5",),
+     "lzcat lzma unlzma unxz xz xzcat "
+     ),
+    (("libapt-pkg.so.7.0", "libapt-private.so.0.0", "libbz2.so.1.0",
+      "libc.so.6", "libcap.so.2", "libcrypto.so.3", "libgcc_s.so.1",
+      "liblz4.so.1", "liblzma.so.5", "libm.so.6", "libstdc++.so.6",
+      "libsystemd.so.0", "libudev.so.1", "libxxhash.so.0", "libz.so.1",
+      "libzstd.so.1",),
+     "apt apt-cache apt-config apt-get apt-mark "
+     ),
+    (("libc.so.6", "libcap.so.2", "libm.so.6", "libsystemd.so.0",),
+     "agetty logger users wall who "
+     ),
+    (("libblkid.so.1", "libc.so.6", "libmount.so.1", "libpcre2-8.so.0",
+      "libselinux.so.1",),
+     "mount mountpoint swapoff umount "
+     ),
+    (("libc.so.6", "libcap.so.2",),
+     "capsh getcap getpcaps setcap "
+     ),
+    (("libc.so.6", "libcrypto.so.3", "libpcre2-8.so.0", "libselinux.so.1",
+      "libz.so.1", "libzstd.so.1",),
+     "ssh-add ssh-keygen ssh-keyscan sshd "
+     ),
+    (("libacl.so.1", "libattr.so.1", "libc.so.6", "libpcre2-8.so.0",
+      "libselinux.so.1",),
+     "cp install mv "
+     ),
+    (("libaudit.so.1", "libbsd.so.0", "libc.so.6", "libcap-ng.so.0",
+      "libmd.so.0", "libpcre2-8.so.0", "libselinux.so.1",),
+     "chage groupadd groupdel "
+     ),
+    (("libblkid.so.1", "libc.so.6", "libcom_err.so.2", "libe2p.so.2",
+      "libext2fs.so.2", "libuuid.so.1",),
+     "e2fsck mke2fs tune2fs "
+     ),
+    (("libbz2.so.1.0", "libc.so.6",),
+     "bunzip2 bzcat bzip2 "
+     ),
+    (("libc.so.6", "libcap.so.2", "libpcre2-8.so.0", "libselinux.so.1",),
+     "dir ls vdir "
+     ),
+    (("libc.so.6", "libgdbm.so.6", "libman-2.13.1.so", "libmandb-2.13.1.so",
+      "libpipeline.so.1", "libseccomp.so.2",),
+     "apropos catman whatis "
+     ),
+    (("libc.so.6", "libmd.so.0",),
+     "dpkg-divert dpkg-query dpkg-split "
+     ),
+    (("libc.so.6", "libncursesw.so.6", "libtinfo.so.6",),
+     "editor nano watch "
+     ),
+    (("libc.so.6", "libsmartcols.so.1",),
+     "lscpu lsmem prlimit "
+     ),
+    (("libacl.so.1", "libattr.so.1", "libaudit.so.1", "libbsd.so.0",
+      "libbz2.so.1.0", "libc.so.6", "libcap-ng.so.0", "libmd.so.0",
+      "libpcre2-8.so.0", "libselinux.so.1", "libsemanage.so.2",
+      "libsepol.so.2",),
+     "useradd usermod "
+     ),
+    (("libacl.so.1", "libc.so.6", "libpcre2-8.so.0", "libselinux.so.1",),
+     "sed tar "
+     ),
+    (("libapparmor.so.1", "libaudit.so.1", "libc.so.6", "libcap-ng.so.0",
+      "libcrypto.so.3", "libpcre2-8.so.0", "libselinux.so.1",
+      "libsudo_util.so.0", "libz.so.1", "libzstd.so.1",),
+     "sudo sudoedit "
+     ),
+    (("libaudit.so.1", "libbsd.so.0", "libc.so.6", "libcap-ng.so.0",
+      "libmd.so.0", "libpam.so.0", "libpam_misc.so.0", "libpcre2-8.so.0",
+      "libselinux.so.1",),
+     "chfn chsh "
+     ),
+    (("libaudit.so.1", "libc.so.6", "libcap-ng.so.0", "libcrypt.so.1",
+      "libpcre2-8.so.0", "libselinux.so.1",),
+     "unix_chkpwd unix_update "
+     ),
+    (("libaudit.so.1", "libc.so.6", "libcap-ng.so.0", "libpam.so.0",),
+     "faillock mkhomedir_helper "
+     ),
+    (("libaudit.so.1", "libc.so.6", "libcap-ng.so.0", "libpam.so.0",
+      "libpam_misc.so.0",),
+     "login su "
+     ),
+    (("libblkid.so.1", "libc.so.6", "libmount.so.1", "libpcre2-8.so.0",
+      "libselinux.so.1", "libsmartcols.so.1",),
+     "lsns swapon "
+     ),
+    (("libc.so.6", "libcom_err.so.2", "libe2p.so.2",),
+     "chattr lsattr "
+     ),
+    (("libc.so.6", "libcrypt.so.1",),
+     "newgrp sg "
+     ),
+    (("libc.so.6", "libcrypto.so.3", "libsudo_util.so.0", "libz.so.1",
+      "libzstd.so.1",),
+     "sudoreplay visudo "
+     ),
+    (("libc.so.6", "libexpat.so.1", "libm.so.6", "libz.so.1",),
+     "python3 python3.13 "
+     ),
+    (("libc.so.6", "libgdbm.so.6", "libman-2.13.1.so", "libmandb-2.13.1.so",
+      "libpipeline.so.1", "libseccomp.so.2", "libz.so.1",),
+     "man mandb "
+     ),
+    (("libc.so.6", "libgmp.so.10",),
+     "expr factor "
+     ),
+    (("libc.so.6", "libgmp.so.10", "libm.so.6", "libmpfr.so.6",
+      "libreadline.so.8", "libsigsegv.so.2", "libtinfo.so.6",),
+     "awk nawk "
+     ),
+    (("libc.so.6", "libman-2.13.1.so", "libpipeline.so.1",
+      "libseccomp.so.2", "libz.so.1",),
+     "lexgrog man-recode "
+     ),
+    (("libc.so.6", "libmd.so.0", "libpcre2-8.so.0", "libselinux.so.1",),
+     "dpkg dpkg-statoverride "
+     ),
+    (("libacl.so.1", "libaudit.so.1", "libblkid.so.1", "libc.so.6",
+      "libcap-ng.so.0", "libcap.so.2", "libcrypt.so.1", "libcrypto.so.3",
+      "libm.so.6", "libmount.so.1", "libpam.so.0", "libpcre2-8.so.0",
+      "libseccomp.so.2", "libselinux.so.1", "libsystemd-core-257.so",
+      "libsystemd-shared-257.so", "libz.so.1", "libzstd.so.1",),
+     "systemd-analyze "
+     ),
+    (("libacl.so.1", "libc.so.6", "libpcre2-8.so.0", "libpopt.so.0",
+      "libselinux.so.1",),
+     "logrotate "
+     ),
+    (("libapparmor.so.1", "libaudit.so.1", "libc.so.6", "libcap-ng.so.0",
+      "libcap.so.2", "libdbus-1.so.3", "libexpat.so.1", "libm.so.6",
+      "libpcre2-8.so.0", "libselinux.so.1", "libsystemd.so.0",),
+     "dbus-daemon "
+     ),
+    (("libaudit.so.1", "libbsd.so.0", "libbz2.so.1.0", "libc.so.6",
+      "libcap-ng.so.0", "libmd.so.0", "libpcre2-8.so.0", "libselinux.so.1",
+      "libsemanage.so.2", "libsepol.so.2",),
+     "userdel "
+     ),
+    (("libaudit.so.1", "libbsd.so.0", "libc.so.6", "libcap-ng.so.0",
+      "libcrypt.so.1", "libmd.so.0", "libpam.so.0", "libpam_misc.so.0",
+      "libpcre2-8.so.0", "libselinux.so.1",),
+     "passwd "
+     ),
+    (("libaudit.so.1", "libbsd.so.0", "libc.so.6", "libcap-ng.so.0",
+      "libcrypt.so.1", "libmd.so.0", "libpam.so.0", "libpcre2-8.so.0",
+      "libselinux.so.1",),
+     "chpasswd "
+     ),
+    (("libaudit.so.1", "libbsd.so.0", "libc.so.6", "libcap-ng.so.0",
+      "libcrypt.so.1", "libmd.so.0", "libpcre2-8.so.0", "libselinux.so.1",),
+     "gpasswd "
+     ),
+    (("libaudit.so.1", "libc.so.6", "libcap-ng.so.0", "libpam.so.0",
+      "libpcre2-8.so.0", "libselinux.so.1",),
+     "cron "
+     ),
+    (("libblkid.so.1", "libc.so.6",),
+     "blkid "
+     ),
+    (("libblkid.so.1", "libc.so.6", "libcap.so.2", "libmount.so.1",
+      "libpcre2-8.so.0", "libselinux.so.1", "libsmartcols.so.1",
+      "libtinfo.so.6", "libudev.so.1",),
+     "lsblk "
+     ),
+    (("libblkid.so.1", "libc.so.6", "libcap.so.2", "libmount.so.1",
+      "libpcre2-8.so.0", "libselinux.so.1", "libsmartcols.so.1",
+      "libudev.so.1",),
+     "findmnt "
+     ),
+    (("libblkid.so.1", "libc.so.6", "libcom_err.so.2", "libe2p.so.2",
+      "libext2fs.so.2",),
+     "dumpe2fs "
+     ),
+    (("libblkid.so.1", "libc.so.6", "libpcre2-8.so.0", "libselinux.so.1",
+      "libuuid.so.1",),
+     "mkswap "
+     ),
+    (("libblkid.so.1", "libc.so.6", "libsmartcols.so.1",),
+     "wipefs "
+     ),
+    (("libblkid.so.1", "libc.so.6", "libuuid.so.1",),
+     "swaplabel "
+     ),
+    (("libbpf.so.1", "libc.so.6", "libcap.so.2", "libcom_err.so.2",
+      "libelf.so.1", "libgssapi_krb5.so.2", "libk5crypto.so.3",
+      "libkeyutils.so.1", "libkrb5.so.3", "libkrb5support.so.0",
+      "libmnl.so.0", "libpcre2-8.so.0", "libresolv.so.2", "libselinux.so.1",
+      "libtirpc.so.3", "libz.so.1", "libzstd.so.1",),
+     "ss "
+     ),
+    (("libbpf.so.1", "libc.so.6", "libcap.so.2", "libelf.so.1", "libm.so.6",
+      "libmnl.so.0", "libxtables.so.12", "libz.so.1", "libzstd.so.1",),
+     "tc "
+     ),
+    (("libbpf.so.1", "libc.so.6", "libcap.so.2", "libelf.so.1",
+      "libmnl.so.0", "libpcre2-8.so.0", "libselinux.so.1", "libz.so.1",
+      "libzstd.so.1",),
+     "ip "
+     ),
+    (("libbrotlicommon.so.1", "libbrotlidec.so.1", "libc.so.6",
+      "libcom_err.so.2", "libcrypto.so.3", "libcurl.so.4", "libffi.so.8",
+      "libgmp.so.10", "libgnutls.so.30", "libgssapi_krb5.so.2",
+      "libhogweed.so.6", "libidn2.so.0", "libk5crypto.so.3",
+      "libkeyutils.so.1", "libkrb5.so.3", "libkrb5support.so.0",
+      "liblber.so.2", "libldap.so.2", "libnettle.so.8", "libnghttp2.so.14",
+      "libnghttp3.so.9", "libp11-kit.so.0", "libpsl.so.5", "libresolv.so.2",
+      "librtmp.so.1", "libsasl2.so.2", "libssh2.so.1", "libssl.so.3",
+      "libtasn1.so.6", "libunistring.so.5", "libz.so.1", "libzstd.so.1",),
+     "curl "
+     ),
+    (("libbsd.so.0", "libc.so.6", "libedit.so.2", "libmd.so.0",
+      "libtinfo.so.6",),
+     "sftp "
+     ),
+    (("libbsd.so.0", "libc.so.6", "libmd.so.0",),
+     "expiry "
+     ),
+    (("libbz2.so.1.0", "libc.so.6", "liblzma.so.5", "libmagic.so.1",
+      "libz.so.1",),
+     "file "
+     ),
+    (("libbz2.so.1.0", "libc.so.6", "liblzma.so.5", "libmd.so.0",
+      "libz.so.1", "libzstd.so.1",),
+     "dpkg-deb "
+     ),
+    (("libc.so.6", "libcap.so.2", "libcrypto.so.3", "libkmod.so.2",
+      "libpci.so.3", "libudev.so.1", "libz.so.1", "libzstd.so.1",),
+     "lspci "
+     ),
+    (("libc.so.6", "libcap.so.2", "libestr.so.0", "libfastjson.so.4",
+      "libm.so.6", "libsystemd.so.0", "libuuid.so.1", "libz.so.1",),
+     "rsyslogd "
+     ),
+    (("libc.so.6", "libcap.so.2", "libm.so.6", "libmnl.so.0",),
+     "nstat "
+     ),
+    (("libc.so.6", "libcap.so.2", "libm.so.6", "libncursesw.so.6",
+      "libproc2.so.0", "libsystemd.so.0", "libtinfo.so.6",),
+     "slabtop "
+     ),
+    (("libc.so.6", "libcap.so.2", "libm.so.6", "libproc2.so.0",
+      "libsystemd.so.0", "libtinfo.so.6",),
+     "top "
+     ),
+    (("libc.so.6", "libcap.so.2", "libmnl.so.0",),
+     "bridge "
+     ),
+    (("libc.so.6", "libcap.so.2", "libpci.so.3", "libudev.so.1",
+      "libz.so.1",),
+     "setpci "
+     ),
+    (("libc.so.6", "libcom_err.so.2", "libcrypto.so.3",
+      "libgssapi_krb5.so.2", "libk5crypto.so.3", "libkeyutils.so.1",
+      "libkrb5.so.3", "libkrb5support.so.0", "libpcre2-8.so.0",
+      "libresolv.so.2", "libselinux.so.1", "libz.so.1", "libzstd.so.1",),
+     "ssh "
+     ),
+    (("libc.so.6", "libcom_err.so.2", "libe2p.so.2", "libext2fs.so.2",),
+     "resize2fs "
+     ),
+    (("libc.so.6", "libcom_err.so.2", "libext2fs.so.2",),
+     "badblocks "
+     ),
+    (("libc.so.6", "libcrypt.so.1", "libcrypto.so.3", "libpcre2-8.so.0",
+      "libssl.so.3", "libz.so.1", "libzstd.so.1",),
+     "nginx "
+     ),
+    (("libc.so.6", "libcrypt.so.1", "libm.so.6",),
+     "perl "
+     ),
+    (("libc.so.6", "libcrypto.so.3", "libssl.so.3", "libz.so.1",
+      "libzstd.so.1",),
+     "openssl "
+     ),
+    (("libc.so.6", "libffi.so.8", "libgmp.so.10", "libgnutls.so.30",
+      "libhogweed.so.6", "libidn2.so.0", "libnettle.so.8",
+      "libp11-kit.so.0", "libpcre2-8.so.0", "libpsl.so.5", "libtasn1.so.6",
+      "libunistring.so.5", "libuuid.so.1", "libz.so.1",),
+     "wget "
+     ),
+    (("libc.so.6", "libm.so.6",),
+     "mawk "
+     ),
+    (("libc.so.6", "libm.so.6", "libpcre2-8.so.0", "libselinux.so.1",),
+     "find "
+     ),
+    (("libc.so.6", "libman-2.13.1.so", "libseccomp.so.2",),
+     "manpath "
+     ),
+    (("libc.so.6", "libpcre2-8.so.0",),
+     "grep "
+     ),
+    (("libc.so.6", "libtic.so.6", "libtinfo.so.6",),
+     "infocmp "
+     ),
+    (("libc.so.6", "libuuid.so.1",),
+     "uuidgen "
+     ),
+)
+
+
+def lib_deps(name):
+    """The sonames a binary links against, or () if we have no record.
+
+    Keyed on basename: /bin/ls and /usr/bin/ls are the same binary on a
+    merged-/usr box, and an attacker who copies one somewhere else is
+    still running it.
+    """
+    for sonames, binaries in _LIB_DEP_SETS:
+        if name in binaries.split():
+            return sonames
+    return ()
+
+
+def lib_path(soname):
+    """Where a soname lives, or None if this box does not have it."""
+    if soname in PRIVATE_LIBS:
+        return PRIVATE_LIBS[soname][0]
+    if soname in SHARED_LIBS:
+        return "/lib/x86_64-linux-gnu/" + soname
+    return None
+
+
 PCI_DEVICES = (
     ("00:00.0", "0600", "Host bridge",
      "Intel Corporation 440FX - 82441FX PMC [Natoma]", "8086:1237",
@@ -15676,6 +16195,85 @@ class Shell:
     PACKAGES = _BOOT_PACKAGES + (
         ("adduser", "3.152", "all"), ("apt", "3.0.3", "amd64"),
         ("rsyslog", "8.2506.0-1", "amd64"),
+        # The library packages. dpkg -S names the package that ships
+        # each shared object; without these it named 77 packages that
+        # dpkg -l said were not installed, and dpkg -L on any of them
+        # answered "package is not installed" for a file on disk that
+        # ldd had just resolved. Versions measured on the guest, except
+        # four it does not install, taken from a debian:trixie
+        # container.
+        ("libacl1", "2.3.2-2+b1", "amd64"),
+        ("libapparmor1", "4.1.0-1", "amd64"),
+        ("libapt-pkg7.0", "3.0.3", "amd64"),
+        ("libattr1", "1:2.5.2-3", "amd64"),
+        ("libaudit1", "1:4.0.2-2+b2", "amd64"),
+        ("libblkid1", "2.41.5-0+deb13u1", "amd64"),
+        ("libbpf1", "1:1.5.0-3", "amd64"),
+        ("libbrotli1", "1.1.0-2+b7", "amd64"),
+        ("libbsd0", "0.12.2-2", "amd64"), ("libbz2-1.0", "1.0.8-6", "amd64"),
+        ("libcap-ng0", "0.8.5-4+b1", "amd64"),
+        ("libcap2", "1:2.75-10+deb13u1+b1", "amd64"),
+        ("libcom-err2", "1.47.2-3+b11", "amd64"),
+        ("libcrypt1", "1:4.4.38-1", "amd64"),
+        ("libcurl4t64", "8.14.1-2+deb13u4", "amd64"),
+        ("libdbus-1-3", "1.16.2-2", "amd64"),
+        ("libedit2", "3.1-20250104-1", "amd64"),
+        ("libelf1t64", "0.192-4", "amd64"), ("libestr0", "0.1.11-2", "amd64"),
+        ("libexpat1", "2.8.3-1~deb13u1", "amd64"),
+        ("libext2fs2t64", "1.47.2-3+b11", "amd64"),
+        ("libfastjson4", "1.2304.0-2", "amd64"),
+        ("libffi8", "3.4.8-2", "amd64"), ("libgcc-s1", "14.2.0-19", "amd64"),
+        ("libgdbm6t64", "1.24-2", "amd64"),
+        ("libgmp10", "2:6.3.0+dfsg-3", "amd64"),
+        ("libgnutls30t64", "3.8.9-3+deb13u4", "amd64"),
+        ("libgssapi-krb5-2", "1.21.3-5+deb13u1", "amd64"),
+        ("libhogweed6t64", "3.10.1-1", "amd64"),
+        ("libidn2-0", "2.3.8-2", "amd64"),
+        ("libk5crypto3", "1.21.3-5+deb13u1", "amd64"),
+        ("libkeyutils1", "1.6.3-6", "amd64"), ("libkmod2", "34.2-2", "amd64"),
+        ("libkrb5-3", "1.21.3-5+deb13u1", "amd64"),
+        ("libkrb5support0", "1.21.3-5+deb13u1", "amd64"),
+        ("libldap2", "2.6.10+dfsg-1", "amd64"),
+        ("liblz4-1", "1.10.0-4", "amd64"),
+        ("liblzma5", "5.8.1-1+deb13u1", "amd64"),
+        ("libmagic1t64", "1:5.46-5", "amd64"),
+        ("libmd0", "1.1.0-2+b1", "amd64"), ("libmnl0", "1.0.5-3", "amd64"),
+        ("libmount1", "2.41.5-0+deb13u1", "amd64"),
+        ("libmpfr6", "4.2.2-1", "amd64"),
+        ("libncursesw6", "6.5+20250216-2", "amd64"),
+        ("libnettle8t64", "3.10.1-1", "amd64"),
+        ("libnftnl11", "1.2.9-1", "amd64"),
+        ("libnghttp2-14", "1.64.0-1.1+deb13u1", "amd64"),
+        ("libnghttp3-9", "1.8.0-1", "amd64"),
+        ("libp11-kit0", "0.25.5-3", "amd64"),
+        ("libpci3", "1:3.13.0-2", "amd64"),
+        ("libpcre2-8-0", "10.46-1~deb13u1", "amd64"),
+        ("libpipeline1", "1.5.8-1", "amd64"),
+        ("libpopt0", "1.19+dfsg-2", "amd64"),
+        ("libproc2-0", "2:4.0.4-9", "amd64"),
+        ("libpsl5t64", "0.21.2-1.1+b1", "amd64"),
+        ("libreadline8t64", "8.2-6", "amd64"),
+        ("librtmp1", "2.4+20151223.gitfa8646d.1-2+b5", "amd64"),
+        ("libsasl2-2", "2.1.28+dfsg1-9", "amd64"),
+        ("libseccomp2", "2.6.0-2", "amd64"),
+        ("libselinux1", "3.8.1-1", "amd64"),
+        ("libsemanage2", "3.8.1-1", "amd64"),
+        ("libsepol2", "3.8.1-1", "amd64"),
+        ("libsigsegv2", "2.14-1+b2", "amd64"),
+        ("libsmartcols1", "2.41.5-0+deb13u1", "amd64"),
+        ("libssh2-1t64", "1.11.1-1+deb13u1", "amd64"),
+        ("libstdc++6", "14.2.0-19", "amd64"),
+        ("libsystemd-shared", "257.13-1~deb13u1", "amd64"),
+        ("libsystemd0", "257.13-1~deb13u1", "amd64"),
+        ("libtasn1-6", "4.20.0-2+deb13u1", "amd64"),
+        ("libtinfo6", "6.5+20250216-2", "amd64"),
+        ("libtirpc3t64", "1.3.6+ds-1", "amd64"),
+        ("libudev1", "257.13-1~deb13u1", "amd64"),
+        ("libunistring5", "1.3-2", "amd64"),
+        ("libuuid1", "2.41.5-0+deb13u1", "amd64"),
+        ("libxtables12", "1.8.11-2", "amd64"),
+        ("libxxhash0", "0.8.3-2", "amd64"),
+        ("libzstd1", "1.5.7+dfsg-1", "amd64"),
         ("base-files", "13.8+deb13u6", "amd64"), ("base-passwd", "3.6.7", "amd64"),
         ("bash", "5.2.37-2+b9", "amd64"), ("bsdutils", "1:2.41-5", "amd64"),
         ("ca-certificates", "20250419", "all"),
@@ -15852,6 +16450,19 @@ class Shell:
         ("/etc/security/" + n, "libpam-modules") for n in PAM_SECURITY)
     _PKG_PATHS["/etc/security/namespace.init"] = "libpam-modules"
     _PKG_PATHS.update((pth, "cron") for pth in CRON_FILES)
+    # Every shared library on the box belongs to a package. They sat on
+    # disk with `dpkg -S` finding no owner, on a box where ldd names them
+    # by path and ldconfig -p lists them -- so the file existed, two
+    # commands pointed at it, and the package database had never heard of
+    # it. Only the /usr spelling is recorded, because that is what dpkg's
+    # own file list holds: `dpkg -S /lib/x86_64-linux-gnu/libc.so.6` on a
+    # real trixie answers "no path found" and the /usr path answers libc6,
+    # which the merged-/usr rule above already reproduces.
+    _PKG_PATHS.update(
+        ("/usr/lib/x86_64-linux-gnu/" + _so, _pkg)
+        for _so, (_sz, _pkg) in SHARED_LIBS.items() if _pkg)
+    _PKG_PATHS.update((_p, _pkg)
+                      for _so, (_p, _sz, _pkg) in PRIVATE_LIBS.items())
 
     _PKG_FILES = {
         "coreutils": ("cat", "chgrp", "chmod", "chown", "cp", "cut", "date",
@@ -16126,6 +16737,23 @@ class Shell:
         if b not in self._BIN_AND_SBIN:
             return hits[:1]
         return hits
+
+    @staticmethod
+    def _dpkg_qual(pkg, path):
+        """`dpkg -S` prints the architecture for Multi-Arch: same packages.
+
+        Measured on the guest: zlib1g:amd64, libselinux1:amd64,
+        libsystemd-shared:amd64 -- and plain coreutils, netbase, sudo,
+        man-db. The rule is not a list: a package is Multi-Arch: same
+        here exactly when it ships into the multiarch library directory,
+        which is the reason it can be co-installed in the first place.
+        sudo's libsudo_util lives in /usr/libexec/sudo and man-db's in
+        /usr/lib/man-db, and both of those packages are Multi-Arch:
+        foreign.
+        """
+        if path.startswith("/usr/lib/x86_64-linux-gnu/"):
+            return pkg + ":amd64"
+        return pkg
 
     def _owner_of(self, binary):
         added, _removed = self._apt_state()
@@ -26952,19 +27580,215 @@ class Shell:
         return self.cmd_cat(list(a), stdin)
 
     def cmd_ldd(self, a, stdin=""):
+        """What a binary links against -- read off the binary.
+
+        Every path got the same three lines. `ldd /usr/bin/ssh` and `ldd
+        /bin/true` were identical on a box where `file` calls them
+        different ELFs, and a loader deciding between a glibc build and a
+        musl one by counting what curl links learned nothing. Worse, it
+        answered for things that are not executables at all: `ldd
+        /etc/passwd` returned the library list for a text file, where the
+        real one says "not a dynamic executable" -- one command, and it
+        is not subtle.
+
+        Measured on the guest and in a debian:trixie container:
+
+            ldd /etc/passwd     \tnot a dynamic executable   rc 1, stderr
+            ldd /usr/bin/which  same -- it is a shell script
+            ldd /tmp            ldd: /tmp: not regular file  rc 1
+            ldd /nonexistent    ldd: ...: No such file...    rc 1
+            ldd /bin/true       three lines, rc 0
+
+        The addresses move between runs on a real box, because the whole
+        point of asking the loader is that it maps things somewhere. Two
+        identical runs of ldd was its own answer.
+        """
         files = [x for x in a if not x.startswith("-")]
         if not files:
             self.err("ldd: missing file arguments")
             return "", 1
-        out = []
+        out, rc = [], 0
+        multi = len(files) > 1
+
+        def addr():
+            # 16 hex digits, in the 0x00007f.. range the loader maps into,
+            # page-aligned. Different every run, as they are on a real box.
+            return "0x%016x" % (0x00007f0000000000
+                                | (random.getrandbits(28) << 12))
         for f in files:
-            if not self.fs.exists(VFS.norm(f, self.cwd)):
+            path = VFS.norm(f, self.cwd)
+            node = (self.fs.nodes.get(path)
+                    or self.fs.nodes.get(self.fs.resolve(path)))
+            if node is None:
                 self.err("ldd: %s: No such file or directory" % f)
-                return "", 1
-            out.append("\tlinux-vdso.so.1 (0x00007ffd8b5f9000)\n"
-                       "\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f9c2a000000)\n"
-                       "\t/lib64/ld-linux-x86-64.so.2 (0x00007f9c2a2d1000)\n")
-        return "".join(out), 0
+                rc = 1
+                continue
+            if multi:
+                out.append("%s:\n" % f)
+            if node.is_dir:
+                self.err("ldd: %s: not regular file" % f)
+                rc = 1
+                continue
+            # The same ELF test the rest of the box uses, so a file `file`
+            # calls a script cannot be a dynamic executable here.
+            body = b"" if node.elf else (node.content or b"")
+            if not node.elf and body[:4] != b"\x7fELF":
+                self.err("\tnot a dynamic executable")
+                rc = 1
+                continue
+            sonames = lib_deps(path.rsplit("/", 1)[-1])
+            if not sonames:
+                sonames = ("libc.so.6",)
+            out.append("\tlinux-vdso.so.1 (%s)\n" % addr())
+            for so in sonames:
+                lp = lib_path(so)
+                if lp is None:
+                    # Named by the binary and not on the box. That is what
+                    # a real ldd prints, and it is what an attacker sees
+                    # after deleting a library out from under something.
+                    out.append("\t%s => not found\n" % so)
+                else:
+                    out.append("\t%s => %s (%s)\n" % (so, lp, addr()))
+            out.append("\t/lib64/ld-linux-x86-64.so.2 (%s)\n" % addr())
+        return "".join(out), rc
+
+    def cmd_ldconfig(self, a, stdin=""):
+        """The shared-library cache: print it, or rebuild it.
+
+        ldconfig was on the stock list, so every invocation -- including
+        `ldconfig -p`, which is how you ask what libraries a box has --
+        printed its version banner and a usage line. Only `--version`
+        prints a banner. `ldconfig -p | grep libc` is in enough loader
+        scripts that answering it with a usage error is a reply in itself.
+
+        Measured on the guest:
+
+            ldconfig -p       "174 libs found in cache `/etc/ld.so.cache'"
+                              then one tab-indented line per soname
+            ldconfig          as non-root: Can't create temporary cache
+                              file /etc/ld.so.cache~: Permission denied
+            ldconfig --version ldconfig (Debian GLIBC 2.41-12+deb13u3) 2.41
+        """
+        if any(x in ("--version", "-V") for x in a):
+            # "ldconfig (Debian GLIBC 2.41-12+deb13u3) 2.41" -- the long
+            # form is the libc6 package version and the short one is the
+            # upstream release inside it. Both come out of the package
+            # table, so `ldconfig --version` cannot name a glibc that
+            # `dpkg -l libc6` does not have.
+            deb = next((v for n, v, _a in self.PACKAGES if n == "libc6"),
+                       "0")
+            return ("ldconfig (Debian GLIBC %s) %s\n"
+                    "Copyright (C) 2024 Free Software Foundation, Inc.\n"
+                    "This is free software; see the source for copying "
+                    "conditions.  There is NO\nwarranty; not even for "
+                    "MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n"
+                    "Written by Andreas Jaeger.\n"
+                    % (deb, deb.split("-")[0])), 0
+        if any(x in ("--help", "-h", "-?") for x in a):
+            return ("Usage: ldconfig [OPTION...]\n"
+                    "Configure Dynamic Linker Run Time Bindings.\n"), 0
+        if any(x in ("-p", "--print-cache") for x in a):
+            rows = self._ldcache()
+            out = ["%d libs found in cache `/etc/ld.so.cache'\n" % len(rows)]
+            # Reverse-sorted by soname, which is the order the cache is
+            # written in and therefore the order -p prints.
+            for so, path in rows:
+                out.append("\t%s (libc6,x86-64) => %s\n" % (so, path))
+            return "".join(out), 0
+        # Bare ldconfig, or -v, rebuilds the cache. That is a write to
+        # /etc/ld.so.cache, and a non-root caller cannot do it -- the
+        # error names the temporary file, not the cache.
+        if self.uid != 0:
+            self.err("/usr/sbin/ldconfig: Can't create temporary cache file "
+                     "/etc/ld.so.cache~: Permission denied")
+            return "", 1
+        rows = self._ldcache()
+        self.fs.write("/etc/ld.so.cache", self._ldcache_blob(rows),
+                      mode=0o644)
+        if any(x in ("-v", "--verbose") for x in a):
+            out = []
+            for d in self._ldconf_dirs():
+                out.append("%s:\n" % d)
+                for so, path in rows:
+                    if path.rsplit("/", 1)[0] == d:
+                        out.append("\t%s -> %s\n" % (so, so))
+            return "".join(out), 0
+        return "", 0
+
+    def _ldconf_dirs(self):
+        """The directories ld.so.conf points at, in the order it lists them.
+
+        Read from the files, not written down here: an attacker who adds
+        a .conf under /etc/ld.so.conf.d and reruns ldconfig has changed
+        the search path, and the cache has to agree with what they did.
+        """
+        dirs, seen = [], set()
+        confs = ["/etc/ld.so.conf"]
+        for line in (self.fs.read("/etc/ld.so.conf")
+                     or b"").decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if line.startswith("include "):
+                pat = line.split(None, 1)[1]
+                base = pat.rsplit("/", 1)[0]
+                for name in sorted(self.fs.listdir(base) or []):
+                    if name.endswith(".conf"):
+                        confs.append(base + "/" + name)
+        for c in confs:
+            for line in (self.fs.read(c)
+                         or b"").decode("utf-8", "replace").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith(
+                        "include "):
+                    continue
+                if line not in seen:
+                    seen.add(line)
+                    dirs.append(line)
+        return dirs
+
+    def _ldcache(self):
+        """(soname, path) for everything on the search path, as -p prints it."""
+        rows, seen = [], set()
+        for d in self._ldconf_dirs():
+            # /lib is a symlink to usr/lib on a merged-/usr box, so listing
+            # the configured path directly comes back empty. Resolve to
+            # list, but print the path ld.so.conf actually names -- which
+            # is what ldd prints too, and the two have to match.
+            for name in sorted(self.fs.listdir(self.fs.resolve(d)) or []):
+                if ".so" not in name or name in seen:
+                    continue
+                node = (self.fs.nodes.get(d + "/" + name)
+                        or self.fs.nodes.get(
+                            self.fs.resolve(d + "/" + name)))
+                if node is None or node.is_dir:
+                    continue
+                seen.add(name)
+                rows.append((name, d + "/" + name))
+        rows.sort(key=lambda r: r[0], reverse=True)
+        return rows
+
+    @staticmethod
+    def _ldcache_blob(rows):
+        """The cache, in the layout glibc writes.
+
+        Nothing on this box parses it, but `ls -l /etc/ld.so.cache` and
+        `file` both read it, and a cache whose size does not move when
+        libraries are added is a cache nobody built. Header measured on
+        the guest with od: the 20-byte magic, then nlibs and len_strings
+        as little-endian u32, then a flags byte of 2.
+
+            struct cache_file_new   48 bytes
+            struct file_entry_new   24 bytes each
+            the string table        soname\0path\0 per entry
+        """
+        strings = b"".join((so + "\x00" + path + "\x00").encode()
+                           for so, path in rows)
+        head = (b"glibc-ld.so.cache1.1"
+                + len(rows).to_bytes(4, "little")
+                + len(strings).to_bytes(4, "little")
+                + b"\x02" + b"\x00" * 3          # flags, then padding
+                + b"\x00" * 4                     # extension_offset
+                + b"\x00" * 12)                   # unused[3]
+        return head + b"\x00" * (24 * len(rows)) + strings
 
     # --- network clients ---
     # ping options that consume the next argument.
@@ -36782,10 +37606,12 @@ class Shell:
                                     break
                         del found
                     if matches:
-                        out.extend("%s: %s\n" % m for m in matches)
+                        out.extend("%s: %s\n" % (self._dpkg_qual(pk, pth), pth)
+                                   for pk, pth in matches)
                         continue
                 if hit:
-                    out.append("%s: %s\n" % hit)
+                    out.append("%s: %s\n"
+                               % (self._dpkg_qual(hit[0], hit[1]), hit[1]))
                     continue
                 # The data files -L now lists have to be searchable too, or
                 # the two halves of dpkg-query disagree about who owns
@@ -36905,6 +37731,21 @@ class Shell:
                 # the package's entire point -- the contents of
                 # /etc/ssl/certs -- had just been created.
                 paths += self._PKG_DATA_FILES(name)
+                # The shared libraries it ships, and the directories they
+                # sit in. `dpkg -L libc6` listed eight doc files and no
+                # libraries at all, on a box where ldd resolves libc.so.6
+                # to a real file and ldconfig -p lists it -- so the package
+                # denied shipping the one thing everything on the box links
+                # against. Read from the same table those two read.
+                for _pth, _own in self._PKG_PATHS.items():
+                    if _own != name or "/lib" not in _pth:
+                        continue
+                    paths.append(_pth)
+                    _d = _pth.rsplit("/", 1)[0]
+                    while _d and _d != "/usr":
+                        paths.append(_d)
+                        _d = _d.rsplit("/", 1)[0]
+                    paths.append("/usr")
                 out.append("".join(sorted(set(paths))[i] + "\n"
                                    for i in range(len(set(paths)))))
             return "".join(out), rc

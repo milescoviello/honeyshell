@@ -84,6 +84,7 @@ Run all:  `./run-suites.sh`
 - `lateraltest.py` -- Where did they try to go next?
 - `launchfdtest.py` -- Where a launched process thinks it is, and what it is writing to.
 - `launchtest.py` -- What a process the attacker just started looks like to every reader.
+- `libtest.py` -- Shared libraries: what links against what, and who agrees.
 - `limittest.py` -- ulimit said yes and changed nothing.
 - `limtest.py` -- Do the four things that report resource limits report the same limits?
 - `linktest.py` -- Do the commands that follow a symlink agree about where it goes?
