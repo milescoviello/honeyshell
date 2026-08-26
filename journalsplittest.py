@@ -60,8 +60,12 @@ def main():
     s = sh()
     base = jlines(s)
     check("the journal has entries to begin with", base > 500, True)
+    # Not "more than twenty": syslog rotates daily and holds only what has
+    # happened since, so in the minutes after 06:25 it legitimately has a
+    # handful of lines. The claim that matters is that it is non-empty and
+    # smaller than the journal.
     check("syslog does too",
-          int(s.run("wc -l < /var/log/syslog").strip() or 0) > 20, True)
+          int(s.run("wc -l < /var/log/syslog").strip() or 0) > 0, True)
 
     # -- truncating rsyslog's copy leaves journald alone ---------------------
     s.run("> /var/log/syslog")
@@ -94,7 +98,7 @@ def main():
     check("...and --disk-usage agrees there is nothing there",
           "0B" in s.run("journalctl --disk-usage"), True)
     check("...while syslog is still on disk, untouched",
-          int(s.run("wc -l < /var/log/syslog").strip() or 0) > 20, True)
+          int(s.run("wc -l < /var/log/syslog").strip() or 0) > 0, True)
 
     # -- a new event still reaches the journal ------------------------------
     # Freezing the store outright breaks this: the message goes into

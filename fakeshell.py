@@ -16,6 +16,7 @@ so all of those behave the way bash does.
 import base64
 import fnmatch
 import hashlib
+import ipaddress
 import math
 import os
 import random
@@ -5289,6 +5290,12 @@ class VFS:
         if _ng > now:
             _ng = rot + 60
         _ngtxt = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(_ng))
+        # The login that opened session 41, placed inside the window this
+        # file covers. Falls back near the rotation when the box has not
+        # been up that long since it.
+        _ses = rot + 3 * 3600 + 811
+        if _ses > now:
+            _ses = rot + 120
         for off, msg in (
                 (now - rot, "systemd[1]: Starting logrotate.service - "
                  "Rotate log files..."),
@@ -5311,8 +5318,19 @@ class VFS:
                 # "-- No entries --". Every one of them gets its own pair
                 # now, at the moment _timer_schedule says it last fired,
                 # which is the same instant list-timers and status quote.
-                (900, "systemd[1]: Started session-41.scope - Session 41 of "
-                 "User root."),
+                # Anchored to the rotation like everything else in this
+                # list, not to a sliding 900 seconds. It was the one entry
+                # here still measured from *now*, so it moved every time the
+                # file was read -- and in the hours after the daily rotation
+                # it moved to *before* it, putting a pre-rotation line in
+                # the post-rotation file. rotwindowtest says no syslog entry
+                # may predate the rotation and timelinetest says head -1
+                # holds still; both were red for those hours every day and
+                # green the rest of the time, which is why it survived. The
+                # docstring at the top of this function is about exactly
+                # this mistake, made once more, three screens further down.
+                (now - _ses, "systemd[1]: Started session-41.scope - "
+                 "Session 41 of User root."),
         ):
             lines.append((now - off, msg))
         lines.extend(self._timer_lines(rot, now))
@@ -32327,8 +32345,22 @@ class Shell:
                     % (GATEWAY, IFACE, LOCAL_IP, SUBNET, PREFIX, IFACE,
                        LOCAL_IP), 0)
         if obj.startswith("n"):                      # neigh
-            return ("%s dev %s lladdr %s REACHABLE\n"
-                    % (GATEWAY, IFACE, GW_MAC), 0)
+            nrest = [w for w in words[1:]]
+            verb = (nrest[0] if nrest else "").lower()
+            if verb.startswith("flush"):
+                self.fs.neigh = []
+                self._sync_proc_arp()
+                return "", 0
+            if verb.startswith("del"):
+                tgt = nrest[1] if len(nrest) > 1 else ""
+                if not self._neigh_del(tgt):
+                    self.err("RTNETLINK answers: No such file or directory")
+                    return "", 2
+                return "", 0
+            # Trailing space after the state, which iproute2 prints and
+            # `cat -A` shows: "... REACHABLE $".
+            return "".join("%s dev %s lladdr %s %s \n" % (ip, dev, mac, st)
+                           for ip, mac, dev, st in self._neigh()), 0
         if obj == "":
             return self._ip_link(stats, extra), 0
         if obj.startswith("m"):                      # maddr
@@ -32509,11 +32541,87 @@ class Shell:
                 % (dest, gw, "0.0.0.0", IFACE,
                    net, "0.0.0.0", NETMASK, IFACE), 0)
 
+    def _neigh(self):
+        """The neighbour table: one list, four readers, and it can be emptied.
+
+        `arp -a`, `arp -n`, `ip neigh` and /proc/net/arp all describe it, and
+        `arp -d` and `ip neigh flush` both change it. Every reader was a
+        separate literal that printed the gateway unconditionally, so the
+        table could not be emptied at all: `arp -d 172.31.16.1` printed the
+        table back and the entry was still in all four.
+
+        Flushing ARP is what someone does before or after moving laterally,
+        and checking it took is one command.
+        """
+        n = getattr(self.fs, "neigh", None)
+        if n is None:
+            n = self.fs.neigh = [[GATEWAY, GW_MAC, IFACE, "REACHABLE"]]
+        return n
+
+    def _neigh_del(self, ip):
+        tbl = self._neigh()
+        for i, e in enumerate(tbl):
+            if e[0] == ip:
+                del tbl[i]
+                self._sync_proc_arp()
+                return True
+        return False
+
+    def _sync_proc_arp(self):
+        """/proc/net/arp is the same table. Keeps its header when empty --
+        measured: net-tools prints nothing at all for an empty table and
+        the proc file still has its header row."""
+        body = ("IP address       HW type     Flags       HW address"
+                "            Mask     Device\n")
+        for ip, mac, dev, _st in self._neigh():
+            body += "%-16s 0x1         0x2         %s     *        %s\n" % (
+                ip, mac, dev)
+        node = (self.fs.nodes.get("/proc/net/arp")
+                or self.fs.nodes.get(self.fs.resolve("/proc/net/arp")))
+        if node is not None and not node.is_dir:
+            node.content = body.encode("latin-1", "replace")
+
     def cmd_arp(self, a, stdin=""):
-        return ("Address                  HWtype  HWaddress           Flags "
-                "Mask            Iface\n"
-                "%-24s ether   %s   C                     %s\n"
-                % (GATEWAY, GW_MAC, IFACE), 0)
+        # -a and -n are two output formats, not two spellings of one. BSD
+        # style for -a, the Linux table for -n and for the bare command;
+        # measured on net-tools 2.10. Every flag produced the table here,
+        # so `arp -a` -- the spelling half the world types -- was wrong.
+        bsd = any(x.startswith("-") and "a" in x[1:] for x in a
+                  if not x.startswith("--"))
+        dele = None
+        want = list(a)
+        for i, x in enumerate(want):
+            if x == "-d" and i + 1 < len(want):
+                dele = want[i + 1]
+        if dele is not None:
+            if self._neigh_del(dele):
+                return "", 0
+            # Measured: on-subnet with no entry is "No ARP entry for X";
+            # an address with no route is the raw ioctl failure. Both exit
+            # 0, which is its own oddity and is what net-tools does.
+            try:
+                same = (ipaddress.ip_address(dele) in
+                        ipaddress.ip_network("%s/%d" % (SUBNET, PREFIX)))
+            except Exception:                                 # noqa: BLE001
+                same = False
+            if same:
+                self.err("No ARP entry for %s" % dele)
+            else:
+                self.err("SIOCDARP(dontpub): Network is unreachable")
+            return "", 0
+        tbl = self._neigh()
+        if not tbl:
+            # An empty table prints nothing, not a lone header.
+            return "", 0
+        if bsd:
+            return "".join("? (%s) at %s [ether] on %s\n" % (ip, mac, dev)
+                           for ip, mac, dev, _st in tbl), 0
+        out = ("Address                  HWtype  HWaddress           Flags "
+               "Mask            Iface\n")
+        for ip, mac, dev, _st in tbl:
+            out += "%-24s ether   %s   C                     %s\n" % (
+                ip, mac, dev)
+        return out, 0
 
     _LISTEN = LISTENERS
 

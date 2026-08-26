@@ -61,6 +61,18 @@ def install(spec, cmd="/root/.x/miner", age=None, user="root"):
                                 peer_port=44322), first
 
 
+def window():
+    """Seconds of log the current syslog can possibly hold.
+
+    syslog rotates daily, so a job installed two hours ago has an hour of
+    its firings in syslog.1 if the rotation happened in between. Checks that
+    assumed a full window were green for most of the day and red for the
+    hour or so after 06:25 -- the same shape of bug as the emulator ones
+    this suite exists to catch, in the suite itself.
+    """
+    return max(60.0, time.time() - fakeshell.cron_daily_last(time.time()))
+
+
 def count(sh, needle="/root/.x/miner"):
     return int(sh.run("grep -c '%s' /var/log/syslog" % needle).strip() or 0)
 
@@ -84,8 +96,9 @@ def main():
     # -- and on the next login, it has ---------------------------------------
     fs, sh, _ = install("* * * * *", age=3600)
     n = count(sh)
-    check("an hour of a per-minute job is about sixty lines",
-          55 <= n <= 62, True)
+    expect = min(3600, window()) / 60.0
+    check("a per-minute job fires once a minute since the rotation",
+          expect - 5 <= n <= expect + 3, True)
     check("the lines name the command",
           "CMD (/root/.x/miner)" in sh.run("grep miner /var/log/syslog"), True)
     check("...and the user", "(root) CMD" in
@@ -95,9 +108,19 @@ def main():
               or 0), n)
 
     # -- the stock entries are untouched -------------------------------------
-    check("the hourly run-parts lines are still there",
-          int(sh.run("grep -c 'run-parts --report /etc/cron.hourly' "
-                     "/var/log/syslog").strip() or 0) > 0, True)
+    # The hourly job fires at :17 and syslog starts at the daily rotation,
+    # so there is a stretch of up to an hour after 06:25 with legitimately
+    # none in this file -- from the rotation until the next :17. Asking
+    # cron_hourly_runs, which is the function the emulator itself uses, is
+    # the only way to get this right without restating the schedule: a first
+    # attempt guessed "seventeen minutes" and was still wrong at 07:11,
+    # because the last hourly run was at 06:17, before the rotation.
+    rot = fakeshell.cron_daily_last(time.time())
+    due = fakeshell.cron_hourly_runs(rot, time.time())
+    hourly = int(sh.run("grep -c 'run-parts --report /etc/cron.hourly' "
+                        "/var/log/syslog").strip() or 0)
+    check("the hourly run-parts lines are there once one has fired",
+          hourly > 0 if due else hourly == 0, True)
 
     # -- the log stays a log -------------------------------------------------
     # Appending them put an hour of cron history after tonight's nginx
@@ -114,15 +137,18 @@ def main():
     check("a second shell does not double the lines", count(second), n)
 
     # -- schedules are read, not assumed -------------------------------------
-    for spec, age, lo, hi in (
-            ("*/5 * * * *", 7200, 22, 26),
-            ("*/15 * * * *", 7200, 6, 10),
-            ("0 * * * *", 7200, 1, 3),
-    ):
+    for spec, age, every in (("*/5 * * * *", 7200, 300),
+                             ("*/15 * * * *", 7200, 900),
+                             ("0 * * * *", 7200, 3600)):
         _, s2, _ = install(spec, age=age)
         got = count(s2)
-        check("%s over %dh fires %d-%d times" % (spec, age // 3600, lo, hi),
-              lo <= got <= hi, True)
+        # Bounded by the shorter of "how long it has existed" and "how much
+        # log there is", which is what a real box would show.
+        span = min(age, window())
+        lo, hi = max(0, int(span / every) - 1), int(span / every) + 1
+        check("%s fires every %ds across the window it can be seen in"
+              % (spec, every), lo <= got <= hi,
+              True)
 
     # A job scheduled for a time that has not come round since it was
     # installed has not fired. Picked relative to now so the check does not

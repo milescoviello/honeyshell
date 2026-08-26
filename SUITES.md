@@ -94,6 +94,7 @@ Run all:  `./run-suites.sh`
 - `modetest.py` -- Do the commands that create files agree about what mode to give them?
 - `modtest.py` -- Do the views of "which kernel modules are loaded" agree with each other?
 - `mounttest.py` -- Does the box agree with itself about what is mounted?
+- `neightest.py` -- The neighbour table: four readers, two ways to change it.
 - `nettest.py` -- Does the box agree about where it is and what it is running?
 - `nettest2.py` -- /dev/tcp: the reverse shell, and what the box says about it.
 - `nicetest.py` -- Process priority: set it and nothing moved.

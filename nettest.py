@@ -85,10 +85,27 @@ def main():
           gw.rsplit(".", 2)[0] == ip.rsplit(".", 2)[0], "%s vs %s" % (gw, ip))
     check("arp -a and ip neigh agree about the gateway",
           gw in s.run("arp -a") and gw in s.run("ip neigh"))
-    arp_mac = re.search(r"ether\s+([0-9a-f:]{17})", s.run("arp -a"))
-    check("arp and ip neigh give the gateway the same MAC",
-          arp_mac and arp_mac.group(1) in s.run("ip neigh"),
-          s.run("ip neigh").strip()[:60])
+    # Four readers of one table, and `arp -a` is the BSD format -- the MAC
+    # comes after "at", not after "ether". This pulled it with a regex for
+    # the *tabular* layout, so it was quietly pinning the wrong output shape
+    # for `arp -a` as well as checking the MAC.
+    macs = {}
+    for label, text in (("arp -a", s.run("arp -a")),
+                        ("arp -n", s.run("arp -n")),
+                        ("ip neigh", s.run("ip neigh")),
+                        ("/proc/net/arp", s.run("cat /proc/net/arp"))):
+        m = re.search(r"([0-9a-f]{2}(?::[0-9a-f]{2}){5})", text)
+        macs[label] = m.group(1) if m else None
+    check("all four readers name a MAC for the gateway",
+          all(macs.values()), repr(macs))
+    check("and it is the same MAC in all four",
+          len(set(macs.values())) == 1, repr(macs))
+    check("arp -a is the BSD format, not the table",
+          s.run("arp -a").startswith("? (%s) at " % gw),
+          s.run("arp -a").splitlines()[:1])
+    check("arp -n is the table, not BSD",
+          s.run("arp -n").startswith("Address "),
+          s.run("arp -n").splitlines()[:1])
 
     # ---- the counters, which are one statistic
     # One command, so both readings share the per-command sample. Across two
