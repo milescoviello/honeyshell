@@ -150,11 +150,25 @@ def main():
           "set HONEY_BOOT_TS and HONEY_FS_EPOCH to fixed files")
 
     # ---- nothing moves because we looked later ---------------------------
+    # The lookahead must not step over the daily logrotate. Rotation *does*
+    # legitimately change the oldest line in a log, so a window that
+    # contains 06:25 measures the rotation rather than drift -- and this
+    # suite therefore failed for the six hours before it every day, which
+    # is exactly the window nobody runs a gate in. Found at 00:25, when
+    # +6h landed on 06:25 to the minute.
     if have_anchors:
+        _now = time.localtime()
+        _secs = _now.tm_hour * 3600 + _now.tm_min * 60 + _now.tm_sec
+        _rot = fs.CRON_DAILY_HM[0] * 3600 + fs.CRON_DAILY_HM[1] * 60
+        _until = (_rot - _secs) % 86400
+        # Stop a minute short of it; if we are already inside that minute,
+        # a short hop is still a real test of "later changes nothing".
+        _ahead = min(6 * 3600, max(60, _until - 60))
         a = snapshot(0, DATED)
-        b = snapshot(6 * 3600, DATED)
+        b = snapshot(_ahead, DATED)
         for q in DATED:
-            check("holds still over six hours: %s" % q, a[q] == b[q],
+            check("holds still over %dh%02dm: %s"
+                  % (_ahead // 3600, (_ahead % 3600) // 60, q), a[q] == b[q],
                   "\n        now %r\n        +6h %r" % (a[q][:90], b[q][:90]))
 
     sh = shell()

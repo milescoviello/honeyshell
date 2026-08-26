@@ -7788,10 +7788,18 @@ class VFS:
         cache = getattr(self, "_load_cache", None)
         if cache:
             return cache
-        t = time.time()
-        val = [0.02 + (int(t) % 3) / 100.0,
-               0.04 + (int(t / 7) % 3) / 100.0,
-               0.01 + (int(t / 11) % 2) / 100.0]
+        # Quantised to whole seconds, and the idle jitter moved off a
+        # per-second modulo. A load average is a decaying average, not a
+        # value that hops every time the clock ticks: with the old base,
+        # `uptime` and `cat /proc/loadavg` run a fraction of a second apart
+        # could straddle a second boundary and disagree -- and could
+        # disagree *downward* while a miner was pegging a core, which no
+        # real box does. cpuloadtest caught it as a one-in-many flake, which
+        # is what a time-dependent value looks like when it is wrong.
+        t = float(int(time.time()))
+        val = [0.02 + (int(t / 31) % 3) / 100.0,
+               0.04 + (int(t / 37) % 3) / 100.0,
+               0.01 + (int(t / 41) % 2) / 100.0]
         # A process pegging a core has to show up here. The three averages
         # are exponentially weighted over 1, 5 and 15 minutes, so a miner
         # started a minute ago lifts the first number and barely moves the
@@ -16040,6 +16048,17 @@ class Shell:
                 and self._classify(cmd)[0] is None):
             fn = None
         if fn is not None:
+            # Every exec goes past the dynamic loader first, and it prints
+            # before the program does. Here rather than at the decision
+            # point above, because the prefix form -- `LD_PRELOAD=x cmd
+            # 2>file` -- installs its redirections between the two, and an
+            # error written before them escaped the file the attacker was
+            # collecting it in.
+            if ("/" not in cmd and not from_path
+                    and cmd not in self._BUILTINS
+                    and cmd not in self._SHELL_KEYWORDS
+                    and cmd not in self.funcs):
+                self._preload_warn()
             try:
                 out, rc = fn(args, stdin)
             except ProcGone as gone:
@@ -18416,6 +18435,37 @@ class Shell:
                              if k in self.exported and k != "_"}}
 
     _REDIR_OUT = re.compile(r'(?:^|\s)\d?>>?\s*([^\s;&|]+)')
+
+    def _preload_warn(self):
+        """What the dynamic loader says before an exec, if anything.
+
+        `/etc/ld.so.preload` is the classic userland-rootkit persistence and
+        it is already logged as such here. What was missing is that the box
+        *behaves* differently once it exists: if the library named in it
+        cannot be opened, ld.so prints
+
+            ERROR: ld.so: object '/usr/lib/libx.so' from /etc/ld.so.preload
+            cannot be preloaded (cannot open shared object file): ignored.
+
+        before every dynamically linked program, and the program then runs
+        normally with rc unchanged. Writing the file before staging the
+        library is an ordering mistake people make, and on a real box it is
+        deafening -- every command they type answers with it. Here it was
+        silent, so `cat /etc/ld.so.preload` said a library was preloaded and
+        the whole rest of the box behaved as though it were not.
+
+        LD_PRELOAD in the environment does the same with a different source
+        label. Measured on debian:trixie, both wordings exactly.
+        """
+        for src, spec in (("/etc/ld.so.preload",
+                           (self.fs.read("/etc/ld.so.preload") or b"").decode(
+                               "utf-8", "replace")),
+                          ("LD_PRELOAD", self.vars.get("LD_PRELOAD", ""))):
+            for lib in (spec or "").replace(":", " ").split():
+                if not self.fs.exists(VFS.norm(lib, self.cwd)):
+                    self.err("ERROR: ld.so: object '%s' from %s cannot be "
+                             "preloaded (cannot open shared object file): "
+                             "ignored." % (lib, src))
 
     def _republish_cwd(self):
         """Keep /proc/<shell>/cwd level with the shell's own idea of it.

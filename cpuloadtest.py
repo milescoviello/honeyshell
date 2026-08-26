@@ -205,13 +205,18 @@ def main():
               True)
         check("loadavg counts it as runnable", la[3] >= 1, True)
 
-    up = sh.run("uptime")
-    m = re.search(r"load average: ([\d.]+), ([\d.]+), ([\d.]+)", up)
+    # Both readers in one command: they are a live value, so on a real box
+    # too they can differ if read either side of a clock tick. What must
+    # never differ is two readers sampling the same instant.
+    both = sh.run("uptime; cat /proc/loadavg")
+    m = re.search(r"load average: ([\d.]+), ([\d.]+), ([\d.]+)", both)
     check("uptime prints a load", bool(m), True)
-    if m and la:
+    m2 = re.search(r"^([\d.]+) ([\d.]+) ([\d.]+) ", both, re.M)
+    check("/proc/loadavg parses out of the same output", bool(m2), True)
+    if m and m2:
         check("uptime and /proc/loadavg agree",
               (float(m.group(1)), float(m.group(2)), float(m.group(3))),
-              (la[0], la[1], la[2]))
+              (float(m2.group(1)), float(m2.group(2)), float(m2.group(3))))
 
     top = sh.run("top -bn1")
     m = re.search(r"%Cpu\(s\):\s*([\d.]+) us,\s*([\d.]+) sy,\s*([\d.]+) ni,"
