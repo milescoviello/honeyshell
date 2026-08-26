@@ -6341,10 +6341,12 @@ class VFS:
           "233 rfkill\n183 hw_random\n144 nvram\n")
         w("/proc/consoles", "ttyS0                -W- (EC p  )    4:64\n"
                             "tty0                 -WU (E  p  )    4:1\n")
-        w("/proc/locks",
-          "1: POSIX  ADVISORY  WRITE 412 08:02:262151 0 EOF\n"
-          "2: FLOCK  ADVISORY  WRITE 1 08:02:131103 0 EOF\n"
-          "3: POSIX  ADVISORY  WRITE 685 08:02:393228 0 EOF\n")
+        # /proc/locks is generated -- see _proc_dynamic. It was three
+        # literal rows naming pids 412, 685 and 1 on a box whose highest
+        # pid is 4100 and whose process table contains none of them, so
+        # `ps -p 412` answered "no such process" about a lock the kernel
+        # was supposedly holding for it. The kernel drops a process's locks
+        # when it dies; a lock held by nobody cannot exist.
         w("/proc/key-users",
           "    0:     6 5/5 4/1000000 51/25000000\n")
         w("/proc/cgroups",
@@ -8377,6 +8379,52 @@ class VFS:
         # impossible by construction on a live kernel.
         return max(1, n)
 
+    #: Locks a daemon holds at rest. InnoDB takes an fcntl write lock on
+    #: ibdata1 so two servers cannot open one datadir, and that is the only
+    #: resting lock this persona's daemon set justifies -- the reference
+    #: guest, which runs journald and cron and nothing else, has an empty
+    #: /proc/locks. Both halves of each row are looked up: the pid from the
+    #: process table and the inode from the file, so a row cannot name a
+    #: process or a file that is not there.
+    RESTING_LOCKS = ((["mariadbd", "mysqld"], "/var/lib/mysql/ibdata1",
+                      "POSIX", "WRITE", "0", "EOF"),)
+
+    def _lock_rows(self):
+        """(kind, mode, pid, dev, ino, start, end) for every held lock."""
+        rows = []
+        procs = getattr(self, "proc_rows", None) or {}
+        by_comm = {}
+        for pid, r in procs.items():
+            if r and len(r) > 10:
+                by_comm.setdefault(os.path.basename(
+                    str(r[10]).split()[0] if str(r[10]).split() else ""),
+                    pid)
+        for comms, path, kind, mode, start, end in self.RESTING_LOCKS:
+            pid = next((by_comm[c] for c in comms if c in by_comm), None)
+            node = self.nodes.get(path) or self.nodes.get(self.resolve(path))
+            if pid is None or node is None:
+                continue
+            rows.append((kind, mode, pid, "08:01", self.ino_of(node),
+                         start, end))
+        # ...and whatever is held right now. flock's entries come and go
+        # with the command it wrapped, which is the whole point of taking
+        # one: a second flock -n while it is held has to fail.
+        for path, (pid, kind, mode) in sorted(
+                getattr(self, "held_locks", {}).items()):
+            node = self.nodes.get(path) or self.nodes.get(self.resolve(path))
+            if node is None:
+                continue
+            rows.append((kind, mode, pid, "08:01", self.ino_of(node),
+                         "0", "EOF"))
+        return rows
+
+    def _locks_text(self):
+        return "".join(
+            "%d: %-6s ADVISORY  %s %d %s:%d %s %s\n"
+            % (i + 1, kind, mode, pid, dev, ino, start, end)
+            for i, (kind, mode, pid, dev, ino, start, end)
+            in enumerate(self._lock_rows()))
+
     def _last_pid(self):
         """The most recently allocated pid, which cannot be below the highest
         pid currently alive."""
@@ -8677,6 +8725,8 @@ class VFS:
         if path == "/proc/uptime":
             up = time.time() - BOOT_TS
             return ("%.2f %.2f\n" % (up, up * NCPU * 0.87)).encode()
+        if path == "/proc/locks":
+            return self._locks_text().encode()
         if path == "/proc/loadavg":
             a, b, c = self.loadavg()
             # The 4th field is running/total over *tasks*, the 5th is the last
@@ -19804,8 +19854,16 @@ class Shell:
                          "%s: root@pts/0" % SSHD_SESSION))
         # A `ps` with no bash in it, on a box you are typing into, is not a
         # process listing anyone believes.
+        #
+        # And it is *running*. /proc/loadavg's fourth field said "1/28"
+        # while `ps -e -o stat=` listed no R at all -- one runnable task
+        # claimed and none nameable. On a real box the count is 1 and the
+        # one is whatever is doing the looking; here every command runs
+        # inside this shell, so this row is that process. Measured on the
+        # guest: exactly one R in the whole table, and it is the ps.
         rows.append((self.user, self.shell_pid, 0.0, 0.1, 9284, 5312, "pts/0",
-                     "Ss", when, "00:00:00", "-bash"))
+                     "Rs" if getattr(self, "exec_mode", False) else "Rs+",
+                     when, "00:00:00", "-bash"))
         for pid, cmd, tty in getattr(self.fs, "procs", []):
             # START and TIME were fixed strings: every process the attacker
             # started claimed to have begun two minutes ago and burned 74
@@ -25802,8 +25860,84 @@ class Shell:
         return self.dispatch(rest[0], rest[1:], stdin)
 
     def cmd_flock(self, a, stdin=""):
-        rest = [x for x in a if not x.startswith("-")]
-        return self.dispatch(rest[1], rest[2:], stdin) if len(rest) > 1 else ("", 0)
+        """flock takes a lock, and the box has to be able to see it.
+
+        This dropped every option and ran whatever the second operand
+        was, so:
+
+          * `flock -n /var/lock/x -c '<script>'` -- the standard cron
+            wrapper, and what a loader uses so two copies of itself do
+            not start -- answered "bash: <script>: command not found",
+            because -c takes a shell command line and this took it as a
+            program name.
+          * nothing was ever locked. /proc/locks did not change while it
+            ran, and a second `flock -n` on the same file succeeded,
+            which is the one thing flock exists to prevent.
+
+        Measured on the guest:
+
+            flock -n /tmp/x -c 'echo held; id -u'   held / 1001, rc 0
+            (held) flock -n /tmp/x -c 'echo got it'  rc 1, no output
+            while held, /proc/locks gains
+                N: FLOCK  ADVISORY  WRITE <pid> <dev>:<ino> 0 EOF
+        """
+        i, nonblock, cmdline, path, close_fd = 0, False, None, None, False
+        while i < len(a):
+            x = a[i]
+            if x in ("-n", "--nb", "--nonblock", "--conflict-exit-code"):
+                nonblock = True
+                if x == "--conflict-exit-code":
+                    i += 1
+            elif x in ("-c", "--command") and i + 1 < len(a):
+                cmdline = a[i + 1]
+                i += 1
+            elif x in ("-w", "--wait", "--timeout", "-E") and i + 1 < len(a):
+                i += 1
+            elif x in ("-o", "--close"):
+                close_fd = True
+            elif x in ("-s", "--shared", "-x", "--exclusive", "-u",
+                       "--unlock", "-F", "--no-fork", "-v", "--verbose"):
+                pass
+            elif x.startswith("-"):
+                pass
+            elif path is None:
+                path = x
+            elif cmdline is None:
+                cmdline = " ".join(a[i:])
+                break
+            i += 1
+        del close_fd
+        if path is None:
+            self.err("flock: not enough arguments")
+            self.err("Try 'flock --help' for more information.")
+            return "", 64
+        target = VFS.norm(path, self.cwd)
+        if not self.fs.exists(target):
+            # A bare fd number is the other form: `flock 9` locks whatever
+            # fd 9 is, and there is no path to check.
+            if path.isdigit():
+                target = "/proc/self/fd/" + path
+            else:
+                self.fs.write(target, b"")
+        held = getattr(self.fs, "held_locks", None)
+        if held is None:
+            held = self.fs.held_locks = {}
+        if target in held:
+            if nonblock:
+                return "", 1
+            # Without -n flock waits forever. There is nobody to wait for
+            # here -- the holder is this same shell -- so waiting is a hang
+            # and refusing is the honest answer.
+            return "", 1
+        if cmdline is None:
+            return "", 0
+        held[target] = (self.shell_pid, "FLOCK", "WRITE")
+        try:
+            # -c is a shell command line, not a program name.
+            out = self.run(cmdline)
+        finally:
+            held.pop(target, None)
+        return out, self.last_rc
 
     def cmd_stdbuf(self, a, stdin=""):
         rest = [x for x in a if not x.startswith("-")]

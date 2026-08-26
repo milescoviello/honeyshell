@@ -92,6 +92,7 @@ Run all:  `./run-suites.sh`
 - `loadertest.py` -- What a downloaded installer script actually meets on the way to running.
 - `localetest.py` -- Does the box agree with itself about what locale it is running in?
 - `lockedwritetest.py` -- Every writer has to fail the same way on a locked file.
+- `locktest.py` -- Who is holding this lock, and does the box know that process?
 - `loctest.py` -- What encoding is this box in, and which files say so?
 - `logtest.py` -- Do the log surfaces agree with each other and with the rest of the box?
 - `lsargtest.py` -- ls with more than one operand -- order, grouping, and shared columns.
