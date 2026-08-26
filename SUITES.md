@@ -35,6 +35,7 @@ Run all:  `./run-suites.sh`
 - `crontamptest.py` -- A wipe, a gutting and an install all logged as cron_install.
 - `crontest.py` -- crontab: one crontab for everyone, and no validation at all.
 - `detect.py` -- Try to prove this box is fake, the way an attacker who just landed would.
+- `devmodeltest.py` -- The device model: which devices exist, and does every view agree?
 - `devtest.py` -- Does the disk story hold together from /etc/fstab down to /dev?
 - `difftest.py` -- Differential test: our fake shell vs real bash.
 - `difftest2.py` -- Round 2: wider corpus, still machine-independent constructs only.

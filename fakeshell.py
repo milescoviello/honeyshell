@@ -304,6 +304,30 @@ BIOS_BOOT_BLOCKS = 4096          # sda14, the BIOS boot partition
 # The GPT disk GUID fdisk prints. Fixed, because a disk identifier
 # that changes between two runs of `fdisk -l` is not a disk.
 DISK_GUID = "9C4F1A2B-3D5E-4F60-8A71-B2C3D4E5F607"
+
+
+def gpt_layout():
+    """The partition table as one table, in on-disk order.
+
+    Every consumer of this used to carry its own copy. fdisk computed the
+    start sectors inline, /sys/block was a hand-written list of three
+    device names, and /proc/diskstats was a fourth list that had never
+    been updated -- so the box shipped an sda2 that fdisk's own docstring
+    records as removed years of sweeps ago, and a sda14 that fdisk,
+    lsblk and /proc/partitions all report but /sys had never heard of.
+
+    Returns (name, minor, start_sector, sectors, kb, gpt_type) per
+    partition. Sizes come from the same constants df and lsblk read, so a
+    partition cannot be resized in one command and not another.
+    """
+    rows, start = [], 2048
+    for name, minor, kb, kind in (("sda14", 14, BIOS_BOOT_BLOCKS, "BIOS boot"),
+                                  ("sda15", 15, ESP_BLOCKS, "EFI System"),
+                                  ("sda1", 1, ROOT_PART_BLOCKS,
+                                   "Linux filesystem")):
+        rows.append((name, minor, start, kb * 2, kb, kind))
+        start += kb * 2
+    return rows
 # `du -s /` has to land near df's Used figure -- just below it, never above.
 # The VFS only models a few megabytes of files, so du reported 4K where df
 # claimed 4.1G; the baseline makes up the difference. It is computed per
@@ -3540,7 +3564,12 @@ def node_size(node, path=None):
         # attribute file is one page, whatever it holds. We printed the
         # length of the string, so `ls -l /sys/class/net/eth0/address` said
         # 18 where every Linux says 4096.
-        return 0 if node.is_dir else 4096
+        #
+        # Symlinks go back to 0 with the directories. sysfs is nothing but
+        # symlinks once you are inside the device model -- /sys/block/sda,
+        # every /sys/bus/*/devices entry, every `driver` back-link -- and
+        # a page-sized symlink is not a thing any kernel prints.
+        return 0 if (node.is_dir or node.link is not None) else 4096
     if node.elf:
         return node.elf[1]
     if node.blob:
@@ -6508,18 +6537,109 @@ class VFS:
               mode=0o400 if "uuid" in k or "serial" in k else 0o444)
         w("/sys/class/dmi/id/uevent",
           "MODALIAS=%s\n" % self.DMI["modalias"], mode=0o644)
-        for dev, size, rot in (("sda", DISK_BLOCKS * 2, "0"),
-                               ("sda1", ROOT_PART_BLOCKS * 2, "0"),
-                               ("sda15", ESP_BLOCKS * 2, "0"),
-                               ("sr0", 2097151, "1")):
-            b = "/sys/block/" + dev
-            self.nodes[b] = FileNode(mode=0o755, is_dir=True, mtime=BOOT_TS)
+        # --- the device model.
+        #
+        # /sys/devices is the tree; /sys/bus and /sys/block are symlink
+        # views onto it. Here the views existed and the tree did not.
+        # /sys/devices/pci0000:00 was absent while /sys/bus/pci/devices
+        # held nine real directories, every `driver` link in them pointed
+        # into a /sys/bus/pci/drivers that was empty, and there was no
+        # /sys/bus/virtio at all on a box whose lspci lists three virtio
+        # devices and whose lsmod loads seven virtio modules. `ls
+        # /sys/block` listed four block devices -- two of them partitions,
+        # which never appear there -- where `lsblk -d`, `fdisk -l` and the
+        # guest's own /sys list two, and it had never heard of sda14.
+        #
+        # Everything below hangs off one tree and the views are links into
+        # it, so the answer cannot differ by which path you took to reach
+        # it.
+        def sl(path, target):
+            # A sysfs symlink appears when the driver binds, which is at
+            # boot. self.symlink() stamps them with now(), so `ls -l` on a
+            # PCI device showed its attribute files dated at boot and its
+            # `driver` link dated this minute -- on a box claiming forty
+            # days of uptime.
+            parent = os.path.dirname(path)
+            if not self.isdir(parent):
+                self.nodes[parent] = FileNode(mode=0o755, is_dir=True,
+                                              mtime=BOOT_TS)
+            self.nodes[path] = FileNode(mode=0o777, link=target,
+                                        mtime=BOOT_TS)
+
+        def sysdir(path):
+            self.nodes[path] = FileNode(mode=0o755, is_dir=True,
+                                        mtime=BOOT_TS)
+
+        # sda hangs off the virtio-scsi HBA and sr0 off the PIIX3 IDE
+        # channel, which is where lspci says those controllers are.
+        _scsi_slot = [d[0] for d in PCI_DEVICES
+                      if d[2] == "SCSI storage controller"][0]
+        _scsi_vidx = [v[1] for v in virtio_devices()
+                      if v[0] == _scsi_slot][0]
+        _ide_slot = [d[0] for d in PCI_DEVICES
+                     if d[2] == "IDE interface"][0]
+        SDA_DEV = ("/sys/devices/pci0000:00/0000:%s/virtio%d/host0/"
+                   "target0:0:0/0:0:0:0" % (_scsi_slot, _scsi_vidx))
+        SR0_DEV = ("/sys/devices/pci0000:00/0000:%s/ata2/host2/"
+                   "target2:0:0/2:0:0:0" % _ide_slot)
+        for dev, size, rot, devno, host, diskseq in (
+                ("sda", DISK_BLOCKS * 2, "0", "8:0", SDA_DEV, 1),
+                ("sr0", 2097151, "1", "11:0", SR0_DEV, 3)):
+            b = host + "/block/" + dev
+            sysdir(b)
             w(b + "/size", "%d\n" % size)
             w(b + "/removable", "1\n" if dev == "sr0" else "0\n")
-            w(b + "/dev", "8:0\n" if dev == "sda" else "11:0\n")
+            w(b + "/dev", devno + "\n")
+            w(b + "/ro", "1\n" if dev == "sr0" else "0\n")
+            w(b + "/alignment_offset", "0\n")
+            w(b + "/discard_alignment", "0\n")
+            w(b + "/capability", "0\n")
+            w(b + "/diskseq", "%d\n" % diskseq)
+            w(b + "/events", "media_change\n" if dev == "sr0" else "\n")
+            w(b + "/events_async", "\n")
+            w(b + "/events_poll_msecs", "-1\n", mode=0o644)
+            # A CD-ROM has no partitions, so its minor range is 1; a disk
+            # gets 16 with a 256-entry extended range behind it.
+            w(b + "/ext_range", "1\n" if dev == "sr0" else "256\n")
+            w(b + "/range", "1\n" if dev == "sr0" else "16\n")
+            w(b + "/hidden", "0\n")
+            w(b + "/partscan", "1\n")
+            w(b + "/inflight", "       0        0\n")
+            w(b + "/uevent", "MAJOR=%s\nMINOR=%s\nDEVNAME=%s\n"
+              "DEVTYPE=disk\nDISKSEQ=%d\n"
+              % (devno.split(":")[0], devno.split(":")[1], dev, diskseq),
+              mode=0o644)
             w(b + "/queue/rotational", rot + "\n", mode=0o644)
             w(b + "/queue/scheduler", "[none] mq-deadline\n", mode=0o644)
             w(b + "/queue/logical_block_size", "512\n")
+            for _sub in ("holders", "slaves", "integrity", "mq", "power",
+                         "trace"):
+                sysdir(b + "/" + _sub)
+            sl(b + "/device", "../../../" + host.rsplit("/", 1)[-1])
+            sl(b + "/subsystem", "../" * (b.count("/") - 1) + "class/block")
+            sl(b + "/bdi", "../" * (b.count("/") - 1)
+               + "virtual/bdi/" + devno)
+            # The view. /sys/block holds whole devices only, as links.
+            sl("/sys/block/" + dev, ".." + b[len("/sys"):])
+        # The partitions, from gpt_layout() -- the same call fdisk prints
+        # and /proc/diskstats counts.
+        _sda = SDA_DEV + "/block/sda"
+        for _pn, _minor, _start, _sectors, _kb, _kind in gpt_layout():
+            _pb = _sda + "/" + _pn
+            sysdir(_pb)
+            w(_pb + "/dev", "8:%d\n" % _minor)
+            w(_pb + "/size", "%d\n" % _sectors)
+            w(_pb + "/start", "%d\n" % _start)
+            w(_pb + "/partition", "%d\n" % _minor)
+            w(_pb + "/ro", "0\n")
+            w(_pb + "/alignment_offset", "0\n")
+            w(_pb + "/discard_alignment", "0\n")
+            w(_pb + "/inflight", "       0        0\n")
+            w(_pb + "/uevent", "MAJOR=8\nMINOR=%d\nDEVNAME=%s\n"
+              "DEVTYPE=partition\nDISKSEQ=1\nPARTN=%d\n"
+              % (_minor, _pn, _minor), mode=0o644)
+            for _sub in ("holders", "power", "trace"):
+                sysdir(_pb + "/" + _sub)
         for ifn, mtu, oper, carrier in (("eth0", "1500", "up", "1"),
                                         ("lo", "65536", "unknown", "1")):
             b = "/sys/class/net/" + ifn
@@ -6571,10 +6691,14 @@ class VFS:
         # The PCI bus as sysfs shows it. lspci reads this directory on a
         # real box; here it listed nine devices and the directory did not
         # exist, so the command and its own data source disagreed about
-        # whether this machine has a bus at all.
+        # whether this machine has a bus at all. The devices themselves now
+        # live in /sys/devices/pci0000:00 where the kernel puts them, and
+        # /sys/bus/pci/devices holds links -- which is what `ls -l` there
+        # shows on any real box, and what makes `readlink -f` on a device
+        # land somewhere that exists.
         for _d in PCI_DEVICES:
             _slot, _cls, _name, _vend, _ids, _sub, _drv, _mods, _rev = _d
-            _base = "/sys/bus/pci/devices/0000:" + _slot
+            _base = "/sys/devices/pci0000:00/0000:" + _slot
             _vid, _did = _ids.split(":")
             w(_base + "/vendor", "0x%s\n" % _vid, mode=0o444)
             w(_base + "/device", "0x%s\n" % _did, mode=0o444)
@@ -6586,9 +6710,71 @@ class VFS:
             w(_base + "/uevent",
               "DRIVER=%s\nPCI_CLASS=%s00\nPCI_ID=%s\nPCI_SLOT_NAME=0000:%s\n"
               % (_drv or "", _cls.upper(), _ids.upper(), _slot), mode=0o444)
+            sl(_base + "/subsystem", "../../../bus/pci")
+            sl("/sys/bus/pci/devices/0000:" + _slot,
+               "../../../devices/pci0000:00/0000:" + _slot)
             if _drv:
-                self.symlink(_base + "/driver",
-                             "../../../bus/pci/drivers/" + _drv)
+                sl(_base + "/driver", "../../../bus/pci/drivers/" + _drv)
+                # A bound driver is bound from both ends. /sys/bus/pci/
+                # drivers was an empty directory, so every one of those
+                # `driver` links dangled: `ls -l` showed the binding and
+                # `ls` on what it pointed at showed nothing there.
+                _dd = "/sys/bus/pci/drivers/" + _drv
+                sysdir(_dd)
+                sl(_dd + "/0000:" + _slot,
+                   "../../../../devices/pci0000:00/0000:" + _slot)
+                w(_dd + "/bind", "", mode=0o200)
+                w(_dd + "/unbind", "", mode=0o200)
+                w(_dd + "/uevent", "", mode=0o644)
+        # The virtio bus. virtio-pci claims three of the PCI devices above
+        # and each one comes back up as a device on a second bus -- which
+        # is the bus every "am I in a VM" check looks at after
+        # systemd-detect-virt. There was no /sys/bus/virtio here at all,
+        # on a box whose lspci names three virtio devices, whose lsmod
+        # loads virtio_net, virtio_scsi and virtio_balloon, and whose
+        # dmesg binds them.
+        for _slot, _vidx, _vdrv, _vecs in virtio_devices():
+            _ids = [d[4] for d in PCI_DEVICES if d[0] == _slot][0]
+            _vdev, _feat = VIRTIO_DRIVERS[_ids][1], VIRTIO_DRIVERS[_ids][2]
+            _vb = ("/sys/devices/pci0000:00/0000:%s/virtio%d"
+                   % (_slot, _vidx))
+            w(_vb + "/device", _vdev + "\n", mode=0o444)
+            w(_vb + "/vendor", "0x1af4\n", mode=0o444)
+            # 0xf is DRIVER_OK: acknowledged, driver found, features
+            # negotiated, running. Any other value here says the device
+            # failed to come up, which would have shown in dmesg.
+            w(_vb + "/status", "0x0000000f\n", mode=0o444)
+            w(_vb + "/features", _feat + "\n", mode=0o444)
+            w(_vb + "/modalias",
+              "virtio:d%08Xv%08X\n" % (int(_vdev, 16), 0x1AF4), mode=0o444)
+            w(_vb + "/uevent",
+              "DRIVER=%s\nMODALIAS=virtio:d%08Xv%08X\n"
+              % (_vdrv, int(_vdev, 16), 0x1AF4), mode=0o644)
+            sysdir(_vb + "/power")
+            sl(_vb + "/subsystem", "../../../../bus/virtio")
+            sl(_vb + "/driver", "../../../../bus/virtio/drivers/" + _vdrv)
+            sl("/sys/bus/virtio/devices/virtio%d" % _vidx,
+               "../../../devices/pci0000:00/0000:%s/virtio%d"
+               % (_slot, _vidx))
+            _vd = "/sys/bus/virtio/drivers/" + _vdrv
+            sysdir(_vd)
+            sl(_vd + "/virtio%d" % _vidx,
+               "../../../../../devices/pci0000:00/0000:%s/virtio%d"
+               % (_slot, _vidx))
+            w(_vd + "/bind", "", mode=0o200)
+            w(_vd + "/unbind", "", mode=0o200)
+            w(_vd + "/uevent", "", mode=0o644)
+        # The virtio modules lsmod loads that have not claimed a device --
+        # virtiofs and virtio_console are built in and registered, they
+        # just have nothing plugged into them here. A driver directory with
+        # no device links under it is exactly how that looks.
+        for _vdrv in ("virtio_console", "virtio_rproc_serial", "virtiofs"):
+            sysdir("/sys/bus/virtio/drivers/" + _vdrv)
+            w("/sys/bus/virtio/drivers/%s/uevent" % _vdrv, "", mode=0o644)
+        for _bus in ("pci", "virtio"):
+            w("/sys/bus/%s/uevent" % _bus, "", mode=0o644)
+            w("/sys/bus/%s/drivers_probe" % _bus, "", mode=0o200)
+            w("/sys/bus/%s/drivers_autoprobe" % _bus, "1\n", mode=0o644)
         # A display adapter with a driver bound has a DRM device. `ls
         # /dev/dri` is the GPU question asked without lspci, and it said
         # the directory did not exist on a box whose lspci lists a VGA
@@ -8360,34 +8546,138 @@ class VFS:
                      ("numa_hit", int(up * 2010)), ("numa_miss", 0)]
             return "".join("%s %d\n" % kv for kv in pairs).encode()
         if path == "/proc/diskstats":
+            # This was the last place on the box that still believed in
+            # sda2. fdisk's docstring records dropping the invented swap
+            # partition; lsblk, /proc/partitions, blkid and /dev were all
+            # corrected with it, and this file was not -- so `cat
+            # /proc/diskstats` next to `cat /proc/partitions` listed a
+            # different set of block devices, and the extra one was the
+            # swap partition that `swapon -s`, `free` and /proc/swaps all
+            # deny. It also carried a loop0 with no /dev/loop0 behind it
+            # and no loop row in lsblk, and it had never heard of sda14 or
+            # sda15. The device list now comes from gpt_layout(), the same
+            # call fdisk prints from.
+            #
+            # The per-partition shares are the guest's own ratios: sda1
+            # 28496 reads against sda's 30090, sda15 258, sda14 162. A
+            # partition busier than its disk is not a thing, and neither
+            # is a BIOS boot partition with traffic after boot.
             up = max(1.0, time.time() - BOOT_TS)
+
             def row(major, minor, name, scale):
                 r = int(up * 0.9 * scale)
                 w_ = int(up * 2.1 * scale)
-                return ("%4d    %3d %s %d %d %d %d %d %d %d %d 0 %d %d "
+                return ("%4d%8d %s %d %d %d %d %d %d %d %d 0 %d %d "
                         "0 0 0 0 0 0\n"
                         % (major, minor, name, r, r // 9, r * 18, r // 3,
                            w_, w_ // 7, w_ * 22, w_ // 2,
                            int(up * 3), int(up * 5)))
-            return (row(8, 0, "sda", 1.0) + row(8, 1, "sda1", 0.02)
-                    + row(8, 2, "sda2", 0.97) + row(11, 0, "sr0", 0.0)
-                    + row(7, 0, "loop0", 0.0)).encode()
+            # sda14 and sda15 are read at boot and then left alone -- one
+            # has no filesystem at all, the other is /boot/efi -- so their
+            # counters are fixed, not a rate. A partition whose reads climb
+            # with uptime while nothing ever opens it is its own tell, and
+            # a BIOS boot partition with writes is not a thing.
+            def static(minor, name, reads, sectors):
+                return ("%4d%8d %s %d 0 %d %d 0 0 0 0 0 %d %d "
+                        "0 0 0 0 0 0\n"
+                        % (8, minor, name, reads, sectors, reads // 20,
+                           reads // 20, reads // 20))
+            out = [row(8, 0, "sda", 1.0), row(8, 1, "sda1", 0.947),
+                   static(14, "sda14", 162, 1296),
+                   static(15, "sda15", 258, 10205),
+                   row(11, 0, "sr0", 0.0)]
+            return "".join(out).encode()
         if path == "/proc/interrupts":
+            # This described a different machine. It routed virtio through
+            # IO-APIC fasteoi lines, which is how a pre-MSI-X guest looked;
+            # a KVM guest with virtio-pci gets one PCI-MSIX line per
+            # virtqueue, named after the device. Worse, it named virtio3 --
+            # a fourth virtio device, on a box whose lspci lists three and
+            # whose /sys/bus/virtio now lists the same three. Anything
+            # counting virtio devices from here got a different answer than
+            # from lspci, lsmod or /sys.
+            #
+            # The vector names per device type are measured, not invented:
+            # net gets config/input.0/output.0, scsi gets
+            # config/control/event and one request queue per CPU, and a
+            # balloon gets config/virtqueues and nothing else -- which is
+            # why the balloon contributes two lines here and no traffic.
             up = max(1.0, time.time() - BOOT_TS)
-            hdr = "".join("%10s" % ("CPU%d" % c) for c in range(NCPU))
-            def irq(label, name, rate):
-                cols = "".join("%10d" % int(up * rate / NCPU) for _ in range(NCPU))
-                return "%4s:%s   %s\n" % (label, cols, name)
-            return (hdr + "\n"
-                    + irq("0", "IO-APIC    2-edge      timer", 0)
-                    + irq("1", "IO-APIC    1-edge      i8042", 0.001)
-                    + irq("4", "IO-APIC    4-edge      ttyS0", 0.01)
-                    + irq("10", "IO-APIC   10-fasteoi   virtio3", 4.2)
-                    + irq("11", "IO-APIC   11-fasteoi   uhci_hcd, virtio2", 1.1)
-                    + irq("LOC", "Local timer interrupts", 118.0)
-                    + irq("RES", "Rescheduling interrupts", 12.0)
-                    + irq("CAL", "Function call interrupts", 3.0)
-                    + irq("TLB", "TLB shootdowns", 1.4)).encode()
+            hdr = "           " + "".join("CPU%-8d" % c for c in range(NCPU))
+
+            def line(label, chip, hw, trig, name, rate, oncpu=0, base=0):
+                # A vector fires on the CPU its affinity names, not evenly
+                # across all of them. Spreading a device interrupt over
+                # four CPUs is the shape of a summary counter, not a
+                # device. `base` is for the vectors that fire during boot
+                # and then stop -- the 8259 timer hands over to the local
+                # APIC, so IRQ 0 is a small fixed number for the life of
+                # the box rather than either zero or a rate.
+                cols = "".join(
+                    " %10d" % (base + int(up * rate) if c == oncpu else 0)
+                    for c in range(NCPU))
+                return "%3s:%s  %8s%4s-%-8s  %s\n" % (
+                    label, cols, chip, hw, trig, name)
+
+            def summary(label, name, rate):
+                # Never the same number four times. Per-CPU counters that
+                # match to the digit across every CPU are the one thing
+                # this file cannot do on real hardware.
+                cols = "".join(
+                    " %10d" % int(up * rate / NCPU * (1.0 + 0.043 * c))
+                    for c in range(NCPU))
+                return "%3s:%s   %s\n" % (label, cols, name)
+
+            out = [hdr + "\n"]
+            for _lbl, _hw, _trig, _nm, _rate, _base in (
+                    (0, 2, "edge", "timer", 0.0, 35),
+                    (1, 1, "edge", "i8042", 0.0, 9),
+                    (4, 4, "edge", "ttyS0", 0.0002, 0),
+                    (8, 8, "edge", "rtc0", 0.0, 0),
+                    (9, 9, "fasteoi", "acpi", 0.0, 0),
+                    (12, 12, "edge", "i8042", 0.0, 3),
+                    (14, 14, "edge", "ata_piix", 0.0, 0),
+                    (15, 15, "edge", "ata_piix", 0.11, 0)):
+                out.append(line(str(_lbl), "IO-APIC", _hw, _trig, _nm,
+                                _rate, oncpu=_lbl % NCPU, base=_base))
+            # One MSI-X block per virtio device, in the order the kernel
+            # probed the PCI bus -- the same order virtio_index() numbers
+            # them for /sys/bus/virtio.
+            _irq = 24
+            for _slot, _vidx, _drv, _vecs in virtio_devices():
+                for _vec, (_vname, _vrate) in enumerate(_vecs):
+                    out.append(line(str(_irq), "PCI-MSIX-0000:" + _slot,
+                                    _vec, "edge",
+                                    "virtio%d-%s" % (_vidx, _vname), _vrate,
+                                    oncpu=_irq % NCPU))
+                    _irq += 1
+            for _lbl, _nm, _rate in (
+                    ("NMI", "Non-maskable interrupts", 0.0),
+                    ("LOC", "Local timer interrupts", 118.0),
+                    ("SPU", "Spurious interrupts", 0.0),
+                    ("PMI", "Performance monitoring interrupts", 0.0),
+                    ("IWI", "IRQ work interrupts", 0.0),
+                    ("RTR", "APIC ICR read retries", 0.0),
+                    ("RES", "Rescheduling interrupts", 12.0),
+                    ("CAL", "Function call interrupts", 3.0),
+                    ("TLB", "TLB shootdowns", 1.4),
+                    ("TRM", "Thermal event interrupts", 0.0),
+                    ("THR", "Threshold APIC interrupts", 0.0),
+                    ("DFR", "Deferred Error APIC interrupts", 0.0),
+                    ("MCE", "Machine check exceptions", 0.0),
+                    ("MCP", "Machine check polls", 0.0111)):
+                out.append(summary(_lbl, _nm, _rate))
+            # ERR and MIS carry one column, not one per CPU. They also sit
+            # here, above the posted-interrupt rows, in the order the
+            # kernel prints them -- the guest's own file is the reference.
+            out.append("ERR:%11d\n" % 0)
+            out.append("MIS:%11d\n" % 0)
+            for _lbl, _nm in (
+                    ("PIN", "Posted-interrupt notification event"),
+                    ("NPI", "Nested posted-interrupt event"),
+                    ("PIW", "Posted-interrupt wakeup event")):
+                out.append(summary(_lbl, _nm, 0.0))
+            return "".join(out).encode()
         if path == "/proc/schedstat":
             up = max(1.0, time.time() - BOOT_TS)
             out = ["version 15\n", "timestamp %d\n" % int(up * 250)]
@@ -11672,6 +11962,49 @@ PCI_DEVICES = (
      "Red Hat, Inc. Virtio SCSI", "1af4:1004",
      "Red Hat, Inc. Device 0008", "virtio-pci", "", ""),
 )
+
+# Which PCI devices the virtio-pci driver claims, and what each one hangs
+# off the virtio bus as. The kernel numbers virtio devices in PCI probe
+# order, so this is PCI_DEVICES filtered and enumerated rather than a
+# second list that can drift from it -- /sys/bus/virtio, /proc/interrupts
+# and lspci all read this, and lspci's own subsystem column
+# ("Red Hat, Inc. Device 0001") is where the virtio device id comes from.
+#
+# The vector names are per device type and were measured: a net device
+# gets config/input.0/output.0, a scsi HBA gets config/control/event plus
+# one request queue per CPU, and a balloon gets config/virtqueues and
+# never fires either of them.
+VIRTIO_DRIVERS = {
+    "1af4:1000": ("virtio_net", "0x0001",
+                  "1111010111111111111101010000110010000000"
+                  "100000000000001110000000"),
+    "1af4:1002": ("virtio_balloon", "0x0005",
+                  "0100010000000000000000000000110010000000"
+                  "100000000000000000000000"),
+    "1af4:1004": ("virtio_scsi", "0x0008",
+                  "0110000000000000000000000000110010000000"
+                  "100000000000000000000000"),
+}
+
+
+def virtio_devices():
+    """(pci_slot, virtio_index, driver, [(vector_name, irq_rate), ...])."""
+    out = []
+    for _d in PCI_DEVICES:
+        slot, ids, drv = _d[0], _d[4], _d[6]
+        if drv != "virtio-pci" or ids not in VIRTIO_DRIVERS:
+            continue
+        vdrv = VIRTIO_DRIVERS[ids][0]
+        if vdrv == "virtio_net":
+            vecs = [("config", 0.0), ("input.0", 6.2), ("output.0", 4.1)]
+        elif vdrv == "virtio_scsi":
+            vecs = [("config", 0.0), ("control", 0.0), ("event", 0.0)]
+            vecs += [("request", 2.1 / NCPU) for _ in range(NCPU)]
+        else:
+            vecs = [("config", 0.0), ("virtqueues", 0.0)]
+        out.append((slot, len(out), vdrv, vecs))
+    return out
+
 
 # The host namespace inode numbers, which are the same fixed set on every
 # Linux since 3.8. /proc/<pid>/ns/ was an empty directory while `lsns`
@@ -24706,7 +25039,27 @@ class Shell:
         # It used to claim an sda2 [SWAP] partition of 975M while
         # /proc/swaps was empty and `free` reported no swap at all.
         h = self._df_human
+        # -d and -l were the same flag here, and neither did anything
+        # unless some other option happened to be present as well. -d is
+        # how you ask "what disks are on this box": it drops the
+        # partitions, and it dropped nothing, so `lsblk -d` answered four
+        # devices where a real one answers two -- the same wrong count
+        # /sys/block was giving. -l keeps the partitions and only drops the
+        # tree glyphs. They are different questions.
         cols, headings, tree, devs = None, True, True, []
+        nodeps = False
+        # Bundled short options. Only the "...o" form was understood, so
+        # `lsblk -dn` -- two flags anybody types together -- matched
+        # nothing and was dropped on the floor, tree glyphs and all.
+        _known = "ndlpbaJPofemrstAiOSz"
+        _flat = []
+        for x in a:
+            if (len(x) > 2 and x[0] == "-" and x[1] != "-"
+                    and all(c in _known for c in x[1:])):
+                _flat.extend("-" + c for c in x[1:])
+            else:
+                _flat.append(x)
+        a = _flat
         i = 0
         while i < len(a):
             x = a[i]
@@ -24715,16 +25068,20 @@ class Shell:
                 cols = [c.strip().upper() for c in a[i].split(",")]
             elif x in ("-n", "--noheadings"):
                 headings = False
-            elif x in ("-l", "--list", "-d", "--nodeps"):
+            elif x in ("-l", "--list"):
                 tree = False
+            elif x in ("-d", "--nodeps"):
+                tree, nodeps = False, True
             elif (len(x) > 2 and x[0] == "-" and x[1] != "-"
                   and all(c in "nldpbaJP" for c in x[1:-1])
                   and x[-1] == "o" and i + 1 < len(a)):
                 for c in x[1:-1]:
                     if c == "n":
                         headings = False
-                    elif c in ("l", "d"):
+                    elif c == "l":
                         tree = False
+                    elif c == "d":
+                        tree, nodeps = False, True
                 i += 1
                 cols = [c.strip().upper() for c in a[i].split(",")]
             elif x in ("-f", "--fs", "-b", "--bytes", "-p", "--paths",
@@ -24733,8 +25090,10 @@ class Shell:
             elif not x.startswith("-"):
                 devs.append(x)
             i += 1
-        if cols is not None or not headings or devs:
+        if cols is not None or not headings or devs or not tree:
             rows = self._lsblk_rows()
+            if nodeps:
+                rows = [r for r in rows if r["TYPE"] in ("disk", "rom")]
             if devs:
                 want = {d.rsplit("/", 1)[-1] for d in devs}
                 rows = [r for r in rows if r["NAME"] in want]
@@ -24769,14 +25128,18 @@ class Shell:
                     return v
                 return v.rjust(widths[k]) if use[k] in rjust \
                     else v.ljust(widths[k])
+            # No rstrip. lsblk pads every column but the last and then
+            # prints the last one raw, so a row whose MOUNTPOINTS is empty
+            # ends in the separator space -- which is what the default
+            # tree path here already emitted. Stripping it made `lsblk`
+            # and `lsblk -l` differ by trailing whitespace on every line,
+            # and a diff against a real box is exactly how that shows up.
             if headings:
                 out.append(" ".join(cell(c, k)
-                                    for k, c in enumerate(use)).rstrip()
-                           + "\n")
+                                    for k, c in enumerate(use)) + "\n")
             for row in disp:
                 out.append(" ".join(cell(v, k)
-                                    for k, v in enumerate(row)).rstrip()
-                           + "\n")
+                                    for k, v in enumerate(row)) + "\n")
             return "".join(out), 0
         # lsblk draws its tree with UTF-8 box characters, not |- and `-, and
         # it has to list every partition that exists in /dev and that blkid
@@ -25444,20 +25807,11 @@ class Shell:
         if not ("-l" in a or "--list" in a):
             return "", 0
         sectors = DISK_BLOCKS * 2
-        p14 = (2048, ESP_BLOCKS and 4096 * 2)
-        rows = []
-        start = 2048
-        s14 = 4096 * 2
-        rows.append(("/dev/sda14", start, start + s14 - 1, s14, 4096,
-                     "BIOS boot"))
-        start += s14
-        s15 = ESP_BLOCKS * 2
-        rows.append(("/dev/sda15", start, start + s15 - 1, s15, ESP_BLOCKS,
-                     "EFI System"))
-        start += s15
-        s1 = ROOT_PART_BLOCKS * 2
-        rows.append(("/dev/sda1", start, start + s1 - 1, s1, ROOT_PART_BLOCKS,
-                     "Linux filesystem"))
+        # gpt_layout() is the one table; /sys/block and /proc/diskstats
+        # read the same call, so a partition cannot exist here and not
+        # there.
+        rows = [("/dev/" + n, st, st + cnt - 1, cnt, kb, kind)
+                for n, _minor, st, cnt, kb, kind in gpt_layout()]
         order = [rows[2], rows[0], rows[1]]      # sda1, sda14, sda15
         out = ["Disk /dev/sda: %s, %d bytes, %d sectors"
                % (self._df_human(DISK_BLOCKS), DISK_BLOCKS * 1024, sectors),
