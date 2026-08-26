@@ -14577,6 +14577,9 @@ class Shell:
         _hd = re.search(r"\x00HD(\d+)\x00", text)
         if _hd:
             text = (text[:_hd.start()] + " " + text[_hd.end():]).strip()
+        # Kept for the `VAR=value cmd 2>&1` case below, which has to hand the
+        # redirections on to the frame that actually runs the command.
+        _text_with_redir = text
         # redirection. Order matters: 2>&1 means "stderr joins stdout".
         text, err_to_out, err_devnull, out_devnull, redir, mode, stdin_file, \
             err_file, err_mode, out_to_err, err_to_term = \
@@ -14844,19 +14847,71 @@ class Shell:
                 return ""
             if n_assign:
                 # Prefix form: in effect for this command only.
+                #
+                # The command runs in a recursive frame, and the
+                # redirections were stripped from `text` *before* we got
+                # here -- so `rest` carried none of them and the frame that
+                # ran the command had nowhere to send its stderr. This frame
+                # then returned that frame's value directly, skipping the
+                # epilogue that would have folded it. The error was produced
+                # and thrown away:
+                #
+                #     ls /nosuchdir 2>&1            the error
+                #     FOO=1 ls /nosuchdir 2>&1      nothing
+                #     FOO=1 ls /nosuchdir 2>/tmp/b  an empty file
+                #
+                # Real bash reports it in all three. The shape is everywhere:
+                # `DEBIAN_FRONTEND=noninteractive apt-get install -y x 2>&1`,
+                # `LC_ALL=C sort ... 2>&1`, and the recon payload that wraps
+                # its whole probe in `$( ( export LANG=C LC_ALL=C; ... ) 2>&1 )`
+                # and then reads the result.
+                #
+                # So hand the *unstripped* tail down instead, and let that
+                # frame parse its own redirections the way any other command
+                # does. Re-walking the assignment words through the original
+                # text rather than reusing `pos`, because that offset was
+                # measured against the stripped copy.
+                _rest = rest
+                _p = 0
+                for w in words[:n_assign]:
+                    while _p < len(_text_with_redir) \
+                            and _text_with_redir[_p].isspace():
+                        _p += 1
+                    if not _text_with_redir.startswith(w, _p):
+                        _p = -1
+                        break
+                    _p += len(w)
+                if _p >= 0:
+                    _cand = _text_with_redir[_p:].strip()
+                    # Only if it really is the same command with more on the
+                    # end; a mismatch means the two texts diverged and the
+                    # stripped one is the safer answer.
+                    if _cand.startswith(rest) or rest.startswith(_cand):
+                        _rest = _cand
                 saved = []
                 for w in words[:n_assign]:
                     nm = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)', w).group(1)
-                    saved.append((nm, self.vars.get(nm)))
+                    saved.append((nm, self.vars.get(nm),
+                                  nm in self.exported))
                     _apply(w)
+                    # A prefix assignment goes into the *command's
+                    # environment*; that is the whole point of the form.
+                    # It only set the shell variable, so `FOO=bar env` and
+                    # `FOO=bar printenv FOO` both printed nothing, and
+                    # `LD_PRELOAD=x cmd` set something no child could see.
+                    # A plain `FOO=bar` on its own line still does not
+                    # export, which is the difference bash draws too.
+                    self.exported.add(nm)
                 try:
-                    return self._run_simple_inner(rest, stdin)
+                    return self._run_simple_inner(_rest, stdin)
                 finally:
-                    for nm, old_val in saved:
+                    for nm, old_val, was_exported in saved:
                         if old_val is None:
                             self.vars.pop(nm, None)
                         else:
                             self.vars[nm] = old_val
+                        if not was_exported:
+                            self.exported.discard(nm)
 
         text = self._brace_expand(text)
         words = split_words(text)

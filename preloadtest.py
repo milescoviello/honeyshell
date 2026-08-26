@@ -141,37 +141,27 @@ def main():
     check("...and named as the preload mechanism",
           any(e.get("kind") == "ld_preload" for e in kinds), True)
 
-    # -- tripwire: a prefix assignment loses redirected stderr --------------
-    # Found while measuring the LD_PRELOAD case and NOT fixed here, because
-    # it is not about preloading at all. `VAR=value cmd 2>&1` runs the
-    # command in a recursive frame after the outer one has already stripped
-    # the redirections, and the outer returns that frame's value directly --
-    # skipping the epilogue that would fold stderr into stdout. So the
-    # error is produced and then thrown away:
-    #
-    #     ls /nosuchdir 2>&1          -> "ls: cannot access ..."   (right)
-    #     FOO=1 ls /nosuchdir 2>&1    -> ""                        (wrong)
-    #     FOO=1 ls /nosuchdir 2>/tmp/b -> the file is empty
-    #
-    # Real bash prints the error in all three. This matters well beyond
-    # preloading: `DEBIAN_FRONTEND=noninteractive apt-get install -y x 2>&1`
-    # and `LC_ALL=C sort ... 2>&1` are both this shape, and today's most
-    # common recon payload wraps its whole probe in
-    # `$( ( export LANG=C LC_ALL=C; ... ) 2>&1 )`. Fixing it means
-    # restructuring where the command runner applies assignments relative to
-    # redirections, which is its own sweep. Asserted here so it cannot
-    # change unnoticed -- if this fails, either it was fixed (good, update
-    # this) or something else moved.
+    # -- the prefix form, which used to lose all of this ---------------------
+    # Was a tripwire here for one sweep. `VAR=value cmd 2>&1` ran the command
+    # in a recursive frame after redirections had already been stripped, and
+    # returned that frame's value directly -- so the error was produced and
+    # thrown away. Fixed in the sweep after this suite was written; the
+    # checks stay here because this is where the measurement was taken.
     fs, sh = box()
     check("plain redirection works",
           "No such file or directory" in sh.run("ls /nosuchdir 2>&1"), True)
-    check("KNOWN GAP: a prefix assignment loses redirected stderr",
-          sh.run("FOO=1 ls /nosuchdir 2>&1"), "")
+    check("a prefix assignment keeps redirected stderr",
+          sh.run("FOO=1 ls /nosuchdir 2>&1"),
+          sh.run("ls /nosuchdir 2>&1"))
     check("...including to a file",
-          sh.run("FOO=1 ls /nosuchdir 2>/tmp/b; cat /tmp/b"), "")
-    check("...and the same for LD_PRELOAD's own message",
-          sh.run("LD_PRELOAD=/opt/x.so id 2>&1"),
-          "uid=0(root) gid=0(root) groups=0(root)\n")
+          "No such file or directory" in
+          sh.run("FOO=1 ls /nosuchdir 2>/tmp/b; cat /tmp/b"), True)
+    check("...and LD_PRELOAD's own message reaches the redirect",
+          sh.run("LD_PRELOAD=/opt/x.so id 2>&1").splitlines()[0],
+          MSG % ("/opt/x.so", "LD_PRELOAD"))
+    check("...for several assignments at once",
+          "No such file or directory" in
+          sh.run("A=1 B=2 ls /nosuchdir 2>&1"), True)
 
     for name, got, want in FAILS:
         print("  FAIL %-58s got %r want %r" % (name, got, want))

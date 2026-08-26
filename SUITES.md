@@ -107,6 +107,7 @@ Run all:  `./run-suites.sh`
 - `pkgdbtest.py` -- What is installed here, and does the database agree with the tools?
 - `pkgtest.py` -- Does dpkg agree with the filesystem about what it installed?
 - `pkgverifytest.py` -- The package database and the filesystem: does anything reconcile them?
+- `prefixenvtest.py` -- VAR=value cmd -- what the command is actually given, and where its errors go.
 - `preloadtest.py` -- What the dynamic loader says before a command runs.
 - `probesuite.py` -- Honeypot-detection probe suite.
 - `procselftest.py` -- What a launched process inherits, and whether the shell survives it.
