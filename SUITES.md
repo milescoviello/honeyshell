@@ -172,6 +172,7 @@ Run all:  `./run-suites.sh`
 - `sudotest.py` -- What does sudo tell someone probing what they can do?
 - `swaptest.py` -- The disk and the swap: two commands describing another machine.
 - `sysctltest.py` -- Does sysctl agree with /proc/sys?
+- `syslogtest.py` -- A message goes where the box's own rsyslog config says it goes.
 - `systemdtest.py` -- Does systemd agree with itself about what starts at boot?
 - `tampertest.py` -- Can an attacker actually replace the system binaries, and do we parse
 - `termtest.py` -- Does the box agree with itself about how big the terminal is?

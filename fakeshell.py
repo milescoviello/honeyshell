@@ -28224,6 +28224,104 @@ class Shell:
             return "%dh ago" % (d // 3600)
         return "%d days ago" % (d // 86400)
 
+    #: syslog priorities, lowest number is most severe.
+    _SYSLOG_PRI = ("emerg", "alert", "crit", "err", "warning", "notice",
+                   "info", "debug")
+    _SYSLOG_PRI_ALIAS = {"panic": "emerg", "error": "err", "warn": "warning"}
+
+    def _rsyslog_rules(self):
+        """(selector, path) for every file rule, from the box's own config.
+
+        /etc/rsyslog.conf and everything its $IncludeConfig pulls in. Read
+        rather than restated, so editing the config changes where messages
+        go -- which is the only reason the file is on the box.
+        """
+        texts = []
+        for path in ("/etc/rsyslog.conf",):
+            body = (self.fs.read(path) or b"").decode("utf-8", "replace")
+            texts.append(body)
+            m = re.search(r"^\$IncludeConfig\s+(\S+)", body, re.M)
+            if m:
+                base = m.group(1).rsplit("/", 1)[0]
+                for name in sorted(self.fs.listdir(base) or []):
+                    if name.endswith(".conf"):
+                        texts.append((self.fs.read(base + "/" + name)
+                                      or b"").decode("utf-8", "replace"))
+        rules = []
+        for body in texts:
+            for raw in body.splitlines():
+                ln = raw.strip()
+                if not ln or ln.startswith(("#", "$", "module", "global")):
+                    continue
+                parts = ln.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                sel, dest = parts[0], parts[1].strip()
+                # A leading dash means "do not fsync", not part of the path.
+                dest = dest.lstrip("-")
+                if not dest.startswith("/"):
+                    continue
+                rules.append((sel, dest))
+        return rules
+
+    def _syslog_targets(self, prio):
+        """Which files a message of this facility.priority is written to.
+
+        A message can land in more than one -- measured with a real
+        rsyslog: a mail.err goes to both /var/log/syslog and
+        /var/log/mail.log.
+        """
+        fac, _, sev = (prio or "user.notice").partition(".")
+        fac = fac.lower() or "user"
+        sev = self._SYSLOG_PRI_ALIAS.get(sev.lower(), sev.lower()) or "notice"
+        try:
+            level = self._SYSLOG_PRI.index(sev)
+        except ValueError:
+            level = self._SYSLOG_PRI.index("notice")
+        out = []
+        for sel, dest in self._rsyslog_rules():
+            if self._selector_matches(sel, fac, level) and dest not in out:
+                out.append(dest)
+        return out or ["/var/log/syslog"]
+
+    def _selector_matches(self, selector, fac, level):
+        """rsyslog's selector grammar, as far as this box's config uses it.
+
+        Semicolon-separated clauses, each `facilities.priority`, applied in
+        order: a later clause can turn an earlier match off. `none` is the
+        off switch, which is how `*.*;auth,authpriv.none` means "everything
+        except auth".
+        """
+        hit = False
+        for clause in selector.split(";"):
+            clause = clause.strip()
+            if not clause or "." not in clause:
+                continue
+            facs, _, pri = clause.rpartition(".")
+            names = [f.strip().lower() for f in facs.split(",") if f.strip()]
+            if not any(n in ("*", fac) for n in names):
+                continue
+            pri = pri.strip().lower()
+            if pri == "none":
+                hit = False
+                continue
+            if pri == "*":
+                hit = True
+                continue
+            # A bare priority means "this severity and everything more
+            # severe", which is a *lower* index.
+            neg = pri.startswith("!")
+            eq = pri.startswith("=") or pri.startswith("!=")
+            want = pri.lstrip("!=")
+            try:
+                idx = self._SYSLOG_PRI.index(
+                    self._SYSLOG_PRI_ALIAS.get(want, want))
+            except ValueError:
+                continue
+            ok = (level == idx) if eq else (level <= idx)
+            hit = (not ok) if neg else ok
+        return hit
+
     def cmd_logger(self, a, stdin=""):
         """`logger hello; tail -1 /var/log/syslog` showed the line before it.
 
@@ -28261,7 +28359,16 @@ class Shell:
             return "", 0
         line = "%s %s %s: %s\n" % (self.fs._logstamp(time.time()),
                                     self.fs.hostname, tag, text)
-        for path in ("/var/log/syslog", "/var/log/messages"):
+        # Where it lands is decided by the box's own rsyslog config, not by
+        # a fixed pair of paths. Every message went to /var/log/syslog
+        # whatever its facility -- including auth and authpriv, which the
+        # config on this box excludes from that file by name
+        # (`*.*;auth,authpriv.none`) and sends to /var/log/auth.log
+        # instead. So `cat /etc/rsyslog.conf` and `logger -p auth.info x;
+        # tail /var/log/auth.log` disagreed in three ways at once: auth in
+        # the wrong file, absent from the right one, and kern never
+        # reaching kern.log.
+        for path in self._syslog_targets(prio):
             cur = self.fs.read(path)
             if cur is None:
                 continue
