@@ -7263,6 +7263,251 @@ class VFS:
             return None
         return COMM_UNITS.get(comm, comm) + ".service"
 
+    #: Where the pieces of an mmap'd ELF end up, as fractions of the file.
+    #: Measured against libc.so.6 on the guest -- 1,995,216 bytes mapped as
+    #: 160K r--p, 1420K r-xp, 344K r--p, 16K r--p, 8K rw-p -- and checked
+    #: against bash, whose five segments come out at the same shape. The
+    #: last two are the relro page and the writable data page, and they are
+    #: one or two pages whatever the file size is.
+    _ELF_SEGMENTS = ((0.082, "r--p"), (0.729, "r-xp"), (0.177, "r--p"),
+                     (0.008, "r--p"), (0.004, "rw-p"))
+
+    def _map_inode(self, path):
+        """The inode `stat` gives for this path, or 0 if it is not there.
+
+        The inode column in /proc/<pid>/maps is the same number stat
+        prints. It used to be `pid * 13 % 800000` for the binary and a
+        literal 700123 for libc, so `stat -c %i` on the mapped file and the
+        map of it disagreed -- and the same library came back with a
+        different inode in every process.
+        """
+        node = self.nodes.get(path) or self.nodes.get(self.resolve(path))
+        # ino_of, not node.ino: the 949 nodes seed_binaries creates are
+        # numbered on demand, so reading the attribute directly gave 0 for
+        # every binary nobody had stat'd yet -- and 0 in the inode column
+        # is how the kernel spells "this is not a file".
+        return self.ino_of(node)
+
+    def proc_map_lines(self, pid, exe, total_kb=None, rss_kb=None):
+        """The address space of a process, built from the binary it runs.
+
+        This was six literal lines: three for whatever binary was in the
+        command line, one for libc, a [stack], and a [vsyscall] that this
+        kernel does not have. So every process on the box had an identical
+        address space, mapped exactly one library whatever it linked
+        against, and had no [heap] and no loader -- on a box where
+        /proc/<pid>/maps is what an exploit reads to find where anything
+        is, and where a bash with no heap is not a bash.
+
+        Built from lib_deps() now, which is the table ldd reads, so the
+        libraries a binary links against are the libraries its process
+        maps. Addresses are per-pid and stable within a session: two reads
+        of one process's maps have to agree, and two different processes
+        have to differ.
+
+        Returns (prefix, name) pairs, where prefix is everything up to the
+        path column and name is the mapping's name or "".
+        """
+        page = 4096
+        rnd = random.Random((pid * 2654435761) ^ (int(BOOT_TS) & 0xffffffff))
+        rows = []
+
+        def add(size, perms, offset, path, label=None):
+            nonlocal cursor
+            size = max(page, (size + page - 1) // page * page)
+            start, end = cursor, cursor + size
+            cursor = end
+            ino = self._map_inode(path) if path else 0
+            dev = "08:01" if ino else "00:00"
+            name = label if label is not None else (path or "")
+            # The kernel pads the fields out to a fixed width and then
+            # prints the name, so the path column always starts at 74. An
+            # anonymous mapping has no name and keeps a single separating
+            # space, which is what a parser splitting on whitespace sees as
+            # a five-field line rather than six.
+            head = ("%012x-%012x %s %08x %s %d"
+                    % (start, end, perms, offset, dev, ino))
+            rows.append((head.ljust(72) if name else head, name))
+            return start, end
+
+        def elf(path, label=None):
+            node = self.nodes.get(path) or self.nodes.get(self.resolve(path))
+            total = node_size(node, path) if node is not None else 1 << 20
+            off = 0
+            for frac, perms in self._ELF_SEGMENTS:
+                sz = max(page, int(total * frac) // page * page)
+                add(sz, perms, off, path, label)
+                off += sz
+
+        # Through the symlinks first. /proc/1/maps on the guest names
+        # /usr/lib/systemd/systemd, not the /sbin/init that argv[0] says,
+        # because what gets mapped is the file the link lands on -- and a
+        # mapping of a path that is not a file gets inode 0 and dev 00:00,
+        # which is what an anonymous mapping looks like. A named file
+        # mapping with no inode is a contradiction in one line.
+        exe = self.resolve(exe) if self.exists(exe) else exe
+        # The main binary, then the heap immediately behind it, which is
+        # where brk puts it.
+        cursor = 0x550000000000 + (rnd.getrandbits(24) << 12)
+        elf(exe)
+        cursor += rnd.getrandbits(10) << 12
+        add(44 * 1024, "rw-p", 0, None, "")
+        add(132 * 1024, "rw-p", 0, None, "[heap]")
+
+        cursor = 0x7f0000000000 + (rnd.getrandbits(24) << 12)
+        add(264 * 1024, "rw-p", 0, None, "")
+        # The locale a C.utf8 process opens. Every one of these is a real
+        # file here, which is the point: a mapping naming a path that does
+        # not exist is a mapping nobody made.
+        locale = "/usr/lib/locale/C.utf8/"
+        for lc, kb in (("LC_CTYPE", 360), ("LC_NUMERIC", 4), ("LC_TIME", 4),
+                       ("LC_COLLATE", 4), ("LC_MONETARY", 4),
+                       ("LC_MESSAGES", 4), ("LC_PAPER", 4), ("LC_NAME", 4),
+                       ("LC_ADDRESS", 4)):
+            if self.exists(locale + lc):
+                add(kb * 1024, "r--p", 0, locale + lc)
+        add(12 * 1024, "rw-p", 0, None, "")
+        for so in lib_deps(os.path.basename(exe)) or ("libc.so.6",):
+            lp = lib_path(so)
+            if lp:
+                # The kernel records the path the dentry is at, not the one
+                # ld.so was handed. Measured on the guest: ldd says
+                # /lib/x86_64-linux-gnu/libc.so.6 and /proc/self/maps says
+                # /usr/lib/x86_64-linux-gnu/libc.so.6, for the same file --
+                # /lib is a symlink and only one of the two follows it.
+                elf(self.resolve(lp) if self.exists(lp) else lp)
+                add(rnd.choice((4, 8, 12)) * 1024, "rw-p", 0, None, "")
+        for lc, kb in (("LC_TELEPHONE", 4), ("LC_MEASUREMENT", 4),
+                       ("LC_IDENTIFICATION", 4)):
+            if self.exists(locale + lc):
+                add(kb * 1024, "r--p", 0, locale + lc)
+        add(8 * 1024, "rw-p", 0, None, "")
+        add(16 * 1024, "r--p", 0, None, "[vvar]")
+        add(8 * 1024, "r-xp", 0, None, "[vdso]")
+        elf("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2")
+        add(page, "rw-p", 0, None, "")
+        # The stack is the top of the address space, not next in line.
+        cursor = 0x7ffc00000000 + (rnd.getrandbits(21) << 12)
+        add(132 * 1024, "rw-p", 0, None, "[stack]")
+        # The total has to be the process's VmSize, because on a real box
+        # they are the same sum of the same VMA list. Measured on the
+        # guest: pmap's total, VmSize, statm[0]*4, the Size column of
+        # smaps and ps VSZ all read 4488 kB for one shell. Here the maps
+        # were an independent story, so pmap totalled 4692K next to a
+        # VmSize of 9284 kB -- six readers of one number and two answers.
+        #
+        # The heap absorbs the difference, which is what actually varies
+        # between two processes running the same binary.
+        if total_kb:
+            have = sum((int(r[0].split()[0].split("-")[1], 16)
+                        - int(r[0].split()[0].split("-")[0], 16))
+                       for r in rows) // 1024
+            slack = total_kb - have
+            for i, (prefix, name) in enumerate(rows):
+                if name != "[heap]":
+                    continue
+                lo, hi = (int(x, 16) for x in prefix.split()[0].split("-"))
+                new_end = hi + slack * 1024
+                if new_end <= lo:
+                    break
+                head = "%012x-%012x %s" % (lo, new_end,
+                                           prefix.split(None, 1)[1])
+                rows[i] = (head.ljust(72), name)
+                break
+        return rows
+
+    def proc_map_rss(self, pid, rows, rss_kb):
+        """Per-mapping resident size, summing to the process's VmRSS.
+
+        smaps and `pmap -x` each drew their own numbers, so the Rss column
+        of one and the RSS column of the other described different
+        processes -- and neither added up to the VmRSS two files away. One
+        draw, scaled once, used by both.
+        """
+        rnd = random.Random((pid ^ 0x5EED) & 0xffffffff)
+        sizes, raw = [], []
+        for prefix, _name in rows:
+            lo, hi = (int(x, 16) for x in prefix.split()[0].split("-"))
+            kb = (hi - lo) // 1024
+            sizes.append(kb)
+            raw.append(kb if kb <= 8 else int(kb * rnd.uniform(0.35, 1.0)))
+        if not rss_kb or not sum(raw):
+            return raw
+        # Scale to the target in whole pages, then put the rounding
+        # remainder on the largest mapping so the column sums exactly.
+        scale = float(rss_kb) / sum(raw)
+        out = [min(sizes[i], max(0, int(v * scale) // 4 * 4))
+               for i, v in enumerate(raw)]
+        gap = rss_kb - sum(out)
+        if gap:
+            room = sorted(range(len(out)),
+                          key=lambda i: sizes[i] - out[i], reverse=True)
+            for i in room:
+                take = max(-out[i], min(gap, sizes[i] - out[i]))
+                out[i] += take
+                gap -= take
+                if not gap:
+                    break
+        return out
+
+    def proc_smaps(self, pid, rows, rss_kb, rollup=False):
+        """smaps: every mapping again, with a block of counters under it.
+
+        `cat /proc/self/smaps` returned nothing at all, on a box that lists
+        the file in /proc/<pid> and whose smaps_rollup anything measuring
+        its own footprint reads. Fields and order are the guest's, and the
+        Rss column comes from proc_map_rss so it sums to the VmRSS in the
+        status file rather than being a second guess at it.
+        """
+        per = self.proc_map_rss(pid, rows, rss_kb)
+        if rollup:
+            lo = min(int(r[0].split()[0].split("-")[0], 16) for r in rows)
+            hi = max(int(r[0].split()[0].split("-")[1], 16) for r in rows)
+            head = "%012x-%012x ---p 00000000 00:00 0" % (lo, hi)
+            out = [head.ljust(72) + " [rollup]\n"]
+            tot = sum(per)
+            dirty = sum(v for v, (pfx, _n) in zip(per, rows)
+                        if pfx.split()[1].startswith("rw"))
+            for key, val in (("Rss", tot), ("Pss", tot),
+                             ("Pss_Dirty", dirty), ("Pss_Anon", dirty),
+                             ("Pss_File", tot - dirty), ("Pss_Shmem", 0),
+                             ("Shared_Clean", 0), ("Shared_Dirty", 0),
+                             ("Private_Clean", tot - dirty),
+                             ("Private_Dirty", dirty), ("Referenced", tot),
+                             ("Anonymous", dirty), ("KSM", 0),
+                             ("LazyFree", 0), ("AnonHugePages", 0),
+                             ("ShmemPmdMapped", 0), ("FilePmdMapped", 0),
+                             ("Shared_Hugetlb", 0), ("Private_Hugetlb", 0),
+                             ("Swap", 0), ("SwapPss", 0), ("Locked", 0)):
+                out.append("%-16s%7d kB\n" % (key + ":", val))
+            return "".join(out)
+        out = []
+        for (prefix, name), rss in zip(rows, per):
+            out.append("%s %s\n" % (prefix, name) if name
+                       else "%s \n" % prefix)
+            lo, hi = prefix.split()[0].split("-")
+            size = (int(hi, 16) - int(lo, 16)) // 1024
+            perms = prefix.split()[1]
+            anon = "00:00" in prefix
+            dirty = rss if (anon or perms.startswith("rw")) else 0
+            for key, val in (("Size", size), ("KernelPageSize", 4),
+                             ("MMUPageSize", 4), ("Rss", rss), ("Pss", rss),
+                             ("Pss_Dirty", dirty), ("Shared_Clean", 0),
+                             ("Shared_Dirty", 0),
+                             ("Private_Clean", rss - dirty),
+                             ("Private_Dirty", dirty), ("Referenced", rss),
+                             ("Anonymous", rss if anon else 0), ("KSM", 0),
+                             ("LazyFree", 0), ("AnonHugePages", 0),
+                             ("ShmemPmdMapped", 0), ("FilePmdMapped", 0),
+                             ("Shared_Hugetlb", 0), ("Private_Hugetlb", 0),
+                             ("Swap", 0), ("SwapPss", 0), ("Locked", 0)):
+                out.append("%-16s%7d kB\n" % (key + ":", val))
+            out.append("THPeligible:    0\n")
+            out.append("VmFlags: %s\n"
+                       % ("rd wr mr mw me ac" if perms.startswith("rw")
+                          else "rd ex mr mw me ac"))
+        return "".join(out)
+
     def _proc_dynamic(self, path):
         """Live contents for a per-PID file. Counters have to move between two
         reads; a frozen /proc/<pid>/stat is as good as a confession."""
@@ -7532,22 +7777,20 @@ class VFS:
                     ("system.slice/" + unit) if unit else
                     session_scope_path(uid, _anchor or pid))
             return ("0::/%s\n" % path).encode()
-        if what == "maps":
+        if what in ("maps", "smaps", "smaps_rollup"):
             exe = cmd.lstrip("-").split()[0] if cmd.strip() else "/bin/false"
             if not exe.startswith("/"):
                 exe = "/usr/bin/" + os.path.basename(exe)
-            return (
-                "55a1c0000000-55a1c0020000 r--p 00000000 08:01 %-9d %s\n"
-                "55a1c0020000-55a1c00d0000 r-xp 00020000 08:01 %-9d %s\n"
-                "55a1c00d0000-55a1c0110000 r--p 000d0000 08:01 %-9d %s\n"
-                "7f9a40000000-7f9a40028000 r--p 00000000 08:01 %-9d "
-                "/usr/lib/x86_64-linux-gnu/libc.so.6\n"
-                "7ffd20000000-7ffd20021000 rw-p 00000000 00:00 0"
-                "         [stack]\n"
-                "ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0"
-                "                  [vsyscall]\n"
-                % (pid * 13 % 800000, exe, pid * 13 % 800000, exe,
-                   pid * 13 % 800000, exe, 700123)).encode()
+            # vsz and rss are the same numbers ps, top, statm and the
+            # status file report, so the address space adds up to what
+            # every other reader on the box says this process is.
+            rows = self.proc_map_lines(pid, exe, total_kb=vsz)
+            if what == "maps":
+                return "".join(
+                    "%s %s\n" % (r[0], r[1]) if r[1] else "%s \n" % r[0]
+                    for r in rows).encode()
+            return self.proc_smaps(pid, rows, rss,
+                                   rollup=(what == "smaps_rollup")).encode()
         if what == "mounts":
             return self._dynamic("/proc/mounts") or self.read_raw(
                 "/proc/mounts")
@@ -25037,12 +25280,110 @@ class Shell:
         return "".join(out), 0
 
     def cmd_pmap(self, a, stdin=""):
-        if not a or not a[-1].isdigit():
+        """pmap reads /proc/<pid>/maps. It was three literal lines.
+
+        `pmap 1` said pid 1 was running /bin/bash, on a box where `ps -p 1`
+        says systemd and /proc/1/comm says systemd -- two commands about
+        one process, and pmap's answer was the one that cannot be true. It
+        also printed the same two mappings and the same 8452K total for
+        every pid, ignored -x entirely, and its addresses did not match the
+        maps file it is supposed to be summarising.
+
+        Measured on the guest:
+
+            pmap $$      <pid>:   <cmdline>
+                         0000562aafa2b000    188K r---- bash
+                         0000562aafb68000     44K rw---   [ anon ]
+                          total             4488K
+            pmap -x      Address  Kbytes  RSS  Dirty Mode  Mapping
+                         a dashed rule, then "total kB" with three columns
+            pmap 1       1:   /sbin/init
+            pmap 2       2:   [kthreadd]  and a total of 0K
+
+        Note the mode column is five characters with a trailing dash where
+        maps has p or s: r---- for r--p, and rw--- for rw-p.
+        """
+        want_x = any(x in ("-x", "--extended") for x in a)
+        pids = [x for x in a if x.isdigit()]
+        if not pids:
+            self.err("pmap: bad argument")
             return "", 1
-        return ("%s:   %s\n"
-                "0000560a1c000000    148K r-x-- bash\n"
-                "00007f2b1c000000   1804K r-x-- libc.so.6\n"
-                " total             8452K\n" % (a[-1], "/bin/bash")), 0
+        out, rc = [], 0
+        for spid in pids:
+            pid = int(spid)
+            meta = self._pmap_ident(pid)
+            if meta is None:
+                # Measured: pmap prints nothing at all for a pid that is
+                # not there and exits 42. Not 1, and not a message.
+                rc = 42
+                continue
+            title, exe, kernel = meta
+            out.append("%d:   %s\n" % (pid, title))
+            if kernel:
+                # A kernel thread has no address space at all. The header
+                # is its comm in brackets and the total is zero.
+                out.append(" total %16dK\n" % 0 if not want_x else
+                           "total kB %15s %7s %7s\n" % ("0", "0", "0"))
+                continue
+            # The same vsz/rss ps and /proc/<pid>/status report, so pmap's
+            # total is the process's VmSize rather than a third opinion.
+            prow = [r for r in self._all_procs() if r[1] == pid]
+            vsz = prow[0][4] if prow else 0
+            rss_target = prow[0][5] if prow else 0
+            maps = self.fs.proc_map_lines(pid, exe, total_kb=vsz)
+            per_rss = self.fs.proc_map_rss(pid, maps, rss_target)
+            rows, tot, rss_t, dirty_t = [], 0, 0, 0
+            for (prefix, name), rss in zip(maps, per_rss):
+                lo, hi = prefix.split()[0].split("-")
+                kb = (int(hi, 16) - int(lo, 16)) // 1024
+                perms = prefix.split()[1]
+                # r--p becomes r----, rw-p becomes rw---: pmap drops the
+                # private/shared flag and pads to five.
+                mode = perms[:3].replace("-", "-") + "--"
+                if perms.endswith("s"):
+                    mode = perms[:3] + "s-"
+                label = ("  [ %s ]" % name.strip("[]")) if name.startswith(
+                    "[") else (name.rsplit("/", 1)[-1] if name
+                               else "  [ anon ]")
+                dirty = rss if perms.startswith("rw") else 0
+                rows.append((int(lo, 16), kb, rss, dirty, mode, label))
+                tot += kb
+                rss_t += rss
+                dirty_t += dirty
+            if want_x:
+                out.append("Address           Kbytes     RSS   Dirty Mode  "
+                           "Mapping\n")
+                for start, kb, rss, dirty, mode, label in rows:
+                    out.append("%016x %7d %7d %7d %-5s %s\n"
+                               % (start, kb, rss, dirty, mode, label))
+                out.append("---------------- ------- ------- ------- \n")
+                out.append("total kB %15d %7d %7d\n"
+                           % (tot, rss_t, dirty_t))
+            else:
+                for start, kb, _rss, _dirty, mode, label in rows:
+                    out.append("%016x %6dK %s %s\n"
+                               % (start, kb, mode, label))
+                out.append(" total %16dK\n" % tot)
+        return "".join(out), rc
+
+    def _pmap_ident(self, pid):
+        """(title, exe, is_kernel_thread) for a pid, or None if it is gone.
+
+        The title is what pmap puts after the colon, and it is the same
+        string ps shows in ARGS -- asking the process table rather than
+        printing /bin/bash, which is how pmap came to disagree with ps
+        about pid 1.
+        """
+        rows = [r for r in self._all_procs() if r[1] == pid]
+        if not rows:
+            return None
+        args = (rows[0][10] or "").strip()
+        if args.startswith("[") and args.endswith("]"):
+            return args, "", True
+        exe = args.split()[0] if args else "/bin/false"
+        if not exe.startswith("/"):
+            exe = "/usr/bin/" + os.path.basename(exe.lstrip("-"))
+        return (args or exe), exe, False
 
     def cmd_nice(self, a, stdin=""):
         """`nice` reports this process's nice, and `nice -n N cmd` sets the

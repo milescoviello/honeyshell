@@ -571,8 +571,14 @@ def _to_num(v):
 
 def _num_str(x):
     """How awk renders a number: integers bare, otherwise CONVFMT (%.6g)."""
-    if x != x or x in (float("inf"), float("-inf")):
-        return {float("inf"): "inf", float("-inf"): "-inf"}.get(x, "nan")
+    # gawk prints these with a sign: "+inf", "-inf", "-nan" -- measured on
+    # debian:trixie with `awk 'BEGIN{x=1e9; x^=100; print x}'`, which is
+    # +inf, not inf. printf "%d" of one prints the same string, not a
+    # number.
+    if x != x:
+        return "-nan"
+    if x in (float("inf"), float("-inf")):
+        return "+inf" if x > 0 else "-inf"
     if x == int(x) and abs(x) < 1e16:
         return str(int(x))
     return "%.6g" % x
@@ -877,8 +883,10 @@ class Interp:
             raise AwkSyntaxError("unhandled statement %r" % (kind,))
 
     def _out_str(self, v):
-        if isinstance(v, float) and v != int(v):
-            return _to_str(v)
+        # This tested `v != int(v)` and then returned _to_str(v) whichever
+        # way it went -- a branch with one outcome, and int() of an
+        # infinity raises OverflowError, so `print x` after an overflowing
+        # `x ^= n` killed awk from inside the print.
         return _to_str(v)
 
     def _emit(self, text, redirect):
@@ -1022,14 +1030,46 @@ class Interp:
         raise AwkSyntaxError("not an lvalue")
 
     def _assign(self, op, target, expr):
+        """Compound assignment, one operator at a time.
+
+        This built a dict of all six results and then indexed it, so every
+        `+=` also evaluated `cur ** rhs`. `awk '{a+=$2}'` over
+        /proc/self/smaps -- a running total against a column of kilobytes --
+        raised OverflowError out of Python and killed the whole command,
+        because 9284 ** 4488 does not fit. Summing a column is the most
+        common thing anybody does with awk.
+        """
         val = self.eval(expr)
-        if op != "=":
-            cur = _to_num(self._lvalue_get(target))
-            rhs = _to_num(val)
-            val = {"+=": cur + rhs, "-=": cur - rhs, "*=": cur * rhs,
-                   "/=": cur / rhs if rhs else float("inf"),
-                   "%=": math.fmod(cur, rhs) if rhs else 0.0,
-                   "^=": cur ** rhs if abs(rhs) < 1024 else float("inf")}[op]
+        if op == "=":
+            self._lvalue_set(target, val)
+            return val
+        cur = _to_num(self._lvalue_get(target))
+        rhs = _to_num(val)
+        if op == "+=":
+            val = cur + rhs
+        elif op == "-=":
+            val = cur - rhs
+        elif op == "*=":
+            val = cur * rhs
+        elif op == "/=":
+            val = cur / rhs if rhs else float("inf")
+        elif op == "%=":
+            val = math.fmod(cur, rhs) if rhs else 0.0
+        elif op == "^=":
+            # Guarded on the magnitude of the *result*, not just the
+            # exponent: 2 ** 1000 is fine and 1e9 ** 100 is not.
+            try:
+                val = cur ** rhs
+            except (OverflowError, ValueError, ZeroDivisionError):
+                # Sign survives the overflow: gawk gives -inf for
+                # (-1e9)^101 and +inf for (1e9)^100, and dropping the sign
+                # turned one into the other.
+                neg = cur < 0 and float(rhs) == int(rhs) and int(rhs) % 2
+                val = float("-inf") if neg else float("inf")
+            if isinstance(val, complex):
+                val = float("nan")
+        else:
+            raise AwkSyntaxError("unknown assignment operator " + op)
         self._lvalue_set(target, val)
         return val
 
@@ -1225,6 +1265,20 @@ def _awk_sprintf(fmt, args):
             pos = m.end()
             continue
         val = nxt()
+        # An infinity or a NaN is not converted: gawk prints "+inf" for
+        # %d, %s and %g alike. We printed 0 for %d -- a finite, wrong,
+        # plausible number where the real one shouts -- and bare "inf"
+        # for %g.
+        _fv = _to_num(val) if conv in "diouxXeEfFgGaA" else None
+        if _fv is not None and (_fv != _fv or _fv in (float("inf"),
+                                                      float("-inf"))):
+            txt = _num_str(_fv)
+            if width:
+                w = int(width)
+                txt = txt.ljust(w) if "-" in flags else txt.rjust(w)
+            out.append(txt)
+            pos = m.end()
+            continue
         try:
             if conv in "di":
                 txt = "%d" % int(_to_num(val))

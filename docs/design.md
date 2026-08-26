@@ -13,7 +13,7 @@ output looks right on its own; it is finished when it agrees with the other
 commands that already knew something about the thing it touched.
 
 That is what the suites test, and it is why there are more lines of test than
-of implementation: 47,813 lines across 177 suites against 41,437 lines of
+of implementation: 48,093 lines across 178 suites against 41,778 lines of
 emulator.
 
 ## One table, many readers

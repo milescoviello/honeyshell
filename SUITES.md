@@ -94,6 +94,7 @@ Run all:  `./run-suites.sh`
 - `loctest.py` -- What encoding is this box in, and which files say so?
 - `logtest.py` -- Do the log surfaces agree with each other and with the rest of the box?
 - `lsargtest.py` -- ls with more than one operand -- order, grouping, and shared columns.
+- `maptest.py` -- A process's address space: six readers, and how big is it really?
 - `memtest.py` -- Four memory sources, four answers.
 - `modetest.py` -- Do the commands that create files agree about what mode to give them?
 - `modtest.py` -- Do the views of "which kernel modules are loaded" agree with each other?
