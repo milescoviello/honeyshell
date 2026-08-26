@@ -12016,7 +12016,8 @@ class Shell:
 
     def __init__(self, vfs=None, log=None, download=None, user="root",
                  peer=None, peer_port=0, local_port=22, store=None,
-                 peer_fails=()):
+                 peer_fails=(), auth_method="password", auth_key_type="",
+                 auth_key_sha=""):
         """Serialised against other constructions on the same VFS.
 
         Every channel of one SSH connection shares a VFS, and this
@@ -12039,14 +12040,22 @@ class Shell:
         lock = getattr(vfs, "_nodes_lock", None)
         if lock is None:
             return self._construct(vfs, log, download, user, peer, peer_port,
-                                   local_port, store, peer_fails)
+                                   local_port, store, peer_fails,
+                                   auth_method, auth_key_type, auth_key_sha)
         with lock:
             return self._construct(vfs, log, download, user, peer, peer_port,
-                                   local_port, store, peer_fails)
+                                   local_port, store, peer_fails,
+                                   auth_method, auth_key_type, auth_key_sha)
 
     def _construct(self, vfs=None, log=None, download=None, user="root",
                    peer=None, peer_port=0, local_port=22, store=None,
-                   peer_fails=()):
+                   peer_fails=(), auth_method="password",
+                   auth_key_type="", auth_key_sha=""):
+        # How this session authenticated, so /var/log/auth.log records the
+        # method that was actually used rather than assuming a password.
+        self.auth_method = auth_method or "password"
+        self.auth_key_type = auth_key_type or ""
+        self.auth_key_sha = auth_key_sha or ""
         # What this address got wrong on the way in, from the SSH layer.
         # (ts, username, invalid_user, client_port) per rejected attempt.
         self.peer_fails = list(peer_fails or ())
@@ -12443,11 +12452,20 @@ class Shell:
             pid = self.sshd_pid
             method = "publickey" if getattr(self, "auth_method", "") == \
                 "publickey" else "password"
+            # sshd names the key after "ssh2:" for a publickey login, and
+            # the historical line seeded into this same file does too -- so
+            # a live key login that stopped at "ssh2" did not match the
+            # format of the line three rows above it.
+            _tail = ""
+            if method == "publickey":
+                _kt = getattr(self, "auth_key_type", "") or "RSA"
+                _ks = getattr(self, "auth_key_sha", "")
+                _tail = ": %s%s" % (_kt, (" " + _ks) if _ks else "")
             uid = self._creds_for(self.user)[0] if self.user else 0
             lines = [
-                "%s %s %s[%d]: Accepted %s for %s from %s port %s ssh2"
+                "%s %s %s[%d]: Accepted %s for %s from %s port %s ssh2%s"
                 % (stamp, HOST, SSHD_SESSION, pid, method, self.user,
-                   self.peer, self.peer_port),
+                   self.peer, self.peer_port, _tail),
                 "%s %s %s[%d]: pam_unix(sshd:session): session opened for "
                 "user %s(uid=%d) by (uid=0)"
                 % (stamp, HOST, SSHD_SESSION, pid, self.user, uid),
