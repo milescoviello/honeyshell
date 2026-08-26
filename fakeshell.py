@@ -34169,6 +34169,41 @@ class Shell:
         return zero
 
     def cmd_ifconfig(self, a, stdin=""):
+        """net-tools' view of the interface, and its own way of changing it.
+
+        `ifconfig eth0 mtu 9000` printed the whole interface listing and
+        exited 0 with the MTU still 1500 -- the same "accepted every change
+        and kept none" shape the routing table had, and net-tools is
+        silent for all of these. It reads and writes the same state
+        `ip addr` and `ip link` do, so an address added with one appears
+        in the other.
+        """
+        ops = [x for x in a if not x.startswith("-")]
+        if len(ops) > 1:
+            dev, rest = ops[0], ops[1:]
+            change, addr, j = {}, None, 0
+            while j < len(rest):
+                w = rest[j]
+                if w == "up":
+                    change["up"] = True
+                elif w == "down":
+                    change["up"] = False
+                elif w == "mtu" and j + 1 < len(rest) \
+                        and rest[j + 1].isdigit():
+                    change["mtu"] = int(rest[j + 1])
+                    j += 1
+                elif re.match(r"^\d+\.\d+\.\d+\.\d+$", w):
+                    addr = w
+                elif w == "netmask" and j + 1 < len(rest):
+                    j += 1
+                j += 1
+            if addr is not None:
+                # `ifconfig eth0:1 10.2.2.2` is the old way to add an
+                # alias, and it is an address on the same interface.
+                return self._if_addr("add",
+                                     [addr + "/24", "dev", dev.split(":")[0]])
+            if change:
+                return self._if_write(dev.split(":")[0], **change)
         e, l = self._ifstats("eth0"), self._ifstats("lo")
         # e and l come from the per-command cache below, so ifconfig,
         # `ip -s link` and /proc/net/dev quote one number rather than three
@@ -34178,8 +34213,14 @@ class Shell:
                 if n >= div:
                     return "%.1f %s" % (n / float(div), unit)
             return "%d B" % n
-        return ("%s: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\n"
-                "        inet %s  netmask %s  broadcast %s\n"
+        st = self._iface(IFACE) or {"up": True, "mtu": 1500, "addrs": []}
+        extra = "".join("        inet %s  netmask 255.255.255.0\n"
+                        % a.split("/")[0] for a in st.get("addrs", ()))
+        return (("%s: flags=" + ("4163<UP,BROADCAST,RUNNING,MULTICAST>"
+                                 if st["up"] else
+                                 "4098<BROADCAST,MULTICAST>")
+                 + "  mtu " + str(st["mtu"]) + "\n"
+                 "        inet %s  netmask %s  broadcast %s\n" + extra +
                 "        inet6 fe80::5054:ff:fe9a:3f12  prefixlen 64  scopeid 0x20<link>\n"
                 "        ether %s  txqueuelen 1000  (Ethernet)\n"
                 "        RX packets %d  bytes %d (%s)\n"
@@ -34193,7 +34234,7 @@ class Shell:
                 "        RX packets %d  bytes %d (%s)\n"
                 "        RX errors 0  dropped 0  overruns 0  frame 0\n"
                 "        TX packets %d  bytes %d (%s)\n"
-                "        TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0\n"
+                 "        TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0\n")
                 % (IFACE, LOCAL_IP, NETMASK, BROADCAST, ETH_MAC,
                    e["rx_packets"], e["rx_bytes"], gib(e["rx_bytes"]),
                    e["tx_packets"], e["tx_bytes"], gib(e["tx_bytes"]),
@@ -34232,6 +34273,132 @@ class Shell:
                         2))
         return out
 
+    def _ifaces(self):
+        """Mutable interface state: extra addresses, link flag, MTU.
+
+        `ip addr add`, `ip addr del`, `ip link set` and `ifconfig` all
+        change an interface, and none of them could. The verb was read as
+        a device name, so `ip addr add 10.1.1.5/24 dev eth0` answered
+        'Device "add" does not exist.' -- an error naming a device nobody
+        asked about -- and `ifconfig eth0 mtu 9000` printed the whole
+        interface listing and exited 0 with nothing changed.
+
+        Only the parts that move live here. The primary address, MAC and
+        counters stay where they were.
+        """
+        st = getattr(self.fs, "ifaces", None)
+        if st is None:
+            st = self.fs.ifaces = {
+                IFACE: {"up": True, "mtu": 1500, "addrs": []},
+                "lo": {"up": True, "mtu": 65536, "addrs": []},
+            }
+        return st
+
+    def _iface(self, dev):
+        return self._ifaces().get(dev)
+
+    def _if_sync(self, dev):
+        """Push the state into /sys/class/net, which is its other reader."""
+        st = self._iface(dev)
+        if st is None:
+            return
+        base = "/sys/class/net/%s/" % dev
+        self.fs.write(base + "mtu", "%d\n" % st["mtu"], mode=0o644)
+        # With the newline. Every file under /sys/class/net ends with one,
+        # and dropping it ran `cat operstate` straight into the next
+        # command's output.
+        self.fs.write(base + "operstate",
+                      (("up" if st["up"] else "down") if dev != "lo"
+                       else "unknown") + "\n")
+        # carrier is EINVAL while the device is down -- reading it is how
+        # a script asks whether the cable is in, and a down interface has
+        # no answer rather than the answer "0".
+        # A down interface has no carrier to report: the real file answers
+        # EINVAL. An empty file is the closest this VFS gets -- `cat` prints
+        # nothing rather than the wrong number -- and the difference is
+        # recorded rather than papered over.
+        self.fs.write(base + "carrier", "1\n" if st["up"] else "")
+        flags = 0x1003 if st["up"] else 0x1002
+        self.fs.write(base + "flags", "0x%x\n" % flags)
+
+    def _if_write(self, dev, **change):
+        """Apply a change, with iproute2's wording for the refusals."""
+        if self.uid != 0:
+            self.err("RTNETLINK answers: Operation not permitted")
+            return "", 2
+        st = self._iface(dev)
+        if st is None:
+            self.err('Cannot find device "%s"' % dev)
+            return "", 1
+        if "up" in change:
+            st["up"] = change["up"]
+            if not change["up"]:
+                # Every route out of a device that is down goes with it.
+                # Measured: after `ip link set eth0 down` in a namespace
+                # whose only device was eth0, `ip route` is empty.
+                self.fs.routes = [r for r in self._routes()
+                                  if r["dev"] != dev]
+                self._sync_proc_route()
+        if "mtu" in change:
+            st["mtu"] = change["mtu"]
+        self._if_sync(dev)
+        self.log(event="iface_change", dev=dev,
+                 change=",".join("%s=%s" % kv for kv in sorted(
+                     change.items())), notable=True)
+        return "", 0
+
+    def _if_addr(self, verb, words):
+        """ip addr add/del, with the Error: ipv4: wording iproute2 uses."""
+        if self.uid != 0:
+            self.err("RTNETLINK answers: Operation not permitted")
+            return "", 2
+        cidr, dev = None, None
+        i = 0
+        while i < len(words):
+            w = words[i]
+            if w == "dev" and i + 1 < len(words):
+                dev = words[i + 1]
+                i += 2
+                continue
+            if cidr is None and "." in w:
+                cidr = w if "/" in w else w + "/32"
+            elif dev is None and w not in ("broadcast", "brd", "scope",
+                                           "label", "peer"):
+                dev = w
+            i += 1
+        if cidr is None:
+            self.err('Not enough information: "dev" argument is required.')
+            return "", 1
+        st = self._iface(dev or IFACE)
+        if st is None:
+            self.err('Cannot find device "%s"' % dev)
+            return "", 1
+        primary = "%s/%d" % (LOCAL_IP, PREFIX)
+        have = set(st["addrs"]) | {primary}
+        if verb == "add":
+            if cidr in have:
+                self.err("Error: ipv4: Address already assigned.")
+                return "", 2
+            st["addrs"].append(cidr)
+        else:
+            if cidr not in have:
+                self.err("Error: ipv4: Address not found.")
+                return "", 2
+            if cidr == primary:
+                # Removing the primary is allowed; it just leaves the
+                # interface with whatever else is on it.
+                st["primary_gone"] = True
+            else:
+                st["addrs"].remove(cidr)
+        self.log(event="iface_change", dev=dev or IFACE,
+                 change="%s %s" % (verb, cidr), notable=True)
+        return "", 0
+
+    def _if_addr_lines(self, dev):
+        """The extra `inet` lines `ip addr` and `ifconfig` both need."""
+        st = self._iface(dev)
+        return list(st["addrs"]) if st else []
+
     def _ip_link(self, stats=False, extra=False):
         e, l = self._ifstats("eth0"), self._ifstats("lo")
         out = ("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state "
@@ -34239,9 +34406,14 @@ class Shell:
                "    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n")
         if stats:
             out += self._ip_stat_block(l, extra)
-        out += ("2: %s: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc "
-                "fq_codel state UP mode DEFAULT group default qlen 1000\n"
-                "    link/ether %s brd ff:ff:ff:ff:ff:ff\n" % (IFACE, ETH_MAC))
+        st = self._iface(IFACE) or {"up": True, "mtu": 1500}
+        out += ("2: %s: <%s> mtu %d qdisc "
+                "fq_codel state %s mode DEFAULT group default qlen 1000\n"
+                "    link/ether %s brd ff:ff:ff:ff:ff:ff\n"
+                % (IFACE,
+                   "BROADCAST,MULTICAST,UP,LOWER_UP" if st["up"]
+                   else "NO-CARRIER,BROADCAST,MULTICAST,UP",
+                   st["mtu"], "UP" if st["up"] else "DOWN", ETH_MAC))
         if stats:
             out += self._ip_stat_block(e, extra)
         return out
@@ -34297,6 +34469,30 @@ class Shell:
         words = [x for x in args if not x.startswith("-")]
         obj = words[0] if words else ""
         if obj.startswith("l"):                      # link
+            # `set` was read as a device name, so `ip link set eth0 down`
+            # answered 'Device "set" does not exist.' -- an error about a
+            # device nobody mentioned -- and the link never moved.
+            if len(words) > 2 and "set".startswith(words[1]) \
+                    and len(words[1]) >= 1 and words[1][0] == "s":
+                dev, rest = words[2], words[3:]
+                if dev == "dev" and rest:
+                    dev, rest = rest[0], rest[1:]
+                change = {}
+                j = 0
+                while j < len(rest):
+                    w = rest[j]
+                    if w == "up":
+                        change["up"] = True
+                    elif w == "down":
+                        change["up"] = False
+                    elif w == "mtu" and j + 1 < len(rest) \
+                            and rest[j + 1].isdigit():
+                        change["mtu"] = int(rest[j + 1])
+                        j += 1
+                    j += 1
+                if not change:
+                    return "", 0
+                return self._if_write(dev, **change)
             if brief:
                 rows = ("lo               UNKNOWN        00:00:00:00:00:00 "
                         "<LOOPBACK,UP,LOWER_UP>\n"
@@ -34318,6 +34514,24 @@ class Shell:
             return (self._ip_oneline(out) if oneline
                     else out), 0
         if obj.startswith("a"):                      # addr
+            if len(words) > 1 and words[1] in ("add", "del", "delete",
+                                               "change", "replace"):
+                return self._if_addr(
+                    "del" if words[1].startswith("del") else "add",
+                    words[2:])
+            if len(words) > 1 and words[1] == "flush":
+                dev = words[2] if len(words) > 2 else IFACE
+                if dev == "dev" and len(words) > 3:
+                    dev = words[3]
+                st = self._iface(dev)
+                if st is None:
+                    self.err('Cannot find device "%s"' % dev)
+                    return "", 1
+                if self.uid != 0:
+                    self.err("RTNETLINK answers: Operation not permitted")
+                    return "", 2
+                st["addrs"] = []
+                return "", 0
             if brief:
                 # -4 and -6 filter here too. The family selector was applied
                 # to the long form only, and the brief form returned before
@@ -34325,11 +34539,14 @@ class Shell:
                 # a script uses to read an address, listed ::1 and the IPv6
                 # link-local alongside the IPv4 it asked for.
                 v4 = {"lo": ["127.0.0.1/8"],
-                      IFACE: ["%s/%d" % (LOCAL_IP, PREFIX)]}
+                      IFACE: (["%s/%d" % (LOCAL_IP, PREFIX)]
+                              + self._if_addr_lines(IFACE))}
                 v6 = {"lo": ["::1/128"],
                       IFACE: ["fe80::5054:ff:fe9a:3f12/64"]}
                 out = []
-                for dev, state in (("lo", "UNKNOWN"), (IFACE, "UP")):
+                _up = (self._iface(IFACE) or {"up": True})["up"]
+                for dev, state in (("lo", "UNKNOWN"),
+                                   (IFACE, "UP" if _up else "DOWN")):
                     addrs = []
                     if fam != 6:
                         addrs += v4[dev]
@@ -34353,14 +34570,28 @@ class Shell:
                    "       valid_lft forever preferred_lft forever\n")
             if stats:
                 out += self._ip_stat_block(l, extra)
-            out += ("2: %s: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc "
-                    "fq_codel state UP group default qlen 1000\n"
-                    "    link/ether %s brd ff:ff:ff:ff:ff:ff\n"
-                    "    inet %s/%d brd %s scope global dynamic %s\n"
-                    "       valid_lft 2591resolved preferred_lft 2591resolved\n"
-                    "    inet6 fe80::5054:ff:fe9a:3f12/64 scope link \n"
-                    "       valid_lft forever preferred_lft forever\n"
-                    % (IFACE, ETH_MAC, LOCAL_IP, PREFIX, BROADCAST, IFACE))
+            _st = self._iface(IFACE) or {"up": True, "mtu": 1500,
+                                         "addrs": []}
+            # Addresses added with `ip addr add` belong in this listing.
+            # Without them the command that added one and the command that
+            # lists them disagreed about what the interface has.
+            _extra = "".join(
+                "    inet %s scope global %s\n"
+                "       valid_lft forever preferred_lft forever\n"
+                % (a, IFACE) for a in _st.get("addrs", ()))
+            out += (("2: %s: <%s> mtu %d qdisc "
+                     "fq_codel state %s group default qlen 1000\n"
+                     "    link/ether %s brd ff:ff:ff:ff:ff:ff\n"
+                     "    inet %s/%d brd %s scope global dynamic %s\n"
+                     "       valid_lft 2591resolved preferred_lft 2591resolved\n"
+                     + _extra +
+                     "    inet6 fe80::5054:ff:fe9a:3f12/64 scope link \n"
+                     "       valid_lft forever preferred_lft forever\n")
+                    % (IFACE,
+                       "BROADCAST,MULTICAST,UP,LOWER_UP" if _st["up"]
+                       else "NO-CARRIER,BROADCAST,MULTICAST,UP",
+                       _st["mtu"], "UP" if _st["up"] else "DOWN",
+                       ETH_MAC, LOCAL_IP, PREFIX, BROADCAST, IFACE))
             out = out.replace("2591resolved", "2591847")
             # iproute2 takes any unique prefix of a verb, so `ip a s eth0`
             # is `ip addr show eth0`. Matching only the full words made "s"

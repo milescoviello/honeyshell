@@ -55,8 +55,19 @@ def main():
     check("...and not the other one", "lo:" in out, False)
     check("ip link show lo is the other one",
           s.run("ip link show lo").startswith("1: lo:"), True)
-    check("both spellings agree",
-          s.run("ip l s %s" % dev), s.run("ip link show %s" % dev))
+    # `s` is not short for `show`. Measured in a namespace on the guest:
+    # `ip l s e0` prints nothing and exits 0, because iproute2 resolves the
+    # ambiguous prefix to *set*, and a set with no options is a no-op. This
+    # case asserted that `ip l s DEV` equalled `ip link show DEV`, which was
+    # written from the shape of the abbreviation rather than from the
+    # command -- sweep 187 made `set` do something and the assumption
+    # surfaced.
+    check("s is set, not show, and a bare set is silent",
+          s.run("ip l s %s" % dev), "")
+    check("sh is show", s.run("ip l sh %s" % dev),
+          s.run("ip link show %s" % dev))
+    check("...and so is sho", s.run("ip l sho %s" % dev),
+          s.run("ip link show %s" % dev))
     check("addr show DEV was already right",
           s.run("ip addr show %s" % dev).startswith("2: %s:" % dev), True)
     s._err = []
