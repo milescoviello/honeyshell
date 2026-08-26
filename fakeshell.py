@@ -3720,6 +3720,33 @@ def written_kb(vfs, under=None):
     return (vfs._alloc_blocks() - base) * 4
 
 
+def _ip_int(addr):
+    """Dotted quad to a 32-bit integer, big-endian."""
+    try:
+        a, b, c, d = (int(x) for x in str(addr).split("."))
+    except (ValueError, AttributeError):
+        return 0
+    return (a << 24) | (b << 16) | (c << 8) | d
+
+
+def _le32(n):
+    """The same value with its bytes reversed.
+
+    /proc/net/route stores addresses little-endian, which is why the
+    default gateway 172.31.16.1 appears there as 01101FAC.
+    """
+    return (((n & 0xFF) << 24) | ((n & 0xFF00) << 8)
+            | ((n >> 8) & 0xFF00) | ((n >> 24) & 0xFF))
+
+
+def _same_net(addr, net, prefix):
+    """Is addr inside net/prefix?"""
+    if not prefix:
+        return True
+    mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+    return (_ip_int(addr) & mask) == (_ip_int(net) & mask)
+
+
 def root_space(vfs):
     """(total, used, free, avail) for / in 1K blocks.
 
@@ -34391,15 +34418,36 @@ class Shell:
                     "32767:\tfrom all lookup default\n", 0)
         if obj.startswith("r"):                      # route
             rest = [w for w in words[1:]]
-            if rest and "get".startswith(rest[0]) and len(rest) > 1:
+            verb = (rest[0] if rest else "").lower()
+            if verb and "get".startswith(verb) and len(rest) > 1:
                 return self._ip_route_get(rest[1])
+            # add / del / change / replace / append all took the show path,
+            # printed the whole table and returned 0. The real ones are
+            # silent on success, and printing two lines where nothing is
+            # printed is a tell on its own -- `ip route add X && echo ok`
+            # came back with the routing table in front of the ok.
+            for word, canon in (("add", "add"), ("append", "add"),
+                                ("delete", "del"), ("del", "del"),
+                                ("change", "change"), ("replace", "replace")):
+                if verb and word.startswith(verb) and len(verb) >= 3:
+                    return self._route_write(canon, rest[1:])
+            if verb == "flush" and len(rest) > 1 and rest[1] == "cache":
+                # Flushing the cache is not flushing the table, and it is
+                # silent.
+                return "", 0
+            if verb == "flush":
+                if self.uid != 0:
+                    self.err("RTNETLINK answers: Operation not permitted")
+                    return "", 2
+                self.fs.routes = []
+                self._sync_proc_route()
+                self.log(event="route_change", verb="flush",
+                         argv=" ".join(rest)[:200], notable=True)
+                return "", 0
             if fam == 6:
                 return ("fe80::/64 dev %s proto kernel metric 256 pref medium\n"
                         % IFACE), 0
-            return ("default via %s dev %s proto dhcp src %s metric 100\n"
-                    "%s/%d dev %s proto kernel scope link src %s metric 100\n"
-                    % (GATEWAY, IFACE, LOCAL_IP, SUBNET, PREFIX, IFACE,
-                       LOCAL_IP), 0)
+            return self._route_text(), 0
         if obj.startswith("n"):                      # neigh
             nrest = [w for w in words[1:]]
             verb = (nrest[0] if nrest else "").lower()
@@ -34462,6 +34510,176 @@ class Shell:
                 keep.append(line)
         return "".join(keep)
 
+    def _routes(self):
+        """The routing table: one list, four readers, and it can be changed.
+
+        `ip route`, `route -n`, `netstat -rn` and /proc/net/route all
+        describe it, and `ip route add/del` and `route add/del` all change
+        it. Every reader was a separate literal and every writer printed
+        the table back and returned 0 -- so `ip route add 10.99.0.0/16 via
+        <gw>` reported success, printed two lines the real command does not
+        print, and added nothing. Setting up a route is what somebody does
+        before pivoting, and `ip route` is the next thing they type.
+
+        Each entry is a dict: dst (None for default), prefix, gw (None for
+        a link route), dev, proto, scope, src, metric.
+        """
+        r = getattr(self.fs, "routes", None)
+        if r is None:
+            r = self.fs.routes = [
+                {"dst": None, "prefix": 0, "gw": GATEWAY, "dev": IFACE,
+                 "proto": "dhcp", "scope": None, "src": LOCAL_IP,
+                 "metric": 100},
+                {"dst": SUBNET, "prefix": PREFIX, "gw": None, "dev": IFACE,
+                 "proto": "kernel", "scope": "link", "src": LOCAL_IP,
+                 "metric": 100},
+            ]
+        return r
+
+    @staticmethod
+    def _route_key(e):
+        return (e["dst"] or "default", e["prefix"])
+
+    def _route_sort(self):
+        """iproute2 prints default first, then by prefix and address."""
+        self.fs.routes = sorted(
+            self._routes(),
+            key=lambda e: (e["dst"] is not None,
+                           _ip_int(e["dst"]) if e["dst"] else 0,
+                           e["prefix"]))
+
+    def _sync_proc_route(self):
+        """/proc/net/route, rewritten from the table.
+
+        net-tools reads this file rather than netlink, so a route that is
+        in `ip route` and not in here is a route netstat cannot see.
+        """
+        rows = ["Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\t"
+                "Metric\tMask\t\tMTU\tWindow\tIRTT\n"]
+        for e in self._routes():
+            dst = _ip_int(e["dst"]) if e["dst"] else 0
+            gw = _ip_int(e["gw"]) if e["gw"] else 0
+            mask = ((0xFFFFFFFF << (32 - e["prefix"])) & 0xFFFFFFFF)                 if e["prefix"] else 0
+            flags = 0x0001 | (0x0002 if e["gw"] else 0)
+            rows.append("%s\t%08X\t%08X\t%04X\t0\t0\t%d\t%08X\t0\t0\t0\n"
+                        % (e["dev"], _le32(dst), _le32(gw), flags,
+                           e["metric"], _le32(mask)))
+        self.fs.write("/proc/net/route", "".join(rows))
+
+    def _route_text(self):
+        out = []
+        for e in self._routes():
+            dst = "default" if e["dst"] is None else "%s/%d" % (e["dst"],
+                                                                e["prefix"])
+            line = dst
+            if e["gw"]:
+                line += " via " + e["gw"]
+            line += " dev " + e["dev"]
+            if e["proto"]:
+                line += " proto " + e["proto"]
+            if e["scope"]:
+                line += " scope " + e["scope"]
+            if e["src"]:
+                line += " src " + e["src"]
+            if e["metric"]:
+                line += " metric %d" % e["metric"]
+            out.append(line + "\n")
+        return "".join(out)
+
+    def _route_parse(self, words):
+        """(entry, error) for the operands of an add/del/change."""
+        e = {"dst": None, "prefix": 0, "gw": None, "dev": IFACE,
+             "proto": None, "scope": None, "src": None, "metric": 0}
+        i = 0
+        seen_dst = False
+        while i < len(words):
+            w = words[i]
+            nxt = words[i + 1] if i + 1 < len(words) else None
+            if w in ("via", "gw") and nxt:
+                e["gw"] = nxt
+                i += 2
+            elif w == "dev" and nxt:
+                e["dev"] = nxt
+                i += 2
+            elif w in ("metric", "-metric") and nxt and nxt.isdigit():
+                e["metric"] = int(nxt)
+                i += 2
+            elif w in ("src", "proto", "scope", "table", "mtu") and nxt:
+                if w in ("proto", "scope", "src"):
+                    e[w] = nxt
+                i += 2
+            elif w in ("onlink", "-net", "-host"):
+                i += 1
+            elif not seen_dst:
+                seen_dst = True
+                if w in ("default", "0.0.0.0/0"):
+                    e["dst"], e["prefix"] = None, 0
+                else:
+                    dst, _, pfx = w.partition("/")
+                    if not re.match(r"^\d+\.\d+\.\d+\.\d+$", dst):
+                        return None, "Error: any valid prefix is expected " \
+                                     "rather than \"%s\"." % w
+                    e["dst"] = dst
+                    e["prefix"] = int(pfx) if pfx.isdigit() else 32
+                i += 1
+            else:
+                i += 1
+        if not seen_dst:
+            return None, "Error: either \"to\" is duplicate, or \"%s\" is a " \
+                         "garbage." % (words[0] if words else "")
+        return e, None
+
+    def _route_reachable(self, gw):
+        """A gateway has to be on a subnet this box is already on.
+
+        Measured: `ip route add 10.77.0.0/16 via 192.0.2.9` answers
+        "Error: Nexthop has invalid gateway." rather than accepting a
+        route through an address the box cannot reach.
+        """
+        if not gw:
+            return True
+        for e in self._routes():
+            if e["dst"] and e["gw"] is None and _same_net(gw, e["dst"],
+                                                          e["prefix"]):
+                return True
+        return False
+
+    def _route_write(self, verb, words):
+        """add / del / change / replace, with iproute2's wording."""
+        if self.uid != 0:
+            self.err("RTNETLINK answers: Operation not permitted")
+            return "", 2
+        e, err = self._route_parse(words)
+        if err:
+            self.err(err)
+            return "", 1
+        tbl = self._routes()
+        match = next((x for x in tbl
+                      if self._route_key(x) == self._route_key(e)), None)
+        if verb in ("del", "delete"):
+            if match is None:
+                # Not "No such file or directory": deleting a route that is
+                # not there is ESRCH, and the two read very differently to
+                # someone checking whether their change took.
+                self.err("RTNETLINK answers: No such process")
+                return "", 2
+            tbl.remove(match)
+        else:
+            if verb in ("add",) and match is not None:
+                self.err("RTNETLINK answers: File exists")
+                return "", 2
+            if not self._route_reachable(e["gw"]):
+                self.err("Error: Nexthop has invalid gateway.")
+                return "", 2
+            if match is not None:
+                tbl.remove(match)
+            tbl.append(e)
+        self._route_sort()
+        self._sync_proc_route()
+        self.log(event="route_change", verb=verb,
+                 argv=" ".join(words)[:200], notable=True)
+        return "", 0
+
     def _ip_route_get(self, dest):
         """`ip route get ADDR` resolves one destination, and says so in one
         line plus a cache line. It printed the whole routing table, which
@@ -34472,19 +34690,30 @@ class Shell:
             dev = "lo"
             return ("local %s dev %s src %s uid %d \n    cache <local> \n"
                     % (dest, dev, LOCAL_IP, uid)), 0
-        # On-link when it falls inside our own subnet, otherwise via the
-        # gateway -- which is the whole point of asking.
-        try:
-            import ipaddress
-            onlink = ipaddress.ip_address(dest) in ipaddress.ip_network(
-                "%s/%d" % (SUBNET, PREFIX))
-        except Exception:                                     # noqa: BLE001
-            onlink = False
-        if onlink:
+        # Longest-prefix match against the table, not a hardcoded "is it
+        # my subnet". Adding `10.99.0.0/16 via 172.31.16.9` and then
+        # asking about 10.99.5.5 answered "via 172.31.16.1" -- the default
+        # gateway -- so the route existed in every listing and changed
+        # nothing about where a packet would go. That is the question this
+        # command is for.
+        best = None
+        for e in self._routes():
+            if e["dst"] is None:
+                if best is None:
+                    best = e
+                continue
+            if _same_net(dest, e["dst"], e["prefix"]):
+                if best is None or best["dst"] is None \
+                        or e["prefix"] > best["prefix"]:
+                    best = e
+        if best is None:
+            self.err("RTNETLINK answers: Network is unreachable")
+            return "", 2
+        if best["gw"] is None:
             return ("%s dev %s src %s uid %d \n    cache \n"
-                    % (dest, IFACE, LOCAL_IP, uid)), 0
+                    % (dest, best["dev"], LOCAL_IP, uid)), 0
         return ("%s via %s dev %s src %s uid %d \n    cache \n"
-                % (dest, GATEWAY, IFACE, LOCAL_IP, uid)), 0
+                % (dest, best["gw"], best["dev"], LOCAL_IP, uid)), 0
 
     @staticmethod
     def _ip_maddr():
@@ -34585,17 +34814,42 @@ class Shell:
         return _json.dumps(recs, separators=(",", ":")) + "\n"
 
     def cmd_route(self, a, stdin=""):
+        """net-tools' view of the same table, and its own way of changing it.
+
+        `route add -net 10.50.0.0/16 gw <gw>` printed the table and
+        returned 0 without adding anything, exactly as `ip route add` did.
+        Both write to one table now, so a route added with either shows up
+        in both -- and in netstat -rn and /proc/net/route, which is what
+        net-tools actually reads.
+        """
+        verb = next((x for x in a if not x.startswith("-")), "")
+        if verb in ("add", "del", "delete"):
+            rest = [x for x in a if x != verb]
+            rest = [x for x in rest if not (x.startswith("-")
+                                            and x not in ("-net", "-host"))]
+            out, rc = self._route_write("del" if verb != "add" else "add",
+                                        rest)
+            if rc and "No such process" in "".join(self._err[-1:]):
+                # net-tools words this one differently.
+                self._err[-1] = "SIOCDELRT: No such process\n"
+            return out, rc
         numeric = any("n" in x for x in a if x.startswith("-"))
-        gw = GATEWAY if numeric else GATEWAY
-        dest = "0.0.0.0" if numeric else "default"
-        net = SUBNET if numeric else SUBNET
-        return ("Kernel IP routing table\n"
-                "Destination     Gateway         Genmask         Flags Metric "
-                "Ref    Use Iface\n"
-                "%-15s %-15s %-15s UG    100    0        0 %s\n"
-                "%-15s %-15s %-15s U     100    0        0 %s\n"
-                % (dest, gw, "0.0.0.0", IFACE,
-                   net, "0.0.0.0", NETMASK, IFACE), 0)
+        rows = ["Kernel IP routing table",
+                "Destination     Gateway         Genmask         Flags "
+                "Metric Ref    Use Iface"]
+        for e in self._routes():
+            dst = e["dst"] or "0.0.0.0"
+            if not numeric and e["dst"] is None:
+                dst = "default"
+            mask = ("0.0.0.0" if not e["prefix"] else
+                    ".".join(str((((0xFFFFFFFF << (32 - e["prefix"]))
+                                   & 0xFFFFFFFF) >> sh) & 0xFF)
+                             for sh in (24, 16, 8, 0)))
+            flags = "UG" if e["gw"] else "U"
+            rows.append("%-15s %-15s %-15s %-5s %-6d %-6d %3d %s"
+                        % (dst, e["gw"] or "0.0.0.0", mask, flags,
+                           e["metric"], 0, 0, e["dev"]))
+        return "\n".join(rows) + "\n", 0
 
     def _neigh(self):
         """The neighbour table: one list, four readers, and it can be emptied.
@@ -34929,16 +35183,26 @@ class Shell:
         # -r and -i printed the connections table, so `netstat -rn` answered a
         # question about routes with a list of sockets.
         if "r" in flags:
+            # The fourth reader of the routing table, and the last one that
+            # was still a literal: a route added with `ip route add` showed
+            # up in ip route, route -n and /proc/net/route and not here.
             numeric = "n" in flags
-            return ("Kernel IP routing table\n"
+            rows = ["Kernel IP routing table",
                     "Destination     Gateway         Genmask         Flags   "
-                    "MSS Window  irtt Iface\n"
-                    "%-15s %-15s %-15s UG        0 0          0 %s\n"
-                    "%-15s %-15s %-15s U         0 0          0 %s\n"
-                    % ("0.0.0.0" if numeric else "default", GATEWAY,
-                       "0.0.0.0", IFACE,
-                       SUBNET, "0.0.0.0" if numeric else "*", NETMASK,
-                       IFACE)), 0
+                    "MSS Window  irtt Iface"]
+            for e in self._routes():
+                dst = e["dst"] or "0.0.0.0"
+                if not numeric and e["dst"] is None:
+                    dst = "default"
+                mask = ("0.0.0.0" if not e["prefix"] else
+                        ".".join(str((((0xFFFFFFFF << (32 - e["prefix"]))
+                                       & 0xFFFFFFFF) >> sh) & 0xFF)
+                                 for sh in (24, 16, 8, 0)))
+                gw = e["gw"] or ("0.0.0.0" if numeric else "*")
+                rows.append("%-15s %-15s %-15s %-7s   0 0          0 %s"
+                            % (dst, gw, mask, "UG" if e["gw"] else "U",
+                               e["dev"]))
+            return "\n".join(rows) + "\n", 0
         if "i" in flags:
             e, l = self._ifstats("eth0"), self._ifstats("lo")
             return ("Kernel Interface table\n"

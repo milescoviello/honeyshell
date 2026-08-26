@@ -144,6 +144,7 @@ Run all:  `./run-suites.sh`
 - `rootcmdtest.py` -- The box's record of who ran what as root.
 - `rottest.py` -- The logs that were rotated away -- can anything read them?
 - `rotwindowtest.py` -- When did the logs rotate, and does everything that records it agree?
+- `routetest.py` -- The routing table: four readers, two writers, and nothing stuck.
 - `runningtest.py` -- Does the box remember what it is running?
 - `runtest.py` -- systemd-run and the sysv helpers -- scheduling that leaves a trace.
 - `schedtest.py` -- What priority is this process, and does changing it change anything?
