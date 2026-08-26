@@ -14943,8 +14943,28 @@ class Shell:
             if produced_err and not err_devnull:
                 if err_to_out:
                     out = out + produced_err
+                elif err_file:
+                    # `{ cmd; } 2>errors` and `( cmd ) 2>errors`. This
+                    # branch folded err_to_out and dropped err_file on the
+                    # floor, so the group form of the commonest capture
+                    # idiom wrote an empty file while `cmd 2>errors` beside
+                    # it worked -- two spellings of "put this group's errors
+                    # in a file", one of them silent. `2>&1` on the same
+                    # group always worked, which is why it went unnoticed.
+                    ep = VFS.norm(self.expand(err_file), self.cwd)
+                    prev = (self.fs.read(ep) or b"") if err_mode == "a" \
+                        else b""
+                    if not self.fs.write(ep, prev + produced_err.encode(
+                            "latin-1", "replace")):
+                        self.last_rc = self._write_fail(ep, err_file)
                 else:
                     self._err.append(produced_err)
+            elif err_file and not err_devnull:
+                # An empty stderr still truncates the target: the shell
+                # opens the file before the group runs.
+                ep = VFS.norm(self.expand(err_file), self.cwd)
+                if err_mode == "w" or not self.fs.exists(ep):
+                    self.fs.write(ep, b"")
             if out_to_err:
                 # stdout now points at stderr, and bash applies redirections
                 # left to right -- a later 2>/dev/null does not retroactively
@@ -20492,8 +20512,8 @@ class Shell:
             if not self.fs.write(dst, data if data is not None else b"",
                                  mode=newmode if newmode is not None
                                  else self._new_mode()):
-                self.err("cp: cannot create regular file '%s': No such file "
-                         "or directory" % dest)
+                self.err("cp: cannot create regular file '%s': %s"
+                         % (dest, self._deny_reason(dst)))
                 rc = 1
                 continue
             if preserve and src in self.fs.nodes:
@@ -20866,7 +20886,8 @@ class Shell:
             p = VFS.norm(f, self.cwd)
             prev = (self.fs.read(p, atime=False) or b"") if append else b""
             if not self.fs.write(p, prev + stdin.encode("latin-1")):
-                self.err("tee: %s: No such file or directory" % f)
+                self.err("tee: %s: %s" % (f, self._deny_reason(
+                    VFS.norm(f, self.cwd))))
                 return stdin, 1
         return stdin, 0
 
@@ -30853,7 +30874,24 @@ class Shell:
                     self.fs.write(VFS.norm(f + suffix, self.cwd), data)
                 # Replace, do not append. It used to concatenate the result
                 # onto the original, so every `sed -i` doubled the file.
-                self.fs.write(path, out.encode("latin-1", "replace"))
+                if not self.fs.write(path, out.encode("latin-1", "replace")):
+                    # sed -i writes a temp file and renames it over the
+                    # original, so an immutable target fails at the rename
+                    # and that is what it names. This returned silently, so
+                    # `sed -i` on a locked file looked like it had worked --
+                    # and clean.sh runs sed on files it has just chattr'd.
+                    # mkstemp's XXXXXX is six mixed-case alphanumerics --
+                    # measured "sedNulwxv" on the guest -- not six hex
+                    # digits, which is what a %X of a hash looks like and is
+                    # its own small pattern.
+                    _al = ("abcdefghijklmnopqrstuvwxyz"
+                           "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+                    _h = abs(_stable_hash(path))
+                    _tmp = "".join(_al[(_h >> (i * 6)) % len(_al)]
+                                   for i in range(6))
+                    self.err("sed: cannot rename ./sed%s: %s"
+                             % (_tmp, self._deny_reason(path)))
+                    return "", 4
                 rc_all = rc_all or rc
             return "", rc_all
         data, _ = self._input(rest, stdin)
@@ -31470,21 +31508,27 @@ class Shell:
         if count >= 0:
             data = data[:count * bs]
         blocks = (len(data) + bs - 1) // bs if bs else 0
-        self.err("%d+%d records in" % (len(data) // bs if bs else 0,
-                                       1 if bs and len(data) % bs else 0))
-        self.err("%d+%d records out" % (len(data) // bs if bs else 0,
-                                        1 if bs and len(data) % bs else 0))
-        self.err("%s copied, 0.0001 s, %s"
-                 % (_dd_units(len(data)), _dd_rate(len(data))))
+        # The output file is opened before anything is transferred, so a dd
+        # that cannot write reports the failure and *no* statistics. This
+        # printed "6 bytes copied" and then failed, which is a transfer that
+        # both happened and did not -- and the wrong errno with it, on a
+        # file `cat` reads happily.
         dest = opt.get("of")
         if dest:
             path = VFS.norm(dest, self.cwd)
             prev = (self.fs.read(path) or b"") if seek else b""
             if not self.fs.write(path, prev[:seek * bs]
                                  + data.encode("latin-1", "replace")):
-                self.err("dd: failed to open '%s': No such file or directory"
-                         % dest)
+                self.err("dd: failed to open '%s': %s"
+                         % (dest, self._deny_reason(path)))
                 return "", 1
+        self.err("%d+%d records in" % (len(data) // bs if bs else 0,
+                                       1 if bs and len(data) % bs else 0))
+        self.err("%d+%d records out" % (len(data) // bs if bs else 0,
+                                        1 if bs and len(data) % bs else 0))
+        self.err("%s copied, 0.0001 s, %s"
+                 % (_dd_units(len(data)), _dd_rate(len(data))))
+        if dest:
             return "", 0
         _ = blocks
         return data, 0
@@ -37347,6 +37391,24 @@ class Shell:
         """None if this is an ordinary file; an rc if the target is special
         and has already been dealt with."""
         return self._net_redirect(path, spelled)
+
+    def _deny_reason(self, path):
+        """"Operation not permitted" or "No such file or directory".
+
+        Every writer had its own literal, and they all said the file did not
+        exist. An immutable or append-only file plainly does exist -- `ls -l`
+        lists it and `cat` reads it -- so `cp` and `tee` claiming otherwise
+        was two commands on one box disagreeing about whether a file is
+        there. Measured on the guest: cp, tee, dd, truncate and bash's own
+        redirect all say "Operation not permitted", each in its own wording.
+        """
+        node = self.fs.nodes.get(path) or self.fs.nodes.get(
+            self.fs.resolve(path))
+        if getattr(self.fs, "_write_denied", False) or (
+                node is not None
+                and ({"i", "a"} & set(getattr(node, "attrs", ())))):
+            return "Operation not permitted"
+        return "No such file or directory"
 
     def _write_fail(self, path, spelled):
         """Report why a redirect could not write.
