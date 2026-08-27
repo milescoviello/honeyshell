@@ -187,6 +187,7 @@ Run all:  `./run-suites.sh`
 - `timetest.py` -- Does every clock on the box agree, and does nothing move that shouldn't?
 - `tmrtest.py` -- What is scheduled on this box, when did it last run, and who agrees?
 - `tztest.py` -- What time is it here, where does the box think it is, and who says so?
+- `udevtest.py` -- udev: the rules directory, and the command you run after writing one.
 - `unitfilestest.py` -- `systemctl list-unit-files NAME` -- the check made right after installing one.
 - `unitnowtest.py` -- Installing persistence as a systemd unit: does the box agree with itself?
 - `unittest2.py` -- If you write a unit file, does the box agree the unit exists?
