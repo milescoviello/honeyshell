@@ -9514,10 +9514,27 @@ class VFS:
     #: the caller can print its own ENOSPC line. Distinct from
     #: _write_denied, which is a permission or attribute refusal.
     _write_enospc = False
+    #: Set when the write target is a directory. open(dir, O_WRONLY) is
+    #: EISDIR on every real filesystem, and the redirect that hit it must
+    #: say so rather than quietly replacing the directory with a file.
+    _write_isdir = False
 
     def write(self, path, data, mode=0o644, mtime=None):
         self._write_denied = False
         self._write_enospc = False
+        self._write_isdir = False
+        # A directory is not a file. open(dir, O_WRONLY) is EISDIR, and it
+        # is EISDIR before it is anything else -- an immutable directory
+        # still reports EISDIR, not EPERM -- so this is checked first.
+        # Without it `mkdir /tmp/d && echo x > /tmp/d` returned 0 and
+        # replaced the directory node with a regular file, so `mkdir` and
+        # `ls -ld` disagreed about what /tmp/d was. Verified against the
+        # live box, where `ls -ld` came back -rwxr-xr-x on a path that had
+        # just been created with mkdir.
+        _d = self.nodes.get(path) or self.nodes.get(self.resolve(path))
+        if _d is not None and getattr(_d, "is_dir", False):
+            self._write_isdir = True
+            return False
         # chattr +i means the kernel refuses the write, whoever you are --
         # root included. Ignoring it made the attribute cosmetic, and the
         # attribute is the point: a loader sets it so its key cannot be
@@ -16231,7 +16248,15 @@ class Shell:
                 # opens the file before the group runs.
                 ep = VFS.norm(self.expand(err_file), self.cwd)
                 if err_mode == "w" or not self.fs.exists(ep):
-                    self.fs.write(ep, b"")
+                    if not self.fs.write(ep, b""):
+                        # The open failed, and this discarded the result --
+                        # so `ls /etc 2>/some/dir` printed the listing and
+                        # exited 0 where bash prints "Is a directory",
+                        # exits 1 and never runs ls at all. The command has
+                        # already run here, but suppressing its output and
+                        # taking the rc is what the attacker sees.
+                        self.last_rc = self._write_fail(ep, err_file)
+                        return ""
             if out_to_err:
                 # stdout now points at stderr, and bash applies redirections
                 # left to right -- a later 2>/dev/null does not retroactively
@@ -16525,8 +16550,13 @@ class Shell:
                 # terminal and not into the void.
                 ep = VFS.norm(self.expand(err_file), self.cwd)
                 prev = (self.fs.read(ep) or b"") if err_mode == "a" else b""
-                self.fs.write(ep, prev + produced_err.encode("latin-1",
-                                                             "replace"))
+                if not self.fs.write(ep, prev + produced_err.encode(
+                        "latin-1", "replace")):
+                    # An open that failed was discarded here, so a redirect
+                    # at a directory exited 0 and printed the command's
+                    # stdout as if nothing were wrong.
+                    self.last_rc = self._write_fail(ep, err_file)
+                    return ""
             else:
                 self._err.append(produced_err)
         elif err_file and not err_devnull:
@@ -16534,7 +16564,9 @@ class Shell:
             # the file before the command runs.
             ep = VFS.norm(self.expand(err_file), self.cwd)
             if err_mode == "w" or not self.fs.exists(ep):
-                self.fs.write(ep, b"")
+                if not self.fs.write(ep, b""):
+                    self.last_rc = self._write_fail(ep, err_file)
+                    return ""
         if out_to_err:
             if out:
                 self._err.append(out)
@@ -40140,6 +40172,12 @@ class Shell:
         the opposite of the truth.
         """
         node = self.fs.nodes.get(path)
+        # EISDIR outranks the attribute checks, the way the kernel orders
+        # them: a redirect at a directory is "Is a directory" whatever the
+        # attributes say.
+        if getattr(self.fs, "_write_isdir", False):
+            self.err("bash: %s%s: Is a directory" % (self.where(), spelled))
+            return 1
         # +a refuses a truncating redirect for the same reason and with the
         # same errno, so ask the VFS what it actually refused on rather
         # than re-deriving one attribute's worth of the rule here.

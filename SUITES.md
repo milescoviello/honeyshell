@@ -77,6 +77,7 @@ Run all:  `./run-suites.sh`
 - `immutabletest.py` -- chattr said the file was locked -- did every writer believe it?
 - `inodetest.py` -- How many names does this file have, and what inode is behind them?
 - `iptest.py` -- iproute2's filters and output modes.
+- `isdirtest.py` -- A redirect at a directory is EISDIR, and the directory survives it.
 - `jobspectest.py` -- Naming a background job: do %+, %-, %N and %prefix all resolve?
 - `jobtest.py` -- Does the shell know about the jobs it just started?
 - `journalsplittest.py` -- journald and rsyslog are two stores, not one.
