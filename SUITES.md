@@ -10,6 +10,7 @@ Run all:  `./run-suites.sh`
 
 - `agetest.py` -- Password aging: when does this account expire, and can it be changed?
 - `alttest.py` -- Does the box agree with itself about what `editor` actually runs?
+- `aptconftest.py` -- apt hook persistence: the directory it goes in, and the command that shows it.
 - `apttest.py` -- If the box can reach the archive, what happens when you install?
 - `archtest.py` -- Does the box agree with itself about what is inside an archive?
 - `archtest2.py` -- tar: does unpacking put the files where the script expects them?

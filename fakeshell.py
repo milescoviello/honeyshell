@@ -10137,6 +10137,17 @@ class VFS:
         for d in ("/etc/ssh", "/etc/cron.d", "/etc/cron.daily", "/etc/cron.hourly",
                   "/etc/cron.weekly", "/etc/sudoers.d", "/etc/systemd",
                   "/etc/systemd/system", "/etc/apt", "/etc/apt/sources.list.d",
+                  # /etc/apt had only sources.list.d, so writing a hook to
+                  # /etc/apt/apt.conf.d/ -- apt-hook persistence, which runs
+                  # as root on every apt update -- failed with "No such file
+                  # or directory" on a box where that directory always
+                  # exists. The rest are the siblings a real /etc/apt has;
+                  # anything that lists the directory would count 2 instead
+                  # of 10.
+                  "/etc/apt/apt.conf.d", "/etc/apt/auth.conf.d",
+                  "/etc/apt/keyrings", "/etc/apt/preferences.d",
+                  "/etc/apt/trusted.gpg.d", "/etc/apt/mirrors",
+                  "/etc/apt/listchanges.conf.d",
                   "/etc/default", "/etc/logrotate.d", "/etc/security",
                   "/etc/pam.d", "/etc/skel", "/etc/init.d", "/etc/udev",
                   "/var/spool/cron/crontabs", "/var/lib/dpkg", "/var/lib/apt",
@@ -10340,6 +10351,60 @@ class VFS:
         # Trixie installs deb822 sources and leaves sources.list as a pointer.
         # The pointer has to resolve, or `cat` of the file it names contradicts
         # the file itself.
+        # The apt.conf.d files Debian ships. 01autoremove, 20auto-upgrades,
+        # 20listchanges and 70debconf verbatim from the guest; the two long
+        # ones are represented by their directives rather than their comment
+        # blocks, since 50unattended-upgrades is 7.4KB of explanation.
+        w("/etc/apt/apt.conf.d/01autoremove",
+          'APT\n{\n  NeverAutoRemove\n  {\n\t"^firmware-linux.*";\n'
+          '\t"^linux-firmware$";\n\t"^linux-image-[a-z0-9]*$";\n'
+          '\t"^linux-image-[a-z0-9]*-[a-z0-9]*$";\n  };\n\n'
+          '  VersionedKernelPackages\n  {\n\t# kernels\n\t"linux-.*";\n'
+          '\t"kfreebsd-.*";\n\t"gnumach-.*";\n'
+          '\t# (out-of-tree) modules\n\t".*-modules";\n\t".*-kernel";\n'
+          '  };\n\n  Never-MarkAuto-Sections\n  {\n\t"metapackages";\n'
+          '\t"tasks";\n  };\n\n  Move-Autobit-Sections\n  {\n'
+          '\t"oldlibs";\n  };\n};\n', mode=0o644)
+        w("/etc/apt/apt.conf.d/20auto-upgrades",
+          'APT::Periodic::Update-Package-Lists "1";\n'
+          'APT::Periodic::Unattended-Upgrade "1";\n', mode=0o644)
+        w("/etc/apt/apt.conf.d/20listchanges",
+          'DPkg::Pre-Install-Pkgs { "/usr/bin/apt-listchanges --apt || '
+          'test $? -lt 10"; };\n'
+          'DPkg::Tools::Options::/usr/bin/apt-listchanges::Version "2";\n'
+          'DPkg::Tools::Options::/usr/bin/apt-listchanges::InfoFD "20";\n'
+          'Dir::Etc::apt-listchanges-main "listchanges.conf";\n'
+          'Dir::Etc::apt-listchanges-parts "listchanges.conf.d";\n',
+          mode=0o644)
+        w("/etc/apt/apt.conf.d/70debconf",
+          '// Pre-configure all packages with debconf before they are '
+          'installed.\n// If you don\'t like it, comment it out.\n'
+          'DPkg::Pre-Install-Pkgs {"/usr/sbin/dpkg-preconfigure --apt '
+          '|| true";};\n', mode=0o644)
+        w("/etc/apt/apt.conf.d/50unattended-upgrades",
+          '// Unattended-Upgrade::Origins-Pattern controls which packages '
+          'are\n// upgraded.\n'
+          'Unattended-Upgrade::Origins-Pattern {\n'
+          '        "origin=Debian,codename=${distro_codename},'
+          'label=Debian";\n'
+          '        "origin=Debian,codename=${distro_codename},'
+          'label=Debian-Security";\n'
+          '        "origin=Debian,codename=${distro_codename}-security,'
+          'label=Debian-Security";\n};\n'
+          'Unattended-Upgrade::Package-Blacklist {\n};\n'
+          'Unattended-Upgrade::AutoFixInterruptedDpkg "true";\n'
+          'Unattended-Upgrade::MinimalSteps "true";\n'
+          'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";\n'
+          'Unattended-Upgrade::Remove-New-Unused-Dependencies "true";\n'
+          'Unattended-Upgrade::Remove-Unused-Dependencies "false";\n'
+          'Unattended-Upgrade::Automatic-Reboot "false";\n'
+          'Unattended-Upgrade::Automatic-Reboot-Time "02:00";\n',
+          mode=0o644)
+        w("/etc/apt/listchanges.conf",
+          '[apt]\nfrontend=pager\nwhich=news\nemail_address=root\n'
+          'email_format=text\nconfirm=false\nheaders=false\n'
+          'reverse=false\nsave_seen=/var/lib/apt/listchanges.db\n',
+          mode=0o644)
         w("/etc/apt/sources.list",
           "# See /etc/apt/sources.list.d/debian.sources\n")
         w("/etc/apt/sources.list.d/debian.sources",
@@ -17035,7 +17100,10 @@ class Shell:
                      "nisdomainname", "ypdomainname"),
         "iproute2": ("ip", "ss", "bridge", "tc", "nstat"),
         "apt": ("apt", "apt-get", "apt-cache", "apt-key", "apt-mark",
-                "apt-config"),
+                "apt-config"),          # apt-config is implemented; see
+                                        # cmd_apt_config -- it stays listed
+                                        # here because dpkg -L still has to
+                                        # say the apt package ships it
         "dpkg": ("dpkg", "dpkg-deb", "dpkg-query", "dpkg-split",
                  "dpkg-divert", "dpkg-statoverride", "update-alternatives"),
         "perl-base": ("perl",),
@@ -40311,6 +40379,197 @@ class Shell:
             self.err("bash: %s%s: No such file or directory"
                      % (self.where(), spelled))
         return 1
+
+    #: apt.conf keys that are compiled into apt rather than read from a
+    #: file. Measured from `apt-config dump` on the guest; the full dump is
+    #: 250 lines and this is the head of it plus the keys anything scripted
+    #: actually reads.
+    _APT_CONFIG_BUILTIN = (
+        ("APT", ""),
+        ("APT::Architecture", "amd64"),
+        ("APT::Build-Essential", ""),
+        ("APT::Build-Essential::", "build-essential"),
+        ("APT::Install-Recommends", "1"),
+        ("APT::Install-Suggests", "0"),
+        ("APT::Sandbox", ""),
+        ("APT::Sandbox::User", "_apt"),
+        ("Dir", "/"),
+        ("Dir::Etc", "etc/apt"),
+        ("Dir::Etc::main", "apt.conf"),
+        ("Dir::Etc::parts", "apt.conf.d"),
+        ("Dir::Etc::sourcelist", "sources.list"),
+        ("Dir::Etc::sourceparts", "sources.list.d"),
+        ("Dir::State", "var/lib/apt"),
+        ("Dir::State::lists", "lists/"),
+        ("Dir::State::status", "/var/lib/dpkg/status"),
+        ("Dir::Cache", "var/cache/apt"),
+        ("Dir::Cache::archives", "archives/"),
+        ("Dir::Bin", ""),
+        ("Dir::Bin::dpkg", "/usr/bin/dpkg"),
+        ("Dir::Log", "var/log/apt"),
+        ("Dir::Log::Terminal", "term.log"),
+        ("Dir::Log::History", "history.log"),
+    )
+
+    def _apt_conf_pairs(self):
+        """(key, value) from every file in /etc/apt/apt.conf.d, in order.
+
+        A small apt.conf parser: `//` and `#` comments out, `KEY "v";` flat,
+        and `KEY { "a"; "b"; };` or nested blocks flattened onto `KEY::`
+        the way apt's own dump prints them. That flattening is the point --
+        a hook lands as
+        `APT::Update::Post-Invoke-Success:: "curl ... | sh"`, which is the
+        line whoever planted it greps for.
+        """
+        out = []
+        try:
+            names = sorted(n for n in self.fs.listdir("/etc/apt/apt.conf.d")
+                           or [])
+        except Exception:                                      # noqa: BLE001
+            return out
+        main = self.fs.read("/etc/apt/apt.conf")
+        bodies = [("apt.conf", main)] if main else []
+        for name in names:
+            if name.endswith((".dpkg-old", ".dpkg-dist", ".ucf-old", "~")):
+                continue                # apt skips these, and so must we
+            bodies.append((name,
+                           self.fs.read("/etc/apt/apt.conf.d/" + name)))
+        for _name, raw in bodies:
+            if not raw:
+                continue
+            text = raw.decode("latin-1", "replace")
+            text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+            lines = []
+            for ln in text.splitlines():
+                ln = re.sub(r"(^|\s)(//|#).*$", "", ln)
+                lines.append(ln)
+            text = "\n".join(lines)
+            stack, i = [], 0
+            for tok in re.finditer(
+                    r'"[^"]*"|[A-Za-z0-9_:./+-]+|\{|\}|;', text):
+                t = tok.group(0)
+                if t == "{":
+                    continue
+                if t == "}":
+                    if stack:
+                        stack.pop()
+                    continue
+                if t == ";":
+                    continue
+                if t.startswith('"'):
+                    val = t[1:-1]
+                    if stack and stack[-1][1]:
+                        # a bare string inside a block is a list item
+                        out.append(("::".join(x[0] for x in stack) + "::",
+                                    val))
+                    elif stack:
+                        out.append(("::".join(x[0] for x in stack), val))
+                        stack.pop()
+                    continue
+                # a name: does a { follow before the next string?
+                rest = text[tok.end():tok.end() + 40].lstrip()
+                stack.append((t, rest.startswith("{")))
+                if not rest.startswith("{"):
+                    continue
+            i += 1
+        return out
+
+    @staticmethod
+    def _apt_config_tree(pairs):
+        """Insert the group nodes apt prints for every intermediate key.
+
+        Real apt dumps a parent as an empty-valued node before its
+        children: `APT::Periodic "";` then Update-Package-Lists and
+        Unattended-Upgrade, and `DPkg::Pre-Install-Pkgs "";` before the
+        two list items. Measured on the guest -- without them the dump is
+        the right values in the wrong shape, and anything walking it by
+        prefix sees no parent.
+        """
+        out, groups = [], set()
+        for key, val in pairs:
+            bare = key[:-2] if key.endswith("::") else key
+            parts = bare.split("::")
+            # Strict ancestors for a key that carries its own value; for a
+            # list key (`Foo::`) the bare name is itself the parent node.
+            depth = len(parts) if key.endswith("::") else len(parts) - 1
+            for i in range(1, depth + 1):
+                pre = "::".join(parts[:i])
+                if pre and pre not in groups:
+                    groups.add(pre)
+                    out.append((pre, ""))
+            if key in groups and not val and not key.endswith("::"):
+                continue            # already emitted as a group node
+            if not val and not key.endswith("::"):
+                # A node listed with no value *is* the group node, so
+                # register it -- otherwise a later child re-emits it and the
+                # dump carries `APT ""` twice.
+                groups.add(key)
+            out.append((key, val))
+        # apt walks its config tree, and each node's children come out in
+        # the order they were first seen -- not alphabetically. Measured on
+        # the guest: the dump is not C-sorted (`LC_ALL=C sort` reorders it),
+        # and 20auto-upgrades gives
+        #   APT::Periodic::Update-Package-Lists
+        #   APT::Periodic::Unattended-Upgrade
+        # in that order, which is the file's order and the reverse of
+        # alphabetical. So: order siblings by first appearance, and place
+        # every key inside its parent's subtree.
+        order = {}                      # parent path -> [child, ...]
+        for key, _v in out:
+            bare = key[:-2] if key.endswith("::") else key
+            parts = bare.split("::") + ([""] if key.endswith("::") else [])
+            for i in range(len(parts)):
+                sibs = order.setdefault("::".join(parts[:i]), [])
+                if parts[i] not in sibs:
+                    sibs.append(parts[i])
+
+        def _rank(kv):
+            k = kv[0]
+            bare = k[:-2] if k.endswith("::") else k
+            parts = bare.split("::") + ([""] if k.endswith("::") else [])
+            out_rank = []
+            for i in range(len(parts)):
+                out_rank.append(
+                    order.get("::".join(parts[:i]), []).index(parts[i]))
+            return out_rank
+        out.sort(key=_rank)
+        return out
+
+    def cmd_apt_config(self, a, stdin=""):
+        """apt-config: dump, and the shell form scripts use.
+
+        It was a stock stub printing its usage, on a box whose own
+        /etc/cron.daily/apt-compat runs
+        `apt-config shell RandomSleep APT::Periodic::RandomSleep` -- a
+        script shipped here calling a command shipped here that could not
+        answer. And with /etc/apt/apt.conf.d absent, apt-hook persistence
+        could not even be written, let alone confirmed.
+        """
+        verb = next((x for x in a if not x.startswith("-")), "")
+        pairs = self._apt_config_tree(
+            list(self._APT_CONFIG_BUILTIN) + self._apt_conf_pairs())
+        if verb == "dump":
+            names = [x for x in a if not x.startswith("-")][1:]
+            rows = []
+            for k, v in pairs:
+                if names and not any(k == n or k.startswith(n + "::")
+                                     for n in names):
+                    continue
+                rows.append('%s "%s";' % (k, v))
+            return "\n".join(rows) + ("\n" if rows else ""), 0
+        if verb == "shell":
+            # `apt-config shell VAR Key` prints VAR='value' for eval.
+            rest = [x for x in a if not x.startswith("-")][1:]
+            out = []
+            for i in range(0, len(rest) - 1, 2):
+                var, key = rest[i], rest[i + 1]
+                hit = next((v for k, v in reversed(pairs) if k == key), None)
+                if hit is not None:
+                    out.append("%s='%s'" % (var, hit))
+            return ("\n".join(out) + "\n") if out else "", 0
+        self.err("E: Invalid operation %s" % verb if verb else
+                 "apt-config 3.0.3 (amd64)")
+        return "", 100
 
     def cmd_chattr(self, a, stdin=""):
         """Set ext2 attributes. Both RedTail staging scripts use this.
