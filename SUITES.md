@@ -133,6 +133,7 @@ Run all:  `./run-suites.sh`
 - `psmisctest.py` -- Does every binary the box says it has actually run?
 - `quotectxtest.py` -- Does an operator inside quotes stay inside quotes?
 - `quotetest.py` -- Filenames that need quoting, and the contexts that render them.
+- `rclocaltest.py` -- /etc/rc.local: the oldest persistence route, and the unit behind it.
 - `rctest.py` -- Do commands *fail* the same way the real ones do?
 - `readtest.py` -- Reading a list, and what a loop exits with.
 - `reconntest.py` -- Does the box tell the same story when the attacker comes back?

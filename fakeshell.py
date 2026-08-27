@@ -6109,6 +6109,27 @@ class VFS:
               "AccuracySec=1h\nPersistent=true\n\n"
               "[Install]\nWantedBy=timers.target\n" % (_t, _per),
               mode=0o644)
+        # /etc/rc.local is the oldest persistence route that still works on
+        # a systemd box, and the unit that makes it work ships on every
+        # Debian install whether or not the file exists. We had no trace of
+        # it: `systemctl status rc-local` said "could not be found" and
+        # is-enabled said "not-found", on a box where the answers are the
+        # unit and "static". Someone who drops an /etc/rc.local and checks
+        # is told the mechanism does not exist here.
+        #
+        # Verbatim from the guest, and deliberately with no [Install]:
+        # systemd-rc-local-generator pulls it into multi-user.target when
+        # /etc/rc.local is executable, which is why it is static rather
+        # than enabled -- and _enabled() derives exactly that from the
+        # absent section, so nothing here has to assert it.
+        w("/usr/lib/systemd/system/rc-local.service",
+          "[Unit]\nDescription=/etc/rc.local Compatibility\n"
+          "Documentation=man:systemd-rc-local-generator(8)\n"
+          "ConditionFileIsExecutable=/etc/rc.local\n"
+          "After=network.target\n\n"
+          "[Service]\nType=forking\nExecStart=/etc/rc.local start\n"
+          "TimeoutSec=infinity\nRemainAfterExit=yes\nGuessMainPID=no\n",
+          mode=0o644)
         for _tg, _desc in (("multi-user", "Multi-User System"),
                            ("basic", "Basic System"),
                            ("sysinit", "System Initialization"),
@@ -36369,7 +36390,9 @@ class Shell:
                         % (fn, desc,
                            "masked (Reason: Unit %s is masked.)" % fn
                            if en == "masked" else
-                           "loaded (%s; %s; preset: enabled)"
+                           ("loaded (%s; %s)" if en in
+                            ("static", "generated") else
+                            "loaded (%s; %s; preset: enabled)")
                            % ((_drop[unit][4] if unit in _drop
                                else "/usr/lib/systemd/system/%s" % fn),
                               en))), 3
@@ -36624,7 +36647,18 @@ class Shell:
             w = max([len("UNIT FILE")] + [len(f) for f in shown])
             rows.append("%-*s %-15s %s" % (w, "UNIT FILE", "STATE", "PRESET"))
             for full in shown:
-                rows.append("%-*s %-15s %s" % (w, full, "enabled", "enabled"))
+                # STATE was the constant "enabled" for every row, so a
+                # static unit claimed to start at boot: the guest lists
+                # "rc-local.service static -" and "-.mount generated -".
+                # _enabled() already derives this from the unit body -- no
+                # [Install] means static -- and nothing here was asking it.
+                # PRESET is "-" for anything that cannot be enabled, which
+                # is what makes the two columns say the same thing.
+                st = _enabled(full.rsplit(".", 1)[0]
+                              if full.endswith(".service") else full)
+                pre = "-" if st in ("static", "masked", "generated") \
+                    else "enabled"
+                rows.append("%-*s %-15s %s" % (w, full, st, pre))
             rows += ["", "%d unit files listed." % len(shown)]
             return "\n".join(rows) + "\n", 0
         if verb == "list-units":

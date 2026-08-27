@@ -142,16 +142,32 @@ def t_systemctl_cat_matches_the_file_on_disk():
 
 
 def t_execstart_points_at_a_real_binary():
-    """A unit whose ExecStart does not exist could never have started."""
+    """A unit whose ExecStart does not exist could never have started.
+
+    Unless it says so itself. A unit guarded by ConditionFileIsExecutable
+    is allowed to name something absent -- that is what the condition is
+    for, and rc-local.service is the case that ships that way on every
+    Debian: ExecStart=/etc/rc.local start with no /etc/rc.local anywhere,
+    which is exactly the guest's own state. Asserting the invariant, not
+    the constant: the rule is "could this have started", and a unit whose
+    condition is unmet was never going to.
+    """
     s = sh()
     o, _ = run(s, "ls %s" % LIB)
     for unit in [n for n in o.split() if n.endswith(".service")]:
         body, _ = run(s, "grep ExecStart %s/%s" % (LIB, unit))
+        cond, _ = run(s, "grep ConditionFileIsExecutable %s/%s" % (LIB, unit))
+        guarded = set()
+        for line in cond.splitlines():
+            if "=" in line:
+                guarded.add(line.split("=", 1)[1].strip().lstrip("!"))
         for line in body.splitlines():
             if "=" not in line:
                 continue
             exe = line.split("=", 1)[1].strip().lstrip("-+!@").split()[0]
             if not exe.startswith("/") or "%" in exe:
+                continue
+            if exe in guarded:
                 continue
             o2, rc = run(s, "test -e %s && echo ok" % exe)
             eq("%s ExecStart %s exists" % (unit, exe), (o2.strip(), rc),
