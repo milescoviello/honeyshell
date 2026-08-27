@@ -19826,9 +19826,30 @@ class Shell:
         stamp = time.strftime("%b %e %H:%M:%S", time.localtime())
         body = "".join("%s %s systemd[1]: %s\n" % (stamp, HOST, ln)
                        for ln in lines)
-        node.content = node.content + body.encode("latin-1", "replace")
-        node.mtime = time.time()
-        node.ctime = max(node.ctime, node.mtime)
+        # Through the VFS, not straight at node.content. A direct mutation
+        # records no journal entry, and the journal is what save_fs_state
+        # persists -- while unit_state is persisted separately, as its own
+        # dict. So the unit's *state* survived a reload and the line saying
+        # it had started did not.
+        #
+        # 203.0.113.33 was told exactly that at 07:54 on 2026-08-27, when
+        # it came back to audit the srbminer.service it installed here:
+        #
+        #     systemctl is-active srbminer.service   active   rc 0
+        #     journalctl -u srbminer.service -n 15   -- No entries --
+        #
+        # Four readers said the unit was running -- is-active, MainPID, ps
+        # and the unit file -- and the fifth said nothing had ever happened.
+        # Same shape as the download path that set node.blob directly and
+        # was full-size until the first restart.
+        #
+        # A whole-file write rather than an append entry: syslog is 1578
+        # bytes seeded and the journal budget is 8MB, so this affords ~5300
+        # appends, and it avoids adding a journal tag -- an unhandled tag
+        # falls through dump_journal's else branch and is written out as a
+        # *remove*.
+        self.fs.write(path, node.content + body.encode("latin-1", "replace"),
+                      mode=node.mode)
 
     def _replay_cron_runs(self):
         """Write the CRON lines the installed jobs would have produced.
@@ -36566,13 +36587,45 @@ class Shell:
             out.append("%d timers listed." % len(rows))
             return "\n".join(out) + "\n", 0
         if verb == "list-unit-files":
-            rows = ["UNIT FILE                 STATE           PRESET"]
+            rows = []
             names = sorted(set(list(unit_tbl) + ["systemd-journald",
                                                     "systemd-logind", "dbus"]))
+            # Two things were wrong here and both show up in the check an
+            # operator makes straight after installing a unit.
+            #
+            # The pattern operands were thrown away, so `systemctl
+            # list-unit-files myunit.service` answered with all 56 units and
+            # "56 unit files listed." Measured on the guest, real systemd
+            # filters: an unknown name gives "0 unit files listed.", a known
+            # one gives its row and "1". Plain globbing against the full
+            # name, several patterns unioned, and no implicit .service
+            # completion -- bare `ssh` matches nothing there.
+            #
+            # And every name was printed with ".service" glued on, so the
+            # root mount listed as "-.mount.service" and a timer as
+            # "apt-daily-upgrade.timer.service" -- suffixes no unit has.
+            # _unit_full is the same helper `status` already uses for
+            # exactly this, after the same bug was fixed there.
+            pats = [x for x in args[1:] if not x.startswith("-")]
+            shown = []
             for name in names:
-                rows.append("%-25s %-15s %s"
-                            % (name + ".service", "enabled", "enabled"))
-            rows += ["", "%d unit files listed." % len(names)]
+                full = self._unit_full(name)
+                if pats and not any(fnmatch.fnmatchcase(full, q)
+                                    for q in pats):
+                    continue
+                shown.append(full)
+            # systemd sizes the name column to the widest row it is
+            # actually printing, so a filter that matches one unit gives a
+            # narrow header. Ours was a fixed 25 whatever was shown, which
+            # is only invisible while the filter is broken and everything
+            # is printed. Measured on the guest: unfiltered pads to the
+            # longest name, `list-unit-files ssh.service` gives
+            # "UNIT FILE   STATE   PRESET".
+            w = max([len("UNIT FILE")] + [len(f) for f in shown])
+            rows.append("%-*s %-15s %s" % (w, "UNIT FILE", "STATE", "PRESET"))
+            for full in shown:
+                rows.append("%-*s %-15s %s" % (w, full, "enabled", "enabled"))
+            rows += ["", "%d unit files listed." % len(shown)]
             return "\n".join(rows) + "\n", 0
         if verb == "list-units":
             failed_only = "--failed" in a or "--state=failed" in a
