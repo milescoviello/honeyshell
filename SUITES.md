@@ -199,6 +199,7 @@ Run all:  `./run-suites.sh`
 - `usertest.py` -- The user databases disagreed once anything changed.
 - `usrmergetest.py` -- dpkg does not follow the merged-/usr symlinks, and that is the answer.
 - `vartest.py` -- What kind of variable is this, and who agrees?
+- `verbannertest.py` -- What a tool says its version is, against what dpkg says it is.
 - `vertest.py` -- When the box is asked its own version numbers, do the answers agree?
 - `wheretest.py` -- Where is this program? Do the five ways of asking agree?
 - `wholefiletest.py` -- Does the box's copy of a file match the box it copies?

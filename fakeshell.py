@@ -18269,8 +18269,33 @@ class Shell:
             return "gzip %s\n" % upstream("gzip")
         if base == "xz":
             return "xz (XZ Utils) %s\n" % upstream("xz-utils")
-        if base == "awk":
-            return "mawk %s\n" % upstream("mawk").rsplit(".", 1)[0]
+        if base in ("awk", "mawk"):
+            # /usr/bin/awk is a symlink to /usr/bin/mawk, so both names
+            # have to print the same thing -- `diff <(awk --version)
+            # <(mawk --version)` is empty on the guest. Keying on "awk"
+            # alone left `mawk --version` silent.
+            # dpkg's 1.3.4.20250131-1 is mawk's "1.3.4 20250131": the last
+            # dotted component is the release date, which mawk prints
+            # space-separated. This chopped it off with rsplit and returned
+            # "mawk 1.3.4", so the one banner the docstring above promises
+            # "always matches dpkg" was the one that did not -- and 1.3.4
+            # without the date is a *2009* mawk, six releases back.
+            #
+            # And it printed one line where mawk prints ten. Measured on
+            # the guest, byte for byte.
+            v = upstream("mawk")
+            core, _, date = v.rpartition(".")
+            return ("mawk %s %s\n"
+                    "Copyright 2008-2024,2025, Thomas E. Dickey\n"
+                    "Copyright 1991-1996,2014, Michael D. Brennan\n"
+                    "\n"
+                    "random-funcs:       srandom/random\n"
+                    "regex-funcs:        internal\n"
+                    "\n"
+                    "compiled limits:\n"
+                    "sprintf buffer      8192\n"
+                    "maximum-integer     9223372036854775808\n"
+                    % (core or v, date))
         if base == "diff":
             return ("diff (GNU diffutils) %s\n" % upstream("diffutils"))
         if base == "which":
@@ -34280,6 +34305,12 @@ class Shell:
             self.shell.fs.write(path, prev + text.encode("latin-1", "replace"))
 
     def cmd_awk(self, a, stdin=""):
+        # `-W version` is mawk's own spelling of --version and prints the
+        # identical banner; ours consumed the -W and its argument as an
+        # option and printed nothing. Checked before the option loop
+        # because that loop treats -W as "skip the next word".
+        if len(a) >= 2 and a[0] == "-W" and a[1].lower().startswith("v"):
+            return self._version_text("awk"), 0
         prog = None
         fs_arg = None
         assigns = {}
@@ -34317,6 +34348,16 @@ class Shell:
                                  % (a[i + 1] if i + 1 < len(a) else ""))
                         return "", 2
                     prog = body.decode("latin-1")
+                    i += 2
+                    continue
+                if x == "-W":
+                    # -W takes an argument -- version, posix, interactive,
+                    # dump. This advanced past the flag only, so "posix"
+                    # became the program and the real program became a
+                    # filename: `awk -W posix '{print $3}'` printed nothing
+                    # where the guest prints the field. --posix and
+                    # --traditional beside it take no argument and are
+                    # right to advance by one.
                     i += 2
                     continue
                 i += 1
@@ -42816,8 +42857,15 @@ class Shell:
                 return table[a[1]] + "\n", 0
             self.err("dmidecode: Invalid string keyword: %s" % a[1])
             return "", 1
-        head = ("# dmidecode 3.4\nGetting SMBIOS data from sysfs.\n"
-                "SMBIOS 2.8 present.\n")
+        # The banner was the literal 3.4 while dpkg calls the package
+        # 3.6-2 -- the binary and the package database disagreeing about
+        # which dmidecode this is. Taken from the package now, so it moves
+        # when that does.
+        _dmi_v = re.sub(r"^\d+:", "",
+                        (self._pkg_version("dmidecode") or "3.6")
+                        ).split("-")[0].split("+")[0]
+        head = ("# dmidecode %s\nGetting SMBIOS data from sysfs.\n"
+                "SMBIOS 2.8 present.\n" % _dmi_v)
         # -t printed the header and stopped, so `dmidecode -t system` --
         # the standard "what am I running on" -- answered with two lines
         # and no data, on a box whose /sys/class/dmi/id is fully populated.

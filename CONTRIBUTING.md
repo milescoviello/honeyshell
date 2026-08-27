@@ -42,7 +42,7 @@ before you trust it.
 ./run-suites.sh
 ```
 
-On a Debian 13 host that should print `suites: 194   unexpected failures: 0
+On a Debian 13 host that should print `suites: 195   unexpected failures: 0
 known: 1` — the one known failure is `awktest.py`, and
 [docs/testing.md](docs/testing.md) says why it is tolerated by name rather
 than skipped. Anything else failing is either your change or a host that is
