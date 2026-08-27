@@ -36038,7 +36038,8 @@ class Shell:
                     # while the journal said "-- No entries --".
                     self._syslog_append(
                         ["Started %s.service - %s." % (u, _desc_of(u))])
-                elif verb == "stop":
+                elif verb == "stop" or (verb == "disable"
+                                        and "--now" in a):
                     # _active is defined further down; read the state
                     # directly rather than depend on the ordering.
                     was = state.get(u, {}).get("active", u not in _drop)
@@ -36053,6 +36054,27 @@ class Shell:
                     self._resync_proc()
                     self._publish_sockets()
                 elif verb == "enable":
+                    if "--now" in a:
+                        # `enable --now` is enable *and* start, and it is the
+                        # single command a loader uses to install persistence
+                        # and turn it on. We created the symlink and left the
+                        # unit dead, so `systemctl is-active` said inactive
+                        # and `ps` showed nothing right after the operator
+                        # had been told the unit was installed and running.
+                        cur["active"] = True
+                        cur["since"] = time.time()
+                        for pid in getattr(
+                                self.fs, "unit_pid_extra", {}).pop(u, ()):
+                            self._killed_pids.discard(pid)
+                            self.fs.respawned = [
+                                r for r in getattr(self.fs, "respawned", [])
+                                if r[1] != pid]
+                        for pid in self._UNIT_PIDS.get(u, ()):
+                            self._killed_pids.discard(pid)
+                        self._resync_proc()
+                        self._publish_sockets()
+                        self._syslog_append(
+                            ["Started %s.service - %s." % (u, _desc_of(u))])
                     # Enabling *is* creating the symlink. Setting a state
                     # flag instead meant `systemctl disable nginx` reported
                     # disabled while the .wants symlink was still sitting
@@ -36326,8 +36348,10 @@ class Shell:
                         % (fn, desc,
                            "masked (Reason: Unit %s is masked.)" % fn
                            if en == "masked" else
-                           "loaded (/usr/lib/systemd/system/%s; %s; "
-                           "preset: enabled)" % (fn, en))), 3
+                           "loaded (%s; %s; preset: enabled)"
+                           % ((_drop[unit][4] if unit in _drop
+                               else "/usr/lib/systemd/system/%s" % fn),
+                              en))), 3
             # A dropped-in unit is loaded from where its file is, and it
             # started when it was started -- not at boot. status claimed
             # /lib/systemd/system and "41 days ago" for a unit written
@@ -36386,8 +36410,13 @@ class Shell:
             # and show tested membership of a table. Ask the one function.
             _up = _active(_key(unit)) if unit else known
             known = known or _up
+            # A unit that is not running has no main pid. This reported
+            # the table's pid whatever the state, so `systemctl show -p
+            # MainPID` named a process while `is-active` said inactive and
+            # `ps` showed nothing -- three answers to "is it running?".
+            _mp = str(pid) if _up else "0"
             values = {
-                "MainPID": str(pid),
+                "MainPID": _mp,
                 "Id": (unit + ".service") if unit else "",
                 "Names": (unit + ".service") if unit else "",
                 "Description": desc,
@@ -36395,9 +36424,14 @@ class Shell:
                 "ActiveState": "active" if _up else "inactive",
                 "SubState": "running" if _up else "dead",
                 "UnitFileState": "enabled" if known else "",
-                "FragmentPath": ("/usr/lib/systemd/system/%s.service" % unit)
-                                if known else "",
-                "ExecMainPID": str(pid),
+                # A unit an attacker dropped into /etc/systemd/system is
+                # loaded from there, and `enable` prints that path in the
+                # symlink line it just emitted. Hardcoding /usr/lib made
+                # show and enable disagree about where the file was.
+                "FragmentPath": ((_drop[unit][4] if unit in _drop
+                                  else "/usr/lib/systemd/system/%s.service"
+                                  % unit) if known else ""),
+                "ExecMainPID": _mp,
                 # A timer's own properties. `systemctl show apt-daily.timer
                 # -p LastTriggerUSec` printed nothing at all -- not an empty
                 # value, no line -- while list-timers has a column for it
