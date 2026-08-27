@@ -14981,6 +14981,11 @@ class Shell:
         ("/etc/rc.local", "persistence_write", "rc_local"),
         ("/etc/ld.so.preload", "persistence_write", "ld_preload"),
         ("/etc/ssh/sshrc", "persistence_write", "sshrc"),
+        # The per-user half of the same mechanism, and the one an attacker
+        # can write without touching /etc. sshd prefers it over
+        # /etc/ssh/sshrc when both exist.
+        ("/root/.ssh/rc", "persistence_write", "sshrc"),
+        ("/home/deploy/.ssh/rc", "persistence_write", "sshrc"),
         ("/root/.bashrc", "persistence_write", "shell_init"),
         ("/root/.profile", "persistence_write", "shell_init"),
         ("/home/deploy/.bashrc", "persistence_write", "shell_init"),
@@ -43112,6 +43117,48 @@ class Shell:
     # interactive non-login shell takes ~/.bashrc. Debian's own ~/.profile
     # sources ~/.bashrc, so on this box a login session runs both.
     _PROFILE_CANDIDATES = (".bash_profile", ".bash_login", ".profile")
+
+    def run_ssh_rc(self):
+        """What sshd runs before the shell: ~/.ssh/rc, or /etc/ssh/sshrc.
+
+        Writing ~/.ssh/rc is persistence you get for one echo, and it is
+        SSH-native rather than shell-native: sshd runs it, so it fires for
+        `ssh host 'cmd'` as well as for an interactive login, and it fires
+        for every login from then on. Nothing here ran either file --
+        run_startup_files covers what *bash* sources, which is a later and
+        different step -- so someone who planted one and reconnected to
+        check saw nothing at all.
+
+        Measured against the guest, which is Debian 13.6 with stock
+        sshd_config (PermitUserRC unset, so the default yes):
+
+          * the output lands in the session ahead of the command's own,
+            for an exec session as much as an interactive one;
+          * no execute bit is needed and no shebang is read -- a mode 600
+            file with a bare `echo` line ran -- because sshd hands it to
+            sh(1) rather than exec'ing it;
+          * exactly one runs. `man sshd`: "If this file does not exist,
+            /etc/ssh/sshrc is run".
+
+        Returns what it printed, or "" when there is nothing to run.
+        """
+        home = self.vars.get("HOME") or ("/root" if self.user == "root"
+                                         else "/home/%s" % self.user)
+        for path in ("%s/.ssh/rc" % home.rstrip("/"), "/etc/ssh/sshrc"):
+            node = (self.fs.nodes.get(path)
+                    or self.fs.nodes.get(self.fs.resolve(path)))
+            if node is None or node.is_dir:
+                continue
+            body = self.fs.read(path)
+            if body is None:
+                continue
+            self.log(event="ssh_rc_run", path=path, size=len(body),
+                     notable=True)
+            try:
+                return self.run("sh %s" % path)
+            except Exception:                                  # noqa: BLE001
+                return ""
+        return ""
 
     def run_startup_files(self, login=True):
         """Source the files bash sources when a session starts.
