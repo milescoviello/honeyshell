@@ -174,9 +174,17 @@ def main():
     puuids = re.findall(r'PARTUUID="([^"]+)"', blk)
     check("blkid gives every partition a distinct PARTUUID",
           len(set(puuids)) == len(puuids), str(puuids))
-    check("blkid's PARTUUID suffix is the partition number",
-          all(p.endswith("-%02d" % int(re.search(r"(\d+)$", d).group(1)))
-              for d, p in zip(parts, puuids) if re.search(r"\d+$", d)),
+    # This asserted `p.endswith("-%02d" % partition_number)` -- the DOS
+    # form, an MBR disk id plus an index. It was the second of our own
+    # suites to have the bug written down as the expectation, and unlike
+    # devtest's version it at least failed loudly when the format was
+    # corrected. A GPT entry UUID is a full 8-4-4-4-12 and carries no
+    # relationship to the partition number; what has to hold is that every
+    # partition has one and that they differ.
+    check("blkid's PARTUUIDs are GPT entry UUIDs",
+          bool(puuids) and all(
+              re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+                       r"-[0-9a-f]{4}-[0-9a-f]{12}$", p) for p in puuids),
           str(list(zip(parts, puuids))))
     root_uuid = re.search(r'/dev/sda1: UUID="([^"]+)"', blk)
     check("fstab's root UUID is the one blkid reports",

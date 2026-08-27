@@ -5906,10 +5906,12 @@ class VFS:
                              (BOOT_UUID, "../../sda15")):
             self.nodes["/dev/disk/by-uuid/" + name] = FileNode(
                 mode=0o777, link=target, mtime=BOOT_TS)
-        # blkid reports these, so by-partuuid and by-label have to agree.
-        for name, target in (("b41c9e2a-01", "../../sda1"),
-                             ("b41c9e2a-14", "../../sda14"),
-                             ("b41c9e2a-15", "../../sda15")):
+        # blkid reports these, so by-partuuid and by-label have to agree --
+        # and they agree by construction now, built from partuuid_of rather
+        # than a second copy of the strings that has to be edited in step.
+        for name, target in ((partuuid_of("sda1"), "../../sda1"),
+                             (partuuid_of("sda14"), "../../sda14"),
+                             (partuuid_of("sda15"), "../../sda15")):
             self.nodes["/dev/disk/by-partuuid/" + name] = FileNode(
                 mode=0o777, link=target, mtime=BOOT_TS)
         self.nodes["/dev/disk/by-label/UEFI"] = FileNode(
@@ -13903,13 +13905,49 @@ BLOCK_DEVICES = (
 )
 
 
+#: GPT partition type GUIDs and the names lsblk prints for them. Universal
+#: constants, not this box's -- every GPT on every machine uses these.
+PART_TYPES = {
+    1:  ("4f68bce3-e8cd-4db1-96e7-fbcaf984b709", "Linux root (x86-64)"),
+    14: ("21686148-6449-6e6f-744e-656564454649", "BIOS boot"),
+    15: ("c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "EFI System"),
+}
+
+
 def partuuid_of(dev):
     """The GPT entry's UUID, which exists whether or not there is a
-    filesystem on the partition."""
+    filesystem on the partition.
+
+    The docstring was right and the code was not: this returned
+    "%s-%02d" % (ROOT_UUID[:8], n) -- "b41c9e2a-01" -- which is an MBR disk
+    identifier plus a partition index, the form a *DOS* label produces. No
+    GPT emits it, and this layout is unambiguously GPT: sda14 is a BIOS
+    boot partition and sda15 an ESP, which an MBR cannot express, and
+    udevadm reports ID_PART_TABLE_TYPE=gpt. The comment at blkid's call
+    site had already noted the shape was one "no partition table
+    produces".
+
+    A real GPT entry UUID is a full 8-4-4-4-12. Derived from the disk's own
+    identity and the partition number so it is stable across restarts and
+    distinct per partition, rather than random per boot -- an attacker who
+    notes a PARTUUID and comes back has to find the same one.
+    """
     m = re.search(r"(\d+)$", dev or "")
     if not m:
         return ""
-    return "%s-%02d" % (ROOT_UUID[:8], int(m.group(1)))
+    seed = ("%s:%s" % (DISK_PTUUID, m.group(1))).encode("ascii")
+    h = hashlib.md5(seed).hexdigest()
+    return "%s-%s-4%s-%s%s-%s" % (h[:8], h[8:12], h[13:16],
+                                  "89ab"[int(h[16], 16) % 4], h[17:20],
+                                  h[20:32])
+
+
+def parttype_of(dev):
+    """(type GUID, type name) for a partition, or ("", "")."""
+    m = re.search(r"(\d+)$", dev or "")
+    if not m:
+        return "", ""
+    return PART_TYPES.get(int(m.group(1)), ("", ""))
 
 
 def device_info(dev):
@@ -27376,10 +27414,38 @@ class Shell:
             return "0B" if n == 0 else h(n // 1024)
 
         def _dev(name, extra):
+            # A whole disk's identity, from the same values udevadm
+            # publishes. lsblk printed nothing for MODEL, VENDOR or SERIAL
+            # while `udevadm info` had ID_MODEL, ID_VENDOR and
+            # ID_SERIAL_SHORT for the same device -- one box, two answers.
+            rom = name.startswith("sr")
             row = {"ROTA": q(name, "rotational"),
                    "PHY-SEC": q(name, "physical_block_size"),
                    "LOG-SEC": q(name, "logical_block_size"),
-                   "SCHED": sched(name), "DISC-GRAN": disc(name)}
+                   "SCHED": sched(name), "DISC-GRAN": disc(name),
+                   "MODEL": "QEMU DVD-ROM" if rom else "QEMU HARDDISK",
+                   "VENDOR": "QEMU",
+                   "SERIAL": "QM00003" if rom else "drive-scsi0",
+                   "WWN": "", "PARTUUID": "", "PARTLABEL": "",
+                   "PARTTYPE": "", "PARTTYPENAME": ""}
+            row.update(extra)
+            return row
+
+        def _part(name, extra):
+            """A partition carries its GPT entry, not the disk's identity.
+
+            PARTUUID was empty in every lsblk listing while blkid printed
+            one and /dev/disk/by-partuuid held a symlink named after it --
+            three readers of the same fact, one of them silent.
+            """
+            ptype, ptname = parttype_of(name)
+            row = {"PARTUUID": partuuid_of(name), "PARTLABEL": "",
+                   "PARTTYPE": ptype, "PARTTYPENAME": ptname,
+                   "MODEL": "", "VENDOR": "", "SERIAL": "", "WWN": "",
+                   "ROTA": q("sda", "rotational"),
+                   "PHY-SEC": q("sda", "physical_block_size"),
+                   "LOG-SEC": q("sda", "logical_block_size"),
+                   "SCHED": sched("sda"), "DISC-GRAN": disc("sda")}
             row.update(extra)
             return row
 
@@ -27390,21 +27456,21 @@ class Shell:
                          "TYPE": "disk", "MOUNTPOINTS": "",
                          "MOUNTPOINT": "", "FSTYPE": "", "UUID": "",
                          "LABEL": "", "PARENT": None}),
-            {"NAME": "sda1", "PREFIX": "\u251c\u2500", "MAJ:MIN": "8:1",
+            _part("sda1", {"NAME": "sda1", "PREFIX": "\u251c\u2500", "MAJ:MIN": "8:1",
              "RM": "0", "SIZE": h(ROOT_PART_BLOCKS), "RO": "0",
              "TYPE": "part", "MOUNTPOINTS": "/", "MOUNTPOINT": "/",
              "FSTYPE": "ext4", "UUID": ROOT_UUID, "LABEL": "",
-             "PARENT": "sda"},
-            {"NAME": "sda14", "PREFIX": "\u251c\u2500", "MAJ:MIN": "8:14",
+             "PARENT": "sda"}),
+            _part("sda14", {"NAME": "sda14", "PREFIX": "\u251c\u2500", "MAJ:MIN": "8:14",
              "RM": "0", "SIZE": self._lsblk_size(BIOS_BOOT_BLOCKS),
              "RO": "0", "TYPE": "part",
              "MOUNTPOINTS": "", "MOUNTPOINT": "", "FSTYPE": "",
-             "UUID": "", "LABEL": "", "PARENT": "sda"},
-            {"NAME": "sda15", "PREFIX": "\u2514\u2500", "MAJ:MIN": "8:15",
+             "UUID": "", "LABEL": "", "PARENT": "sda"}),
+            _part("sda15", {"NAME": "sda15", "PREFIX": "\u2514\u2500", "MAJ:MIN": "8:15",
              "RM": "0", "SIZE": h(ESP_BLOCKS), "RO": "0", "TYPE": "part",
              "MOUNTPOINTS": "/boot/efi", "MOUNTPOINT": "/boot/efi",
              "FSTYPE": "vfat", "UUID": BOOT_UUID, "LABEL": "UEFI",
-             "PARENT": "sda"},
+             "PARENT": "sda"}),
             _dev("sr0", {"NAME": "sr0", "PREFIX": "", "MAJ:MIN": "11:0",
                          "RM": "1", "SIZE": "1024M", "RO": "0",
                          "TYPE": "rom", "MOUNTPOINTS": "",

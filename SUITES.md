@@ -118,6 +118,7 @@ Run all:  `./run-suites.sh`
 - `owntest.py` -- Does every binary on this box belong to a package?
 - `pamtest.py` -- Does the box agree with itself that it authenticates anybody?
 - `paramtest.py` -- Parameter expansion, and what happens when one of them fails.
+- `partuuidtest.py` -- The disk's identity, and the commands that report it.
 - `pathtest.py` -- Do the commands that resolve paths agree with each other?
 - `persiststatetest.py` -- What an attacker changes has to survive a restart, or none of it should.
 - `pkgdbtest.py` -- What is installed here, and does the database agree with the tools?

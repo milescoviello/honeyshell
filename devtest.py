@@ -190,14 +190,35 @@ def t_blkid_omits_fields_it_cannot_know():
                ("yes", 0))
 
 
-def t_partuuids_match_the_partition_numbers():
+def t_partuuids_are_gpt_entry_uuids():
+    """Every partition has a distinct GPT entry UUID, and blkid says so.
+
+    This used to assert the opposite. It matched
+    PARTUUID="<prefix>-<NN>" and checked NN against the partition number --
+    encoding the *DOS* form, an MBR disk identifier plus an index, as the
+    expected shape. On a layout with a BIOS boot partition and an ESP,
+    which only GPT can express, that was the wrong invariant.
+
+    Worse, when the form was corrected the test did not fail: the `if m:`
+    meant a non-matching line was silently skipped, so three checks simply
+    stopped running and the suite went from 103 passed to 100 with nothing
+    red. A test that quietly disappears is worse than one that breaks --
+    so this one counts what it found and fails if it found nothing.
+    """
     s = sh()
     out, _ = run(s, "blkid")
+    seen = {}
     for l in out.splitlines():
-        m = re.match(r"/dev/sda(\d+):.*PARTUUID=\"[^-]+-(\d+)\"", l)
+        m = re.match(r"/dev/(sda\d+):.*PARTUUID=\"([^\"]*)\"", l)
         if m:
-            eq("sda%s has PARTUUID -%s" % (m.group(1), m.group(1)),
-               int(m.group(2)), int(m.group(1)))
+            seen[m.group(1)] = m.group(2)
+    eq("blkid reports a PARTUUID for every partition",
+       sorted(seen), ["sda1", "sda14", "sda15"])
+    for part, val in sorted(seen.items()):
+        eq("%s PARTUUID is a full UUID" % part,
+           bool(re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+                         r"-[0-9a-f]{4}-[0-9a-f]{12}$", val)), True)
+    eq("the PARTUUIDs are distinct", len(set(seen.values())), len(seen))
 
 
 def t_disk_symlink_farm_is_populated():
@@ -317,7 +338,7 @@ TESTS = [t_the_fstab_uuid_chain_resolves, t_every_by_uuid_link_resolves,
          t_character_devices_keep_their_numbers,
          t_no_device_nothing_else_mentions, t_lsblk_draws_a_tree,
          t_blkid_omits_fields_it_cannot_know,
-         t_partuuids_match_the_partition_numbers,
+         t_partuuids_are_gpt_entry_uuids,
          t_disk_symlink_farm_is_populated, t_sizes_stay_self_consistent,
          t_findmnt_answers_about_size,
          t_findmnt_takes_bundled_short_options,

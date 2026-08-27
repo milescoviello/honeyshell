@@ -1,7 +1,7 @@
 # Testing
 
-There is more test than implementation here: 50,715 lines across 192 suites
-against 44,408 lines of emulator. That ratio is the point, not an accident —
+There is more test than implementation here: 50,937 lines across 193 suites
+against 44,474 lines of emulator. That ratio is the point, not an accident —
 see [design.md](design.md) for why.
 
 ## Running them
