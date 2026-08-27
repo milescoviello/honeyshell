@@ -17902,7 +17902,12 @@ class Shell:
         # systemd-cgls and systemd-cgtop ship with systemd and were
         # "command not found" on a box running it -- the two commands that
         # show the cgroup tree, missing from the package that owns them.
+        # localectl was missing from this list, so a box with hostnamectl
+        # and timedatectl shipped two thirds of the trio and `command -v
+        # localectl` came back empty on a machine whose dpkg says systemd
+        # is installed.
         "systemd": ("systemd-run", "systemctl", "journalctl", "hostnamectl",
+                    "localectl",
                     "timedatectl",
                     "loginctl", "systemd-analyze", "systemd-detect-virt",
                     "systemd-cgls", "systemd-cgtop",
@@ -28890,6 +28895,25 @@ class Shell:
             return "", 0
         if verb == "hostname":
             return self.fs.hostname + "\n", 0
+        # hostnamectl is the one of the trio that has *no* `show` verb and
+        # no -p: systemctl and timedatectl both take them, so it reads like
+        # an oversight and is not. Ours accepted anything and printed the
+        # status block, which is a tell in the permissive direction -- a
+        # script that runs `hostnamectl show` gets an error on Debian and
+        # output here. Measured on the guest:
+        #   hostnamectl show        Unknown command verb 'show', did you
+        #                           mean 'help'?              rc 1
+        #   hostnamectl frobnicate  Unknown command verb 'frobnicate'. rc 1
+        #   hostnamectl -p X        hostnamectl: invalid option -- 'p'
+        if "-p" in opts:
+            self.err("hostnamectl: invalid option -- 'p'")
+            return "", 1
+        if verb not in ("status", "hostname"):
+            if verb == "show":
+                self.err("Unknown command verb 'show', did you mean 'help'?")
+            else:
+                self.err("Unknown command verb '%s'." % verb)
+            return "", 1
         # A single --static/--transient/--pretty asks for one value.
         # The static hostname is /etc/hostname and the transient one is the
         # kernel's. `hostname evilbox` sets only the kernel's, so after it
@@ -29126,6 +29150,61 @@ class Shell:
         out, _rc = self.dispatch(target, argv[1:], stdin)
         return out, 0
 
+    def cmd_localectl(self, a, stdin=""):
+        """localectl: the third of the ctl trio, and it was simply missing.
+
+        systemd ships it on every install and the guest has it at
+        /usr/bin/localectl, so a box with hostnamectl and timedatectl and
+        no localectl is a box that shipped two thirds of a package.
+
+        It reads the same /etc/locale.conf the shell's own LANG comes from,
+        rather than restating the value -- `locale`, /etc/locale.conf and
+        this have to agree, and they do by construction.
+
+        Measured on the guest:
+
+            System Locale: LANG=C.UTF-8
+                VC Keymap: (unset)
+               X11 Layout: (unset)
+
+        The keymap rows are "(unset)" because /etc/default/keyboard does
+        not exist there -- Debian stopped shipping one -- and it does not
+        exist here either.
+        """
+        verb = next((x for x in a if not x.startswith("-")), "")
+        if verb and verb not in ("status", "list-locales", "set-locale",
+                                 "list-keymaps", "set-keymap",
+                                 "set-x11-keymap"):
+            self.err("Unknown command verb '%s'." % verb)
+            return "", 1
+        conf = (self.fs.read("/etc/locale.conf") or b"").decode(
+            "latin-1", "replace")
+        lang = ""
+        for line in conf.splitlines():
+            if line.startswith("LANG="):
+                lang = line.split("=", 1)[1].strip().strip('"')
+        if verb == "list-locales":
+            return (lang or "C.UTF-8") + "\n", 0
+        if verb == "list-keymaps":
+            # No console-setup here, so there is no keymap list to print.
+            self.err("Failed to read list of keymaps: No such file or "
+                     "directory")
+            return "", 1
+        if verb in ("set-locale", "set-keymap", "set-x11-keymap"):
+            return "", 0
+        kb = self.fs.read("/etc/default/keyboard")
+        keymap = layout = "(unset)"
+        if kb:
+            body = kb.decode("latin-1", "replace")
+            for line in body.splitlines():
+                if line.startswith("XKBLAYOUT="):
+                    layout = line.split("=", 1)[1].strip().strip('"') \
+                        or "(unset)"
+        rows = [("System Locale", "LANG=" + (lang or "C.UTF-8")),
+                ("VC Keymap", keymap),
+                ("X11 Layout", layout)]
+        return "".join("%16s: %s\n" % (k, v) for k, v in rows), 0
+
     def cmd_timedatectl(self, a, stdin=""):
         """The RTC row was missing and two keys were a column out.
 
@@ -29148,6 +29227,42 @@ class Shell:
                 self.err("Failed to set time: Automatic time "
                          "synchronization is enabled")
                 return "", 1
+        if verb == "show":
+            # `show` fell through to the status block, so the scripted way
+            # to read one property -- `timedatectl show -p Timezone
+            # --value` -- answered with the whole human-readable table.
+            # Same shape as list-unit-files ignoring its operand in sweep
+            # 196. Measured on the guest: key=value lines, and --value
+            # prints the bare value for the named property.
+            now = self.wall()
+            props = [
+                ("Timezone", self._zone_name()),
+                ("LocalRTC", "no"),
+                ("CanNTP", "yes"),
+                ("NTP", "yes"),
+                ("NTPSynchronized", "yes"),
+                ("TimeUSec", time.strftime("%a %Y-%m-%d %H:%M:%S UTC",
+                                           time.localtime(now))),
+                ("RTCTimeUSec", time.strftime("%a %Y-%m-%d %H:%M:%S UTC",
+                                              time.gmtime(now))),
+            ]
+            want = []
+            for i, x in enumerate(a):
+                if x in ("-p", "--property") and i + 1 < len(a):
+                    want += a[i + 1].split(",")
+                elif x.startswith("--property="):
+                    want += x.split("=", 1)[1].split(",")
+            bare = "--value" in a
+            rows = [kv for kv in props if not want or kv[0] in want]
+            if bare:
+                return "".join(v + "\n" for _k, v in rows), 0
+            return "".join("%s=%s\n" % kv for kv in rows), 0
+        if verb and verb not in ("status", "show-timesync", "timesync-status",
+                                 "list-timezones"):
+            # Real timedatectl refuses a verb it does not know rather than
+            # printing the status; ours printed status for anything.
+            self.err("Unknown command verb '%s'." % verb)
+            return "", 1
         now = self.wall()
         stamp = time.strftime("%a %Y-%m-%d %H:%M:%S UTC", time.localtime(now))
         rows = [("Local time", stamp),

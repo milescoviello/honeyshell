@@ -37,6 +37,7 @@ Run all:  `./run-suites.sh`
 - `cronranstest.py` -- A cron job the attacker installed has to appear in cron's own log.
 - `crontamptest.py` -- A wipe, a gutting and an install all logged as cron_install.
 - `crontest.py` -- crontab: one crontab for everyone, and no validation at all.
+- `ctlverbtest.py` -- The systemd ctl trio, and which query verbs each one actually takes.
 - `detect.py` -- Try to prove this box is fake, the way an attacker who just landed would.
 - `devmodeltest.py` -- The device model: which devices exist, and does every view agree?
 - `devtest.py` -- Does the disk story hold together from /etc/fstab down to /dev?
