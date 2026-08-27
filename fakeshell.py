@@ -7833,9 +7833,15 @@ class VFS:
             _own = (getattr(self, "proc_meta", None) or {}).get(pid) or {}
             _anchor = _own.get("ppid")
             unit = None if _anchor else self._unit_of_pid(pid, comm, tty)
+            # The session id, which is what loginctl and $XDG_SESSION_ID
+            # both report -- not the pid of whoever started it.
+            # This process's own session, not whichever one allocated
+            # most recently.
+            _sess = (getattr(self, "proc_session", {}) or {}).get(
+                pid, getattr(self, "shell_session_id", 1))
             path = ("init.scope" if pid == 1 else
                     ("system.slice/" + unit) if unit else
-                    session_scope_path(uid, _anchor or pid))
+                    session_scope_path(uid, _sess))
             return ("0::/%s\n" % path).encode()
         if what in ("maps", "smaps", "smaps_rollup"):
             exe = cmd.lstrip("-").split()[0] if cmd.strip() else "/bin/false"
@@ -13148,13 +13154,20 @@ CGROUP_ROOT_DIRS = (
 )
 
 
-def session_scope_path(uid, pid):
+def session_scope_path(uid, session_id):
     """The cgroup path a login session's process sits in.
 
     One function, because /proc/<pid>/cgroup and the tree under
-    /sys/fs/cgroup have to name the same scope.
+    /sys/fs/cgroup have to name the same scope -- and the number in it is
+    the *session* id, not something derived from a pid. It was
+    `pid % 40 + 1`, so /proc/self/cgroup said session-21.scope while
+    loginctl and $XDG_SESSION_ID both said 2925: three readers of one
+    session, and the cgroup was the one that disagreed.
+
+    Measured on the guest: the cgroup path, `loginctl list-sessions` and
+    $XDG_SESSION_ID all read 8041 for one session.
     """
-    return "user.slice/user-%d.slice/session-%d.scope" % (uid, pid % 40 + 1)
+    return "user.slice/user-%d.slice/session-%s.scope" % (uid, session_id)
 
 
 def cgroup_dir_files(path, memory=None, tasks=None, procs=(), cpu_usec=None):
@@ -13705,6 +13718,16 @@ class Shell:
         # shell_pid only exists from here on, which is why the environ
         # snapshot above cannot record it itself.
         self.rawfs.shell_env_pid = self.shell_pid
+        # Publish this shell's login session for /proc/<pid>/cgroup, which
+        # is generated in the VFS and has no shell to ask.
+        #
+        # Here rather than inside the property: the environment dict is
+        # built earlier in __init__ and reads XDG_SESSION_ID, so the
+        # property fires before shell_pid exists -- and a publish in there
+        # was silently swallowed every time. rawfs, not fs, because
+        # _proc_dynamic runs on the raw VFS and the wrapper is a different
+        # object; the settable clock hit the same trap in sweep 177.
+        self._publish_session()
         # ...and keyed by pid as well, because one slot on the shared VFS is
         # not one shell. `nohup ./x &` builds a second Shell, which
         # overwrote shell_env_pid with its own pid -- a pid the process
@@ -14067,7 +14090,8 @@ class Shell:
         level down.
         """
         return session_scope_path(
-            self.creds.uid if hasattr(self, "creds") else 0, self.shell_pid)
+            self.creds.uid if hasattr(self, "creds") else 0,
+            self.logind_session)
 
     def _creds_for(self, user):
         """(uid, gid, supplementary gids) read out of passwd and group."""
@@ -17510,6 +17534,13 @@ class Shell:
             sub._nest = self._nest + 1
             _claimed = sub.shell_pid
             sub.shell_pid = self.shell_pid   # bash: $$ is the parent's
+            # ...and it is the parent's *login* session too. A subshell is
+            # a fork, not a new login: allocating one per Shell object left
+            # a backgrounded process and the shell that started it naming
+            # different sessions.
+            sub._logind_session = self.logind_session
+            getattr(self.rawfs, "proc_session", {}).pop(_claimed, None)
+            sub._publish_session()
             self._inherit_session(_claimed)
             # ...but a subshell is a fork, so $BASHPID is its own.
             sub.forked_pid = self.fs.next_pid
@@ -20122,6 +20153,20 @@ class Shell:
         self.fs.next_pid += 1
         argv, comm, exe, script = self._proc_identity(cmd)
         self.fs.procs.append((pid, argv, "?" if background else "pts/0"))
+        # Which login session it belongs to. A process started from a
+        # session lives in that session's cgroup scope and dies with it --
+        # measured on the guest, where a plain `&`, a `nohup ... &` and
+        # even a `setsid ... &` were all gone by the next login, because
+        # the user slice is torn down when the last session of a
+        # non-lingering user ends. Without this the box kept them running
+        # and then reported them in the *current* session's scope, which
+        # is a scope that did not exist when they started.
+        try:
+            raw = self.rawfs
+            raw.proc_session = getattr(raw, "proc_session", {})
+            raw.proc_session[pid] = self.logind_session
+        except Exception:                                     # noqa: BLE001
+            pass
         self._proc_meta(pid, comm, exe, script)
         self._proc_stdout(pid, cmd)
         if len(self.fs.procs) > 40:
@@ -28139,8 +28184,31 @@ class Shell:
         # would leave the three naming three different sessions.
         got = getattr(self, "_logind_session", None)
         if got is None:
+            # A login gets its own session; the Shells this emulator
+            # builds internally -- for a background job, for a subshell --
+            # inherit the one they were forked from, which is why both
+            # construction sites copy _logind_session over. Sharing one id
+            # across the whole filesystem instead made two separate logins
+            # report the same session and the same sshd pid.
             got = self._logind_session = logind_allocate(self.started)
+            # /proc/<pid>/cgroup is generated in the VFS, which has no
+            # shell to ask. Publish per-pid rather than as one field: two
+            # channels of one connection share a VFS, and a single
+            # last-writer-wins field made the *first* shell's own
+            # /proc/<pid>/cgroup change under it when the second one
+            # allocated -- so a cgroup read before a launch and after it
+            # named different sessions.
         return got
+
+    def _publish_session(self):
+        """Record which login session this shell's pid belongs to."""
+        try:
+            raw = self.rawfs
+            if getattr(raw, "proc_session", None) is None:
+                raw.proc_session = {}
+            raw.proc_session[self.shell_pid] = self.logind_session
+        except Exception:                                     # noqa: BLE001
+            pass
 
     def cmd_loginctl(self, a, stdin=""):
         """systemd 257's loginctl, which this box claims to run: nine
@@ -33210,6 +33278,9 @@ class Shell:
         sub._nest = self._nest + 1
         _claimed = sub.shell_pid
         sub.shell_pid = self.shell_pid   # bash: $$ is the parent's
+        sub._logind_session = self.logind_session
+        getattr(self.rawfs, "proc_session", {}).pop(_claimed, None)
+        sub._publish_session()
         self._inherit_session(_claimed)
         # ...but a subshell is a fork, so $BASHPID is its own.
         sub.forked_pid = self.fs.next_pid
@@ -36037,6 +36108,17 @@ class Shell:
         def _active(u):
             if u in other:
                 return state.get(u, {}).get("active", other[u][1])
+            # user@<uid>.service is the per-user manager logind starts with
+            # a session and stops with the last one. It answered "inactive"
+            # while this very session was open and listed by loginctl --
+            # a session whose user manager is not running, on a box whose
+            # own /proc/<pid>/cgroup puts every process in that manager's
+            # slice. Measured on the guest: active during a session.
+            # _key() strips ".service", so the name arrives here bare.
+            m = re.match(r"^user(?:-runtime-dir)?@(\d+)$", u)
+            if m:
+                mine = self.creds.uid if hasattr(self, "creds") else 0
+                return int(m.group(1)) == mine
             if u not in unit_tbl:
                 return False
             # A unit that exists only because someone wrote its file is not
@@ -36266,14 +36348,20 @@ class Shell:
                     props += a[i + 1].split(",")
             desc, pid, _comm = unit_tbl.get(unit, ("", 0, ""))
             cg_memory, cg_tasks, cg_cpu = self._unit_cgroup_numbers(unit)
+            # `systemctl is-active user@0.service` and `systemctl show
+            # user@0.service -p ActiveState` are the same question, and
+            # they came from different code: is-active consulted the state
+            # and show tested membership of a table. Ask the one function.
+            _up = _active(_key(unit)) if unit else known
+            known = known or _up
             values = {
                 "MainPID": str(pid),
                 "Id": (unit + ".service") if unit else "",
                 "Names": (unit + ".service") if unit else "",
                 "Description": desc,
                 "LoadState": "loaded" if known else "not-found",
-                "ActiveState": "active" if known else "inactive",
-                "SubState": "running" if known else "dead",
+                "ActiveState": "active" if _up else "inactive",
+                "SubState": "running" if _up else "dead",
                 "UnitFileState": "enabled" if known else "",
                 "FragmentPath": ("/usr/lib/systemd/system/%s.service" % unit)
                                 if known else "",

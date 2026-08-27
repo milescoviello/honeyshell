@@ -31,7 +31,7 @@ it buys.
 
 | | |
 |---|---:|
-| Emulator | 42,910 lines |
+| Emulator | 42,998 lines |
 | Commands | 349 |
 | Suites | 184 |
 | Test code | 49,400 lines |
@@ -48,7 +48,7 @@ every sweep, so treat them as the size of the thing rather than a constant.
 
 | File | Lines | Job |
 |---|---:|---|
-| `fakeshell.py` | 42,910 | The emulator: the VFS, the shell language, and every command |
+| `fakeshell.py` | 42,998 | The emulator: the VFS, the shell language, and every command |
 | `awkemu.py` | 1,358 | awk — attackers pipe nearly everything through it |
 | `localedb.py` | 1,164 | Locale data, so `LC_ALL=` actually changes what commands print |
 | `sedemu.py` | 792 | sed |
