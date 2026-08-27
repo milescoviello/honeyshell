@@ -174,6 +174,7 @@ Run all:  `./run-suites.sh`
 - `sudopwtest.py` -- sudo said a password was required, and then took any password at all.
 - `sudotest.py` -- What does sudo tell someone probing what they can do?
 - `swaptest.py` -- The disk and the swap: two commands describing another machine.
+- `sysctlbreadthtest.py` -- How much of /proc/sys is here, and does one knob answer to one value?
 - `sysctltest.py` -- Does sysctl agree with /proc/sys?
 - `syslogtest.py` -- A message goes where the box's own rsyslog config says it goes.
 - `systemdtest.py` -- Does systemd agree with itself about what starts at boot?
