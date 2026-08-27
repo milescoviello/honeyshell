@@ -22,6 +22,7 @@ Run all:  `./run-suites.sh`
 - `bigfiletest.py` -- The same bytes, every way of moving them: do the answers agree?
 - `bindirtest.py` -- Which directory is this binary in, and does everything agree?
 - `bintest.py` -- What does this box actually have installed, and what can it do with it?
+- `blockqueuetest.py` -- /sys/block/*/queue, and the five lsblk columns that read it.
 - `boottest.py` -- Does the box agree with itself about how it booted?
 - `builtintest.py` -- If `type` calls it a builtin, does it run?
 - `bytesviewtest.py` -- Do the tools that show invisible bytes agree there are any?

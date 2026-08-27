@@ -7308,7 +7308,60 @@ class VFS:
               mode=0o644)
             w(b + "/queue/rotational", rot + "\n", mode=0o644)
             w(b + "/queue/scheduler", "[none] mq-deadline\n", mode=0o644)
-            w(b + "/queue/logical_block_size", "512\n")
+            # queue held three files against the guest's 44, and that
+            # shortfall was visible from the other side too: `lsblk -o
+            # ROTA,PHY-SEC,LOG-SEC,SCHED,DISC-GRAN` printed five empty
+            # columns, because every one of them is read out of this
+            # directory. Values measured per device -- 16 of the 44 differ
+            # between a disk and a CD-ROM, so one table for both would have
+            # given sr0 a hard drive's geometry. rotational and scheduler
+            # stay as the persona set them.
+            for _qk, _qa, _qb in (
+                ("add_random", '1', '0'),
+                ("atomic_write_boundary_bytes", '0', '0'),
+                ("atomic_write_max_bytes", '0', '0'),
+                ("atomic_write_unit_max_bytes", '0', '0'),
+                ("atomic_write_unit_min_bytes", '0', '0'),
+                ("chunk_sectors", '0', '0'),
+                ("dax", '0', '0'),
+                ("discard_granularity", '4096', '0'),
+                ("discard_max_bytes", '1073741824', '0'),
+                ("discard_max_hw_bytes", '1073741824', '0'),
+                ("discard_zeroes_data", '0', '0'),
+                ("dma_alignment", '3', '511'),
+                ("fua", '1', '0'),
+                ("hw_sector_size", '512', '2048'),
+                ("io_poll", '0', '0'),
+                ("io_poll_delay", '-1', '-1'),
+                ("io_timeout", '30000', '30000'),
+                ("iostats", '1', '1'),
+                ("logical_block_size", '512', '2048'),
+                ("max_discard_segments", '1', '1'),
+                ("max_hw_sectors_kb", '32767', '128'),
+                ("max_integrity_segments", '0', '0'),
+                ("max_sectors_kb", '1280', '128'),
+                ("max_segment_size", '65536', '65536'),
+                ("max_segments", '254', '127'),
+                ("minimum_io_size", '512', '2048'),
+                ("nomerges", '0', '0'),
+                ("nr_requests", '256', '1'),
+                ("nr_zones", '0', '0'),
+                ("optimal_io_size", '0', '0'),
+                ("physical_block_size", '512', '2048'),
+                ("read_ahead_kb", '128', '128'),
+                ("rq_affinity", '1', '1'),
+                ("stable_writes", '0', '0'),
+                ("virt_boundary_mask", '0', '0'),
+                ("wbt_lat_usec", '75000', '75000'),
+                ("write_cache", 'write back', 'write through'),
+                ("write_same_max_bytes", '0', '0'),
+                ("write_zeroes_max_bytes", '2147483136', '0'),
+                ("zone_append_max_bytes", '0', '0'),
+                ("zone_write_granularity", '0', '0'),
+                ("zoned", 'none', 'none'),
+            ):
+                w(b + "/queue/" + _qk,
+                  (_qb if dev == "sr0" else _qa) + "\n", mode=0o644)
             for _sub in ("holders", "slaves", "integrity", "mq", "power",
                          "trace"):
                 sysdir(b + "/" + _sub)
@@ -27198,11 +27251,54 @@ class Shell:
         six lines of table.
         """
         h = self._df_human
+
+        def q(dev, key, default=""):
+            """A queue attribute, read from /sys rather than restated here.
+
+            ROTA, PHY-SEC, LOG-SEC, SCHED and DISC-GRAN were absent from
+            these rows entirely, so asking for them printed five empty
+            columns while /sys/block/<dev>/queue held the answers. Reading
+            them keeps the two from ever disagreeing -- which is the same
+            reason the queue directory is now complete.
+            """
+            raw = self.fs.read("/sys/block/%s/queue/%s" % (dev, key))
+            if raw is None:
+                return default
+            return raw.decode("latin-1", "replace").strip() or default
+
+        def sched(dev):
+            """lsblk prints the *active* scheduler, the one in brackets."""
+            cur = q(dev, "scheduler")
+            for tok in cur.split():
+                if tok.startswith("[") and tok.endswith("]"):
+                    return tok[1:-1]
+            return cur.split()[0] if cur.split() else ""
+
+        def disc(dev):
+            """DISC-GRAN is a human size, and 0 prints as 0B."""
+            try:
+                n = int(q(dev, "discard_granularity", "0"))
+            except ValueError:
+                return ""
+            # _df_human takes kilobytes. Feeding it 512-byte blocks made
+            # a 4096-byte granularity print as 8K where the guest says 4K.
+            return "0B" if n == 0 else h(n // 1024)
+
+        def _dev(name, extra):
+            row = {"ROTA": q(name, "rotational"),
+                   "PHY-SEC": q(name, "physical_block_size"),
+                   "LOG-SEC": q(name, "logical_block_size"),
+                   "SCHED": sched(name), "DISC-GRAN": disc(name)}
+            row.update(extra)
+            return row
+
         return [
-            {"NAME": "sda", "PREFIX": "", "MAJ:MIN": "8:0", "RM": "0",
-             "SIZE": h(DISK_BLOCKS), "RO": "0", "TYPE": "disk",
-             "MOUNTPOINTS": "", "MOUNTPOINT": "", "FSTYPE": "",
-             "UUID": "", "LABEL": "", "PARENT": None},
+            _dev("sda", {"NAME": "sda", "PREFIX": "", "MAJ:MIN": "8:0",
+                         "RM": "0",
+                         "SIZE": h(DISK_BLOCKS), "RO": "0",
+                         "TYPE": "disk", "MOUNTPOINTS": "",
+                         "MOUNTPOINT": "", "FSTYPE": "", "UUID": "",
+                         "LABEL": "", "PARENT": None}),
             {"NAME": "sda1", "PREFIX": "\u251c\u2500", "MAJ:MIN": "8:1",
              "RM": "0", "SIZE": h(ROOT_PART_BLOCKS), "RO": "0",
              "TYPE": "part", "MOUNTPOINTS": "/", "MOUNTPOINT": "/",
@@ -27218,10 +27314,11 @@ class Shell:
              "MOUNTPOINTS": "/boot/efi", "MOUNTPOINT": "/boot/efi",
              "FSTYPE": "vfat", "UUID": BOOT_UUID, "LABEL": "UEFI",
              "PARENT": "sda"},
-            {"NAME": "sr0", "PREFIX": "", "MAJ:MIN": "11:0", "RM": "1",
-             "SIZE": "1024M", "RO": "0", "TYPE": "rom",
-             "MOUNTPOINTS": "", "MOUNTPOINT": "", "FSTYPE": "",
-             "UUID": "", "LABEL": "", "PARENT": None},
+            _dev("sr0", {"NAME": "sr0", "PREFIX": "", "MAJ:MIN": "11:0",
+                         "RM": "1", "SIZE": "1024M", "RO": "0",
+                         "TYPE": "rom", "MOUNTPOINTS": "",
+                         "MOUNTPOINT": "", "FSTYPE": "", "UUID": "",
+                         "LABEL": "", "PARENT": None}),
         ]
 
     def cmd_lsblk(self, a, stdin=""):
@@ -27301,7 +27398,11 @@ class Shell:
                         v = r["PREFIX"] + v
                     vals.append(v)
                 disp.append(vals)
-            rjust = {"MAJ:MIN", "RM", "SIZE", "RO"}
+            # ROTA and the queue-derived numbers are right-aligned too:
+            # the guest prints "sda 1 0 0   64G disk     512     512 none
+            # 4K", padding each numeric column rather than butting them up.
+            rjust = {"MAJ:MIN", "RM", "SIZE", "RO", "ROTA", "PHY-SEC",
+                     "LOG-SEC", "DISC-GRAN"}
             # Parenthesised deliberately, for the reason _findmnt_render
             # already records: `[len(c)] if headings else [0] + [...]`
             # binds the + to the else branch only, so with headings on
