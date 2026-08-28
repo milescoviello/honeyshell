@@ -4041,6 +4041,32 @@ GID_NAMES = {0: "root", 1: "daemon", 2: "bin", 3: "sys", 4: "adm", 5: "tty",
 # /etc/ssh/ssh_host_*.pub` on the box matches what the client recorded.
 HOST_KEY_PUBS = {}
 
+# The algorithms this box offers, defined once. ssh_honeypot builds its
+# transport preferences from these, and `sshd -T` renders them, so the dump
+# an attacker reads cannot contradict the KEXINIT they just completed.
+# Before this the dump omitted ciphers/macs/kexalgorithms entirely, which was
+# the only reason the two could not be compared.
+SSHD_ALGOS = {
+    # Base list; ssh_honeypot prepends mlkem768x25519-sha256 when libcrypto
+    # can do it, and reports the result through SSHD_ALGOS_LIVE.
+    "kexalgorithms": ("curve25519-sha256", "curve25519-sha256@libssh.org",
+                      "ecdh-sha2-nistp256", "ecdh-sha2-nistp384",
+                      "ecdh-sha2-nistp521"),
+    # Base list; chacha20-poly1305@openssh.com goes in front when the
+    # OpenSSH construction is installed.
+    "ciphers": ("aes128-gcm@openssh.com", "aes256-gcm@openssh.com",
+                "aes128-ctr", "aes192-ctr", "aes256-ctr"),
+    "macs": ("hmac-sha2-256-etm@openssh.com",
+             "hmac-sha2-512-etm@openssh.com",
+             "hmac-sha1-etm@openssh.com",
+             "hmac-sha2-256", "hmac-sha2-512", "hmac-sha1"),
+}
+
+# Set by ssh_honeypot.tune_algorithms() to what the transport *actually*
+# negotiated down to after intersecting with what paramiko can do. None until
+# a real server has run, which is why SSHD_ALGOS above has to stand alone.
+SSHD_ALGOS_LIVE = None
+
 
 def _ssh_string(b):
     return len(b).to_bytes(4, "big") + b
@@ -14336,6 +14362,39 @@ class CredFS:
                 node.uid, node.gid = self.uid, self.gid
         return ok
 
+    def link_capture(self, path, store_path, size, prefix=b"", mode=None):
+        """A captured artifact belongs to whoever downloaded it.
+
+        link_capture lives on the VFS, so __getattr__ handed it straight to
+        the uncredentialed filesystem and its internal self.write() was
+        VFS.write, not the one above -- the node kept the default uid 0.
+        Only large payloads take this path (a small one is inlined by
+        write()), so the ownership depended on the size of the file: a
+        non-root attacker's small drop was theirs and their big one came
+        back `root root` in their own home directory.
+
+        That is both a tell and a dead install. On 2026-08-27 203.0.113.64
+        curled a 46MB Go binary to /home/deploy/.sysmonitor as `deploy` and
+        the next command, `chmod +x`, was refused Permission denied by the
+        owner check in chmod() below -- the loader stopped there.
+        """
+        exists = path in self._fs.nodes
+        self._check(path, "w", "open")
+        if not exists:
+            parent = os.path.dirname(path) or "/"
+            try:
+                self._check(parent, "wx", "create")
+            except PermissionDenied:
+                raise PermissionDenied(path, "create")
+        ok = self._fs.link_capture(path, store_path, size,
+                                   prefix=prefix, mode=mode)
+        if ok and not exists:
+            node = (self._fs.nodes.get(path)
+                    or self._fs.nodes.get(self._fs.resolve(path)))
+            if node is not None:
+                node.uid, node.gid = self.uid, self.gid
+        return ok
+
     def remove(self, path, recursive=False):
         parent = os.path.dirname(path) or "/"
         try:
@@ -14365,8 +14424,19 @@ class CredFS:
         return ok
 
     def symlink(self, path, target):
+        # Ownership for the same reason write() and mkdir() do it: the
+        # permission check was here but the uid assignment was not, so on
+        # one box `mkdir d` came back `deploy deploy` and `ln -s x l`
+        # beside it came back `root root`. The guest gives the caller
+        # both times.
+        exists = path in self._fs.nodes
         self._check(os.path.dirname(path) or "/", "wx", "symlink")
-        return self._fs.symlink(path, target)
+        ok = self._fs.symlink(path, target)
+        if ok and not exists:
+            node = self._fs.nodes.get(path)
+            if node is not None:
+                node.uid, node.gid = self.uid, self.gid
+        return ok
 
     def chmod(self, path, mode):
         node = self._fs.nodes.get(path)
@@ -31754,38 +31824,149 @@ class Shell:
     # all, on the service the attacker is sitting in. The values that are
     # settable are read out of /etc/ssh/sshd_config, so the dump cannot
     # contradict the file the same box serves.
+    # `sshd -T` dumps the effective configuration. It printed nothing at
+    # all, on the service the attacker is sitting in. The values that are
+    # settable are read out of /etc/ssh/sshd_config, so the dump cannot
+    # contradict the file the same box serves.
+    #
+    # Order is the real sshd's print order, not ours: a diff against a known
+    # host compares position as readily as content. Measured on the guest
+    # (Debian 13.6, OpenSSH 10.0p2), which prints 103 lines. We printed 44 --
+    # and one of those, x11maxdisplays, the real sshd does not have at all,
+    # so we answered a question it would not have answered.
+    #
+    # The three lines the KEXINIT can be checked against -- ciphers, macs and
+    # kexalgorithms -- are substituted from SSHD_ALGOS at render time rather
+    # than written out here, so the dump and the handshake cannot drift.
+    # Copying the guest's values verbatim would have been wrong in a way that
+    # is worse than omitting them: its macs list offers umac-64 and umac-128,
+    # which this transport cannot do, so `sshd -T` would have advertised two
+    # algorithms the very next connection would fail to negotiate.
     _SSHD_T_DEFAULTS = (
-        ("port", "22"), ("addressfamily", "any"),
-        ("listenaddress", "[::]:22"), ("listenaddress", "0.0.0.0:22"),
-        ("usepam", "yes"), ("pamservicename", "sshd"),
-        ("logingracetime", "120"), ("x11displayoffset", "10"),
-        ("x11maxdisplays", "1000"), ("maxauthtries", "6"),
-        ("maxsessions", "10"), ("clientaliveinterval", "0"),
-        ("clientalivecountmax", "3"), ("streamlocalbindmask", "0177"),
-        ("permitrootlogin", "yes"), ("ignorerhosts", "yes"),
-        ("ignoreuserknownhosts", "no"), ("hostbasedauthentication", "no"),
+        ("port", "22"),
+        ("addressfamily", "any"),
+        ("listenaddress", "[::]:22"),
+        ("listenaddress", "0.0.0.0:22"),
+        ("usepam", "yes"),
+        ("pamservicename", "sshd"),
+        ("logingracetime", "120"),
+        ("x11displayoffset", "10"),
+        ("maxauthtries", "6"),
+        ("maxsessions", "10"),
+        ("clientaliveinterval", "0"),
+        ("clientalivecountmax", "3"),
+        ("requiredrsasize", "1024"),
+        ("streamlocalbindmask", "0177"),
+        ("unusedconnectiontimeout", "none"),
+        ("permitrootlogin", "yes"),
+        ("ignorerhosts", "yes"),
+        ("ignoreuserknownhosts", "no"),
+        ("hostbasedauthentication", "no"),
         ("hostbasedusesnamefrompacketonly", "no"),
-        ("pubkeyauthentication", "yes"), ("kerberosauthentication", "no"),
-        ("kerberosorlocalpasswd", "yes"), ("kerberosticketcleanup", "yes"),
-        ("gssapiauthentication", "no"), ("gssapicleanupcredentials", "yes"),
-        ("passwordauthentication", "yes"), ("kbdinteractiveauthentication",
-                                            "no"),
-        ("permitemptypasswords", "no"), ("permituserenvironment", "no"),
-        ("compression", "yes"), ("tcpkeepalive", "yes"),
-        ("printmotd", "no"), ("printlastlog", "yes"),
-        ("x11forwarding", "no"), ("x11uselocalhost", "yes"),
-        ("strictmodes", "yes"), ("allowagentforwarding", "yes"),
-        ("allowtcpforwarding", "yes"), ("usedns", "no"),
+        ("pubkeyauthentication", "yes"),
+        ("kerberosauthentication", "no"),
+        ("kerberosorlocalpasswd", "yes"),
+        ("kerberosticketcleanup", "yes"),
+        ("gssapiauthentication", "no"),
+        ("gssapicleanupcredentials", "yes"),
+        ("gssapikeyexchange", "no"),
+        ("gssapistrictacceptorcheck", "yes"),
+        ("gssapistorecredentialsonrekey", "no"),
+        ("gssapikexalgorithms",
+         "gss-group14-sha256-,gss-group16-sha512-,gss-nistp256-sha256-,gss-curve25519-sha256-,gss-group14-sha1-,gss-gex-sha1-"),
+        ("passwordauthentication", "yes"),
+        ("kbdinteractiveauthentication", "no"),
+        ("printmotd", "no"),
+        ("printlastlog", "yes"),
+        ("x11forwarding", "no"),
+        ("x11uselocalhost", "yes"),
+        ("permittty", "yes"),
+        ("permituserrc", "yes"),
+        ("strictmodes", "yes"),
+        ("tcpkeepalive", "yes"),
+        ("permitemptypasswords", "no"),
+        ("compression", "yes"),
+        ("gatewayports", "no"),
+        ("usedns", "no"),
+        ("allowtcpforwarding", "yes"),
+        ("allowagentforwarding", "yes"),
+        ("disableforwarding", "no"),
+        ("allowstreamlocalforwarding", "yes"),
+        ("streamlocalbindunlink", "no"),
+        ("fingerprinthash", "SHA256"),
+        ("exposeauthinfo", "no"),
+        ("refuseconnection", "no"),
+        ("debianbanner", "yes"),
+        ("pidfile", "/run/sshd.pid"),
+        ("modulifile", "/etc/ssh/moduli"),
+        ("xauthlocation", "/usr/bin/xauth"),
+        ("ciphers", "@@CIPHERS@@"),
+        ("macs", "@@MACS@@"),
+        ("banner", "none"),
+        ("forcecommand", "none"),
+        ("chrootdirectory", "none"),
+        ("trustedusercakeys", "none"),
+        ("revokedkeys", "none"),
+        ("securitykeyprovider", "internal"),
+        ("authorizedprincipalsfile", "none"),
+        ("versionaddendum", "none"),
+        ("authorizedkeyscommand", "none"),
+        ("authorizedkeyscommanduser", "none"),
+        ("authorizedprincipalscommand", "none"),
+        ("authorizedprincipalscommanduser", "none"),
+        ("hostkeyagent", "none"),
+        ("kexalgorithms", "@@KEX@@"),
+        ("casignaturealgorithms",
+         "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,sk-ssh-ed25519@openssh.com,sk-ecdsa-sha2-nistp256@openssh.com,rsa-sha2-512,rsa-sha2-256"),
+        ("hostbasedacceptedalgorithms",
+         "ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,ecdsa-sha2-nistp521-cert-v01@openssh.com,sk-ssh-ed25519-cert-v01@openssh.com,sk-ecdsa-sha2-nistp256-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com,ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,sk-ssh-ed25519@openssh.com,sk-ecdsa-sha2-nistp256@openssh.com,rsa-sha2-512,rsa-sha2-256"),
+        ("hostkeyalgorithms",
+         "ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,ecdsa-sha2-nistp521-cert-v01@openssh.com,sk-ssh-ed25519-cert-v01@openssh.com,sk-ecdsa-sha2-nistp256-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com,ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,sk-ssh-ed25519@openssh.com,sk-ecdsa-sha2-nistp256@openssh.com,rsa-sha2-512,rsa-sha2-256"),
+        ("pubkeyacceptedalgorithms",
+         "ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,ecdsa-sha2-nistp521-cert-v01@openssh.com,sk-ssh-ed25519-cert-v01@openssh.com,sk-ecdsa-sha2-nistp256-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com,ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,sk-ssh-ed25519@openssh.com,sk-ecdsa-sha2-nistp256@openssh.com,rsa-sha2-512,rsa-sha2-256"),
+        ("sshdsessionpath", "/usr/lib/openssh/sshd-session"),
+        ("sshdauthpath", "/usr/lib/openssh/sshd-auth"),
+        ("persourcepenaltyexemptlist", "none"),
+        ("loglevel", "INFO"),
+        ("syslogfacility", "AUTH"),
+        ("authorizedkeysfile", ".ssh/authorized_keys .ssh/authorized_keys2"),
+        ("hostkey", "/etc/ssh/ssh_host_rsa_key"),
+        ("hostkey", "/etc/ssh/ssh_host_ecdsa_key"),
+        ("hostkey", "/etc/ssh/ssh_host_ed25519_key"),
+        ("acceptenv", "LANG"),
+        ("acceptenv", "LC_*"),
+        ("acceptenv", "COLORTERM"),
+        ("acceptenv", "NO_COLOR"),
+        ("authenticationmethods", "any"),
+        ("channeltimeout", "none"),
         ("subsystem", "sftp /usr/lib/openssh/sftp-server"),
-        ("maxstartups", "10:30:100"), ("permittunnel", "no"),
-        ("loglevel", "INFO"), ("syslogfacility", "AUTH"),
+        ("maxstartups", "10:30:100"),
+        ("persourcemaxstartups", "none"),
+        ("persourcenetblocksize", "32:128"),
+        ("permittunnel", "no"),
+        ("ipqos", "ef cs1"),
+        ("rekeylimit", "0 0"),
+        ("permitopen", "any"),
+        ("permitlisten", "any"),
+        ("permituserenvironment", "no"),
+        ("pubkeyauthoptions", "none"),
+        ("persourcepenalties",
+         "crash:90 authfail:5 noauth:1 grace-exceeded:10 refuseconnection:10 max:600 min:15 max-sources4:65536 max-sources6:65536 overflow:permissive overflow6:permissive"),
     )
     # sshd_config directive -> the lower-cased key sshd -T prints
     _SSHD_T_FROM_FILE = ("Port", "PermitRootLogin", "PubkeyAuthentication",
                          "PasswordAuthentication", "PermitEmptyPasswords",
                          "X11Forwarding", "PrintMotd", "UsePAM",
                          "MaxAuthTries", "LoginGraceTime", "AllowTcpForwarding",
-                         "PermitTunnel", "LogLevel")
+                         "PermitTunnel", "LogLevel", "MaxSessions",
+                         "ClientAliveInterval", "ClientAliveCountMax",
+                         "KbdInteractiveAuthentication", "Compression",
+                         "GatewayPorts", "PermitTTY", "PermitUserRC",
+                         "StrictModes", "TCPKeepAlive", "UseDNS",
+                         "AllowAgentForwarding", "Banner", "ChrootDirectory",
+                         "ForceCommand", "PidFile", "MaxStartups",
+                         "PrintLastLog", "X11UseLocalhost", "X11DisplayOffset",
+                         "IgnoreRhosts", "PermitUserEnvironment")
 
     def cmd_sshd(self, a, stdin=""):
         if "-T" in a:
@@ -31796,9 +31977,21 @@ class Shell:
                 parts = line.split(None, 1)
                 if len(parts) == 2 and parts[0] in self._SSHD_T_FROM_FILE:
                     overrides[parts[0].lower()] = parts[1].strip()
+            algos = SSHD_ALGOS_LIVE or SSHD_ALGOS
+            subs = {
+                "@@CIPHERS@@": ",".join(algos.get("ciphers") or ()),
+                "@@MACS@@": ",".join(algos.get("macs") or ()),
+                "@@KEX@@": ",".join(algos.get("kexalgorithms") or ()),
+            }
             out = []
             for key, val in self._SSHD_T_DEFAULTS:
-                if key == "listenaddress":
+                val = subs.get(val, val)
+                # Repeatable directives are printed once per value and are
+                # not overridable from the file by a single lookup: taking
+                # overrides here made all three hostkey lines identical.
+                if key in ("listenaddress", "hostkey", "acceptenv"):
+                    if key == "listenaddress" and "port" in overrides:
+                        val = re.sub(r":\d+$", ":" + overrides["port"], val)
                     out.append("%s %s\n" % (key, val))
                     continue
                 out.append("%s %s\n" % (key, overrides.get(key, val)))

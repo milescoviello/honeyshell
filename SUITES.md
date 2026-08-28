@@ -28,6 +28,7 @@ Run all:  `./run-suites.sh`
 - `bytesviewtest.py` -- Do the tools that show invisible bytes agree there are any?
 - `bytetest.py` -- Does the box tell the same story about the same bytes?
 - `captest.py` -- The privilege-escalation recon surface, and whether it agrees with itself.
+- `captureownertest.py` -- A file belongs to whoever created it, whatever path created it.
 - `cgrouptest.py` -- cgroup v2: the tree, and the numbers systemd quotes from it.
 - `clocksettest.py` -- Setting the clock has to move the clock, and only the clock.
 - `colortest.py` -- grep's colour, and the terminal signal that decides it.
@@ -166,6 +167,7 @@ Run all:  `./run-suites.sh`
 - `socktest.py` -- Sockets: four tables, four answers.
 - `splittest.py` -- Word splitting: "$@" versus $@ versus "$*", and whether IFS matters.
 - `sqlttytest.py` -- mysql's output format depends on the terminal, and `select 1` has to work.
+- `sshdconftest.py` -- `sshd -T` against the config file, and against the handshake it describes.
 - `sshidtest.py` -- What does the box say about its own SSH identity, and about keys?
 - `ssltest.py` -- Does the box agree with itself about hashing, encoding and its CA store?
 - `sstest.py` -- ss's extended columns and filters, against the socket underneath.

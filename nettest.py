@@ -327,10 +327,15 @@ def main():
     dump = s.run("sshd -T")
     check("sshd -T dumps an effective config", len(dump.splitlines()) > 20,
           "%d lines" % len(dump.splitlines()))
-    dumped = {}
+    # One line per value, not one per key: sshd repeats a repeatable
+    # directive rather than joining it. Keeping only the first (setdefault
+    # on a string) compared the file's four AcceptEnv values against the
+    # dump's first one and called the box inconsistent with itself.
+    allvals = {}
     for line in dump.splitlines():
         k, _, v = line.partition(" ")
-        dumped.setdefault(k, v.strip())
+        allvals.setdefault(k, []).append(v.strip())
+    dumped = {k: v[0] for k, v in allvals.items()}
     mismatched = []
     for line in cfg.splitlines():
         parts = line.split(None, 1)
@@ -343,7 +348,13 @@ def main():
         # comparison collapses runs of whitespace rather than the emulator
         # being made to copy the tabs.
         want = " ".join(parts[1].split()).lower()
-        got = " ".join(dumped[key].split()).lower() if key in dumped else None
+        # sshd_config lists a repeatable directive's values on one line and
+        # sshd -T prints one line each -- confirmed on the guest, whose
+        # single "AcceptEnv LANG LC_* COLORTERM NO_COLOR" comes back as four
+        # acceptenv lines. Join them before comparing, so a directive that
+        # really did lose values still fails.
+        got = (" ".join(" ".join(allvals[key]).split()).lower()
+               if key in allvals else None)
         if got is not None and got != want:
             mismatched.append("%s: file %r vs -T %r" % (key, want, got))
     check("sshd -T agrees with sshd_config on every shared directive",
