@@ -40,7 +40,7 @@ export PYTHONDONTWRITEBYTECODE=1 PYTHONFAULTHANDLER=1
 # the private gate at publish time rather than maintained twice.
 #
 #   JOBS=1 ./run-suites.sh     everything serially, as it used to run
-SERIAL="accttest.py chantest.py ciphertest.py corescattertest.py crosstest.py capturetest.py deploytest.py detect.py doortest.py ifaceleaktest.py libdeptest.py maxauthtest.py probesuite.py replaytest.py rotwindowtest.py selfstatetest.py sftpexttest.py sftplstest.py sftptest.py stamptest.py tunneltest.py uploadmemtest.py concurtest.py fsbudgettest.py"
+SERIAL="accttest.py chantest.py ciphertest.py corescattertest.py crosstest.py capturetest.py deploytest.py detect.py doortest.py ifaceleaktest.py libdeptest.py maxauthtest.py probesuite.py replaytest.py rotwindowtest.py selfstatetest.py sftpexttest.py sftplstest.py sftptest.py stamptest.py tunneltest.py uploadmemtest.py concurtest.py fsbudgettest.py procstarttest.py"
 : "${JOBS:=$(nproc 2>/dev/null || echo 2)}"
 
 WORK=$(mktemp -d) || exit 1
