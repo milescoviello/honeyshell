@@ -4,6 +4,16 @@ Each entry is a question the emulator used to answer inconsistently, and every
 fix is pinned by a suite. The full list of suites, one line each, is in
 [SUITES.md](SUITES.md).
 
+## Unreleased
+
+- **`run-suites.sh` runs the suites in a pool.** Serially they took 64 minutes
+  in CI. Suites whose assertions are about timing, load or scheduling still run
+  first and alone; everything else runs `$(nproc)` wide. `JOBS=1` restores the
+  old one-at-a-time behaviour. Results are reported in name order, so two runs
+  diff cleanly, and suite output is written straight to files rather than
+  through a command substitution, which had been dropping NUL bytes with a
+  warning per suite.
+
 ## v0.2.0 — 2026-09-23
 
 | | v0.1.0 | v0.2.0 |

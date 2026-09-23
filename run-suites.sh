@@ -29,23 +29,60 @@ fi
 
 cd "$(dirname "$0")" || exit 1
 rm -rf __pycache__
+# Concurrent interpreters writing the same .pyc is a race nobody needs, and a
+# suite that dies on a signal should say where rather than just "rc=139".
+export PYTHONDONTWRITEBYTECODE=1 PYTHONFAULTHANDLER=1
+
+# One suite at a time took over an hour in CI. Most suites share nothing but
+# the emulator module, so they run in a pool; the ones below run first and
+# alone, because their assertions are about timing, load or scheduling, and a
+# loaded machine is exactly what makes those flaky. The list is copied from
+# the private gate at publish time rather than maintained twice.
+#
+#   JOBS=1 ./run-suites.sh     everything serially, as it used to run
+SERIAL="accttest.py chantest.py ciphertest.py corescattertest.py crosstest.py capturetest.py deploytest.py detect.py doortest.py ifaceleaktest.py libdeptest.py maxauthtest.py probesuite.py replaytest.py rotwindowtest.py selfstatetest.py sftpexttest.py sftplstest.py sftptest.py stamptest.py tunneltest.py uploadmemtest.py concurtest.py fsbudgettest.py"
+: "${JOBS:=$(nproc 2>/dev/null || echo 2)}"
+
+WORK=$(mktemp -d) || exit 1
+trap 'rm -rf "$WORK"' EXIT
+export WORK
+# Straight to a file, never through $(...): some suites print NUL bytes, and
+# bash drops those from a command substitution with a warning per suite.
+run_one() {
+  timeout 900 python3 -W ignore "$1" > "$WORK/$1.out" 2>&1
+  echo $? > "$WORK/$1.rc"
+}
+export -f run_one
+
+LIST=$(ls *test*.py detect.py probesuite.py 2>/dev/null | sort -u)
+ser=""; par=""
+for f in $LIST; do
+  case " $(echo $SERIAL) " in
+    *" $f "*) ser="$ser $f" ;;
+    *)        par="$par $f" ;;
+  esac
+done
+for f in $ser; do run_one "$f"; done
+printf '%s\n' $par | xargs -r -P "$JOBS" -I{} bash -c 'run_one "$1"' _ {}
+
+# Reported in name order, not finishing order, so two runs diff cleanly.
 n=0; bad=0; known=0
-for f in $(ls *test*.py detect.py probesuite.py 2>/dev/null | sort -u); do
+for f in $LIST; do
   n=$((n+1))
-  out=$(timeout 900 python3 -W ignore "$f" 2>&1)
-  rc=$?
-  [ $rc -eq 0 ] && continue
+  rc=$(cat "$WORK/$f.rc" 2>/dev/null || echo 255)
+  [ "$rc" -eq 0 ] && continue
+  last=$(tr -d '\000' < "$WORK/$f.out" | tail -1)
   case " $KNOWN_FAILURES " in
     *" $f "*)
       known=$((known+1))
-      echo "KNOWN  $f  rc=$rc  --  $(echo "$out" | tail -1)"
+      echo "KNOWN  $f  rc=$rc  --  $last"
       continue ;;
   esac
   bad=$((bad+1))
   echo "FAIL   $f  rc=$rc"
-  echo "$out" | grep -iE '^\s*(FAIL|differ)|Traceback|Error' | head -6
-  echo "       $(echo "$out" | tail -1)"
+  tr -d '\000' < "$WORK/$f.out" | grep -aiE '^\s*(FAIL|differ)|Traceback|Error' | head -6
+  echo "       $last"
 done
 echo
-echo "suites: $n   unexpected failures: $bad   known: $known"
+echo "suites: $n   unexpected failures: $bad   known: $known   (pool width $JOBS)"
 [ "$bad" -eq 0 ]

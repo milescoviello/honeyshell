@@ -8,6 +8,7 @@ see [design.md](design.md) for why.
 
 ```sh
 ./run-suites.sh                  # all of them; prints only failures
+JOBS=1 ./run-suites.sh           # one at a time
 KNOWN_FAILURES= ./run-suites.sh  # ...and do not tolerate the known one
 python3 -W ignore difftest.py    # just one
 ```
@@ -15,7 +16,14 @@ python3 -W ignore difftest.py    # just one
 `run-suites.sh` runs every `*test*.py` plus `detect.py` and `probesuite.py`,
 gives each one a 900-second timeout, prints nothing for a suite that passes,
 and exits non-zero if any *unexpected* suite fails. The summary line at the
-end is `suites: N   unexpected failures: N   known: N`.
+end is `suites: N   unexpected failures: N   known: N   (pool width N)`.
+
+Suites run in a pool `$(nproc)` wide, except the ones listed in `SERIAL` at
+the top of the script, which run first and alone: their assertions are about
+timing, load or scheduling, and a loaded machine is exactly what makes those
+flaky. Failures are reported in name order rather than finishing order, so
+two runs can be diffed. `JOBS=N` sets the pool width, and `JOBS=1` runs
+everything serially.
 
 It refuses to run twice at once, via `flock` on
 `/tmp/honeyshell-suites.lock`. That is not politeness: the first thing it does
