@@ -63,7 +63,7 @@ _OPS = ["**=", "...", ">>=", "<<=", "&&", "||", "==", "!=", "<=", ">=", "++",
 _VALUE_END = ("NAME", "NUMBER", "STRING", "ERE", "BUILTIN")
 
 
-def _lex(src):
+def _lex(src, warns=None):
     toks = []
     i, n = 0, len(src)
     while i < n:
@@ -96,9 +96,42 @@ def _lex(src):
             while j < n and src[j] != '"':
                 if src[j] == "\\" and j + 1 < n:
                     esc = src[j + 1]
-                    buf.append({"n": "\n", "t": "\t", "r": "\r", "\\": "\\",
-                                '"': '"', "/": "/", "a": "\a", "b": "\b",
-                                "f": "\f", "v": "\v"}.get(esc, "\\" + esc))
+                    _simple = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\",
+                               '"': '"', "/": "/", "a": "\a", "b": "\b",
+                               "f": "\f", "v": "\v"}
+                    if esc in _simple:
+                        buf.append(_simple[esc])
+                        j += 2
+                        continue
+                    # mawk understands \x hex escapes, and takes at most
+                    # two digits: "\x414" is "A4", not codepoint 0x414.
+                    if esc == "x":
+                        _hex = re.match(r"[0-9A-Fa-f]{1,2}", src[j + 2:])
+                        if _hex:
+                            buf.append(chr(int(_hex.group(), 16)))
+                            j += 2 + len(_hex.group())
+                            continue
+                    _oct = re.match(r"[0-7]{1,3}", src[j + 1:])
+                    if _oct:
+                        buf.append(chr(int(_oct.group(), 8) & 0xFF))
+                        j += 1 + len(_oct.group())
+                        continue
+                    # mawk keeps BOTH characters of an escape it does not
+                    # know, and says nothing: "a\qb" prints a\qb.
+                    #
+                    # This branch previously dropped the backslash and
+                    # printed a warning, because it was written against
+                    # gawk. On a box whose `awk --version` says mawk, that
+                    # warning was itself the tell: its text is worded in
+                    # gawk's style ("awk: cmd. line:1: warning: escape
+                    # sequence ...") and no mawk build emits it, so
+                    # `awk 'BEGIN{print "\x41"}'` -- which prints A on
+                    # mawk -- answered "x41" plus a gawk diagnostic.
+                    # See the reference note in awktest.py: the differential
+                    # reference has to be the guest's mawk, never this
+                    # host's awk, which is gawk 5.2.1.
+                    buf.append("\\")
+                    buf.append(esc)
                     j += 2
                     continue
                 buf.append(src[j])
@@ -569,6 +602,24 @@ def _to_num(v):
         return 0.0
 
 
+# The interpreter currently running, so that _num_str can see CONVFMT
+# without every caller having to thread it through. run_awk saves and
+# restores this, so a nested run (awk inside a command substitution inside
+# awk's own input pipeline) cannot leave a stale one behind.
+_CUR = [None]
+
+
+def _conv_fmt(name, default="%.6g"):
+    it = _CUR[0]
+    if it is None:
+        return default
+    v = it.globals.get(name)
+    # Only a string is usable as a format. Reading a float back through
+    # _to_str here would call _num_str, which called this -- CONVFMT=1
+    # would recurse until the stack ran out.
+    return v if isinstance(v, str) and "%" in v else default
+
+
 def _num_str(x):
     """How awk renders a number: integers bare, otherwise CONVFMT (%.6g)."""
     # gawk prints these with a sign: "+inf", "-inf", "-nan" -- measured on
@@ -581,7 +632,15 @@ def _num_str(x):
         return "+inf" if x > 0 else "-inf"
     if x == int(x) and abs(x) < 1e16:
         return str(int(x))
-    return "%.6g" % x
+    # CONVFMT, not a hardcoded %.6g: mawk honours it for every number ->
+    # string conversion including array subscripts, so
+    # `CONVFMT="%.2g"; x=3.14159; print x ""` is 3.1 and
+    # `CONVFMT="%.2g"; a[0.1+0.2]=1` is subscripted "0.3".
+    fmt = _conv_fmt("CONVFMT")
+    try:
+        return fmt % x
+    except (TypeError, ValueError):
+        return "%.6g" % x
 
 
 def _to_str(v):
@@ -632,6 +691,72 @@ _CLASSES = {"alpha": "a-zA-Z", "digit": "0-9", "alnum": "a-zA-Z0-9",
             "cntrl": r"\x00-\x1f\x7f", "xdigit": "0-9A-Fa-f"}
 
 
+def _fs_split(fs, text):
+    """Split a record on the field separator, the way awk does.
+
+    re.split() hands back capture groups as if they were fields, so any FS
+    with a group in it put the separators themselves into the record. The
+    shape is not hypothetical -- 203.0.113.83 ran
+
+        uptime | awk -F'( up |,|load)' '{... print $2}'
+
+    against this box on 2026-09-02 while fingerprinting it for a miner.
+    Real awk gives "5 days"; this one gave " up ", and NF came back 11
+    where a real awk says 6. Alternation without the parentheses, single
+    characters, multi-character strings and bracket classes were all fine,
+    which is why it survived this long.
+
+    Splitting on the match spans keeps groups out of the result and leaves
+    every other separator behaving exactly as it did. A zero-width match
+    separates nothing and is skipped, so an FS that can match empty cannot
+    spin here.
+    """
+    rx = re.compile(_posix_ere(fs))
+    out, last = [], 0
+    for m in rx.finditer(text):
+        if m.end() == m.start():
+            continue
+        out.append(text[last:m.start()])
+        last = m.end()
+    out.append(text[last:])
+    return out
+
+
+def _rs_split(records, rs, raw=None):
+    """Re-apply RS to input that was already split on newlines.
+
+    RS is almost always set in BEGIN, which runs after the caller has
+    already split the input, so this cannot be done at read time. `raw`
+    is the original text when the caller has it: rejoining the records
+    with newlines loses a trailing one, and that newline is visible --
+    mawk on "a:b:c\n" with RS=":" makes the third record "c\n", not "c".
+
+    mawk takes an RS longer than one character as a regex, which the
+    previous code did not do at all: RS=";;" and RS="[0-9]+" both left the
+    input as a single record, so `awk 'BEGIN{RS=";;"}{print $0}'` echoed
+    the whole file back and NR was 1.
+
+    Known deviation, measured and deliberately not fixed: assigning RS in a
+    rule body rather than in BEGIN takes effect from the next record in
+    mawk, which reads its input one record at a time. `NR==1{RS=":"}` over
+    "a:b\nc:d\n" gives mawk three records (a:b, c, "d\n") and gives this
+    two (a:b, c:d), because RS is read once, after BEGIN. Matching it needs
+    a streaming reader instead of a pre-split list, and no program observed
+    on this box has set RS outside BEGIN. awktest.py asserts the BEGIN forms
+    and pins this one as a deviation so it cannot be mistaken for untested.
+    """
+    text = raw if raw is not None else "\n".join(records)
+    if rs == "":
+        # Paragraph mode: any run of blank lines separates records, and
+        # leading and trailing newlines are ignored.
+        return [p for p in re.split(r"\n{2,}", text.strip("\n")) if p != ""]
+    parts = text.split(rs) if len(rs) == 1 else re.split(_posix_ere(rs), text)
+    # A separator at the very end does not start a new empty record.
+    if parts and parts[-1] == "":
+        parts.pop()
+    return parts
+
+
 def _posix_ere(pattern):
     out = re.sub(r"\[:([a-z]+):\]",
                  lambda m: _CLASSES.get(m.group(1), m.group(0)), pattern)
@@ -658,7 +783,8 @@ class _Return(Exception):
 
 
 class Interp:
-    def __init__(self, program, argv_fs=None, hooks=None, assigns=None):
+    def __init__(self, program, argv_fs=None, hooks=None, assigns=None,
+                 env=None):
         self.items = program
         self.out = []
         self.err = []
@@ -673,6 +799,16 @@ class Interp:
         for k, v in (assigns or {}).items():
             self.globals[k] = _StrNum(v)
         self.arrays = {}
+        # ENVIRON. mawk populates it; this emulator did not, so
+        # `awk 'BEGIN{print ENVIRON["HOME"]}'` -- a one-liner that appears
+        # in recon scripts precisely because it needs no shell -- printed an
+        # empty line on a box where every other reader of the environment
+        # answered. The env is supplied by the caller and is the emulated
+        # shell's, never this process's: os.environ here would hand an
+        # attacker the honeypot's own variables.
+        if env:
+            self.arrays["ENVIRON"] = {
+                str(k): _StrNum(v) for k, v in env.items()}
         self.locals = []
         self.fields = [""]
         self.exit_code = 0
@@ -688,7 +824,7 @@ class Interp:
         elif len(fs) == 1:
             parts = line.split(fs) if line else []
         else:
-            parts = re.split(_posix_ere(fs), line) if line else []
+            parts = _fs_split(fs, line) if line else []
         self.fields.extend(parts)
         self.globals["NF"] = float(len(parts))
 
@@ -748,11 +884,14 @@ class Interp:
         return self.arrays.setdefault(name, {})
 
     # -- driver
-    def run(self, records):
+    def run(self, records, raw=None):
         try:
             for it in self.items:
                 if it[0] == "BEGIN":
                     self.exec_stmt(it[1])
+            rs = _to_str(self.globals.get("RS", "\n"))
+            if rs != "\n":
+                records = _rs_split(records, rs, raw)
             for line in records:
                 self.globals["NR"] = _to_num(self.globals["NR"]) + 1
                 self.globals["FNR"] = _to_num(self.globals["FNR"]) + 1
@@ -887,6 +1026,19 @@ class Interp:
         # way it went -- a branch with one outcome, and int() of an
         # infinity raises OverflowError, so `print x` after an overflowing
         # `x ^= n` killed awk from inside the print.
+        #
+        # print uses OFMT where concatenation uses CONVFMT, and only for a
+        # number that is not integral: with OFMT="%.2f", `print 3.14159` is
+        # 3.14, `print 42` is 42, and `print 3.14159 ""` is 3.14159 because
+        # that one is a concatenation. Fields keep their own text -- a
+        # strnum is a str subclass here, so it does not reach this branch.
+        if isinstance(v, float) and v == v and v not in (
+                float("inf"), float("-inf")) and v != int(v):
+            fmt = _conv_fmt("OFMT")
+            try:
+                return fmt % v
+            except (TypeError, ValueError):
+                return _to_str(v)
         return _to_str(v)
 
     def _emit(self, text, redirect):
@@ -1182,7 +1334,7 @@ class Interp:
             elif len(fs) == 1:
                 parts = text.split(fs) if text else []
             else:
-                parts = re.split(_posix_ere(fs), text) if text else []
+                parts = _fs_split(fs, text) if text else []
             for i, part in enumerate(parts, 1):
                 arr[str(i)] = _StrNum(part)
             return float(len(parts))
@@ -1339,20 +1491,63 @@ def _unescape(text):
     return "".join(out)
 
 
-def run_awk(prog_text, records, fs=None, hooks=None, assigns=None):
+def _undefined_funcs(ast):
+    """Names called as functions that the program never defines."""
+    defined = {i[1] for i in ast if i[0] == "FUNC"}
+    found, seen, stack = [], set(), [ast]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, (list, tuple)):
+            continue
+        if len(node) > 1 and node[0] == "USERCALL" \
+                and isinstance(node[1], str) \
+                and node[1] not in defined and node[1] not in seen:
+            seen.add(node[1])
+            found.append(node[1])
+        stack.extend(x for x in node if isinstance(x, (list, tuple)))
+    # mawk reports these in symbol-table order; measured, two undefined
+    # names came back alphabetically, which is what this reproduces.
+    return sorted(found)
+
+
+def run_awk(prog_text, records, fs=None, hooks=None, assigns=None,
+            env=None, raw=None):
     """(stdout, stderr, exit_code). Raises nothing; syntax errors come back as
     stderr plus exit 2, which is what awk does -- never a passthrough."""
+    _warns = []
     try:
-        ast = _Parser(_lex(prog_text)).program()
+        ast = _Parser(_lex(prog_text, _warns)).program()
     except AwkSyntaxError as exc:
         return "", "awk: syntax error: %s\n" % exc, 2
     except RecursionError:
         return "", "awk: program too deeply nested\n", 2
-    interp = Interp(ast, argv_fs=fs, hooks=hooks, assigns=assigns)
+    # An undefined function is fatal before anything runs, so a program with
+    # one produces no output at all: mawk prints nothing for
+    # `awk 'BEGIN{print "hi"} {print foo()}'`. This used to be a runtime
+    # error, which meant BEGIN had already printed by the time it fired, and
+    # the message was worded "calling undefined function foo" -- gawk-ish,
+    # and not what a box running mawk 1.3.4 says. mawk notices at EOF and
+    # names the line its counter has reached by then, which is one past the
+    # newlines it consumed: a one-line program reports line 2, and the same
+    # program with a trailing newline reports line 3 (measured -- so this
+    # counts newlines and must not strip a trailing one).
+    _undef = _undefined_funcs(ast)
+    if _undef:
+        line = prog_text.count("\n") + 2
+        return "", "".join(
+            "awk: line %d: function %s never defined\n" % (line, nm)
+            for nm in _undef), 2
+    interp = Interp(ast, argv_fs=fs, hooks=hooks, assigns=assigns, env=env)
+    _prev, _CUR[0] = _CUR[0], interp
     try:
-        interp.run(records)
+        interp.run(records, raw=raw)
     except _AwkRuntime as exc:
-        return "".join(interp.out), "awk: %s\n" % exc, 2
+        return ("".join(interp.out),
+                "".join(_warns) + "awk: %s\n" % exc, 2)
     except RecursionError:
-        return "".join(interp.out), "awk: call nesting too deep\n", 2
-    return "".join(interp.out), "".join(interp.err), interp.exit_code
+        return ("".join(interp.out),
+                "".join(_warns) + "awk: call nesting too deep\n", 2)
+    finally:
+        _CUR[0] = _prev
+    return ("".join(interp.out), "".join(_warns) + "".join(interp.err),
+            interp.exit_code)

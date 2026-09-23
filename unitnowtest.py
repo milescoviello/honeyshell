@@ -39,6 +39,7 @@ Usage:  python3 unitnowtest.py
 """
 
 import sys
+import time
 
 import fakeshell
 
@@ -154,6 +155,66 @@ r(sh3, "systemctl stop cron")
 check("...and a stopped one reports 0",
       r(sh3, "systemctl show cron -p MainPID --value"), "0")
 check("...and says so", r(sh3, "systemctl is-active cron"), "inactive")
+
+# ------------------- a unit's start is its own process's start
+# `systemctl show -p ActiveEnterTimestamp` and `ps -o lstart=` on the same
+# unit's MainPID are two commands anybody runs together, and every unit
+# reported BOOT_TS. Right for the daemons that come up with the box --
+# nginx, mariadb, ssh and cron all start within five seconds of it -- and
+# wrong for the two monitoring exporters, whose processes the workload
+# starts weeks later:
+#
+#     systemctl show -p ActiveEnterTimestamp node_exporter
+#         Wed 2026-07-08 12:11:37 UTC
+#     ps -o lstart= -p 21407
+#         Wed Aug 12 09:16:37 2026
+#
+# 35 days apart, for one pid. `systemctl status` printed the same boot
+# instant on its "Active: since" line, so all three agreed with each other
+# and disagreed with ps.
+U = shell()
+_bad, _checked = [], 0
+for _u in ("node_exporter", "dcgm-exporter", "nginx", "mariadb", "ssh",
+           "cron"):
+    _mp = r(U, "systemctl show -p MainPID --value %s" % _u).strip()
+    if not _mp.isdigit() or _mp == "0":
+        continue
+    _ae = r(U, "systemctl show -p ActiveEnterTimestamp --value %s" % _u).strip()
+    _ps = r(U, "ps -o lstart= -p %s" % _mp).strip()
+    if not (_ae and _ps):
+        continue
+    _checked += 1
+    # "Wed 2026-07-08 12:11:37 UTC" against "Wed Jul  8 12:11:37 2026"
+    try:
+        a = time.strptime(_ae, "%a %Y-%m-%d %H:%M:%S UTC")
+        b = time.strptime(" ".join(_ps.split()), "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        _bad.append("%s: unparsable %r / %r" % (_u, _ae, _ps))
+        continue
+    if abs(time.mktime(a) - time.mktime(b)) > 1:
+        _bad.append("%s: show=%s ps=%s" % (_u, _ae, _ps))
+check("enough units carried a main pid", _checked >= 5, True, str(_checked))
+check("every unit's ActiveEnterTimestamp is its own process's start",
+      _bad, [],
+      "systemctl and ps describing one pid cannot differ")
+# ...and status must not disagree with show about the same unit.
+_split = []
+for _u in ("node_exporter", "nginx"):
+    _ae = r(U, "systemctl show -p ActiveEnterTimestamp --value %s" % _u).strip()
+    _st = [l for l in r(U, "systemctl status %s" % _u).splitlines()
+           if "Active:" in l]
+    if _ae and _st and _ae not in _st[0]:
+        _split.append("%s: show=%r status=%r" % (_u, _ae, _st[0].strip()))
+check("status and show quote the same instant", _split, [])
+# The exporters are not boot daemons, so their start must be later than
+# the box's. That is the half a single hardcoded BOOT_TS could not express.
+_boot = r(U, "uptime -s").strip()
+_exp = r(U, "systemctl show -p ActiveEnterTimestamp --value node_exporter").strip()
+check("an exporter starts after the box boots",
+      bool(_boot) and bool(_exp)
+      and time.mktime(time.strptime(_exp, "%a %Y-%m-%d %H:%M:%S UTC"))
+      > time.mktime(time.strptime(_boot, "%Y-%m-%d %H:%M:%S")) + 60, True,
+      "boot=%r exporter=%r" % (_boot, _exp))
 
 for f in FAILS:
     print(" ", f)

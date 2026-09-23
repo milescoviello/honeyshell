@@ -1,16 +1,19 @@
 #!/bin/bash
 # Run every suite. Exit non-zero if any UNEXPECTED one fails.
 #
-# One suite is expected to fail and says so out loud rather than being
-# skipped: awktest.py differs from GNU awk on `gsub(/a/, "\\&")` -- see
-# "The one known failure" in docs/testing.md. Listing it here keeps CI green
-# without hiding it, and an unexpected failure still turns the build red.
-# Silencing a known failure by skipping the suite would also hide the other
-# 89 cases it checks.
+# One suite is expected to fail on Debian 13, and says so out loud rather
+# than being skipped: scripttest.py, where 3 of its 423 cases differ from
+# Python 3.13.5 in how an uncaught exception's traceback is formatted under
+# `python3 -c`. See "Known failures" in docs/testing.md. Listing it here
+# keeps CI green without hiding it; any other failure still turns the build
+# red, and skipping the suite instead would hide the 420 cases that pass.
+#
+# awktest.py used to be the listed one. It is fixed -- 97/97 against the
+# reference awk, 47/47 against mawk 1.3.4 -- and is no longer tolerated.
 #
 # KNOWN_FAILURES can be overridden to run with nothing tolerated:
 #   KNOWN_FAILURES= ./run-suites.sh
-: "${KNOWN_FAILURES=awktest.py}"
+: "${KNOWN_FAILURES=scripttest.py}"
 
 # Refuse to run twice at once: the first thing this does is delete
 # __pycache__ out from under anything already importing, and the differential

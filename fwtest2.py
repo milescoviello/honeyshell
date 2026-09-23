@@ -158,8 +158,15 @@ def main():
     check("nft is not a command here", rc, 127)
     check("...and says so", "nft: command not found" in "".join(s3._err),
           True)
-    check("dpkg does not claim the package",
-          "no packages found" in s3.run("dpkg -l nftables 2>&1"), True)
+    # Same correction as boottest's busybox line: nftables is referenced by
+    # something installed on a stock trixie image, so dpkg holds a stub and
+    # prints `un nftables` with rc 0 rather than "no packages found".
+    # Measured on the guest. Not installed is still not installed -- the
+    # status column says so, which is what this check is really about.
+    _nft = s3.run("dpkg -l nftables 2>&1")
+    check("dpkg does not claim the package is installed",
+          [l.split()[0] for l in _nft.splitlines()
+           if l.startswith(("ii ", "un "))], ["un"])
     check("and there is no binary on the disk",
           s3.run("test -e /usr/sbin/nft && echo y || echo n").strip(), "n")
     # The tools that *are* here still agree with the package list.

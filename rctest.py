@@ -24,6 +24,26 @@ import fakeshell as fs                                          # noqa: E402
 # (name, snippet). Snippets run in a fresh temp dir with umask 022 and must
 # not touch anything outside it.
 CASES = [
+    # An if whose condition is false and which has no else exits 0, not
+    # the condition's status. POSIX and bash both say so. This returned
+    # the condition's 1, so such an if as a script's last line failed the
+    # script and `if ...; fi && next` never reached next.
+    ("if false, no else",       "if false; then false; fi"),
+    ("if false, test cond",     "if [ 0 -ne 0 ]; then false; fi"),
+    ("if/elif both false",      "if false; then :; elif false; then :; fi"),
+    ("if false then chained",   "if false; then :; fi && true"),
+    ("if true, body fails",     "if true; then false; fi"),
+    ("if false, else fails",    "if false; then true; else false; fi"),
+    ("while never runs",        "while false; do false; done"),
+    # A saved status is what a script branches on, so the branch itself
+    # is the exit status worth comparing. `rc=$?` stored a sentinel, so
+    # every one of these took the wrong path on a command that had just
+    # succeeded.
+    ("saved rc, test zero",     'true; rc=$?; [ "$rc" -eq 0 ]'),
+    ("saved rc, test nonzero",  'false; rc=$?; [ "$rc" -ne 0 ]'),
+    ("saved rc, if-then",       'true; rc=$?; if [ "$rc" -ne 0 ]; then false; fi'),
+    ("saved rc from a subst",   'out=$(true); rc=$?; [ "$rc" -eq 0 ]'),
+    ("saved rc guards an exit", 'x=$(exit 4); rc=$?; [ "$rc" -eq 4 ]'),
     ("true",                    "true"),
     ("false",                   "false"),
     ("exit code passthrough",   "(exit 42)"),
@@ -38,6 +58,22 @@ CASES = [
     ("type present",            "type ls"),
     ("type absent",             "type definitelynotacommand"),
     ("hash absent",             "hash definitelynotacommand"),
+
+    # $? after an assignment whose value is a command substitution.
+    # `out=$(cmd); rc=$?` is how a script captures output and checks
+    # whether it worked in one breath, and every one of these returned 0:
+    # the message was on stderr and the status said success, so every
+    # `||` and `if !` built on the idiom took the wrong branch. A plain
+    # assignment really is 0; with several, bash keeps the last one's.
+    ("assign from failing cmdsub", "x=$(false)"),
+    ("assign from exit 5",        "x=$(exit 5)"),
+    ("assign from true",          "x=$(true)"),
+    ("plain assignment",          "x=1"),
+    ("assign from backticks",     "x=`false`"),
+    ("two assigns, last wins",    "a=$(false) b=$(exit 3)"),
+    ("assign from denied read",   "x=$(cat /nonexistent 2>/dev/null)"),
+    ("cmdsub as an argument",     "echo $(false) >/dev/null"),
+    ("assign then use in test",   "x=$(false); [ $? -ne 0 ]"),
 
     ("unknown command",         "definitelynotacommand"),
     ("absolute missing path",   "/nonexistent/binary"),

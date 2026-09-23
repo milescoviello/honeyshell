@@ -66,7 +66,14 @@ def R(cmd, s):
 
 
 def sudo_lines(s):
-    return [l for l in R("cat /var/log/auth.log", s)[0].splitlines()
+    # auth.log and its rotation, which is what anyone investigating greps.
+    # The seeded worked example sits at a fixed offset into the weekly
+    # rotation window, so for the ~20 hours after each Sunday 06:47 it has
+    # not fallen due yet and lives only in auth.log.1 -- the history is
+    # continuous across the pair, not inside either one alone. Reading only
+    # the live file made this suite pass six days a week.
+    return [l for l in R("cat /var/log/auth.log.1 /var/log/auth.log",
+                         s)[0].splitlines()
             if " sudo[" in l or " sudo: " in l]
 
 

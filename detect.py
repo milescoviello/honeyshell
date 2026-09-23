@@ -2224,22 +2224,40 @@ def _c(s):
         "fstab=%r" % fstab.strip()[:50]
 
 
+#: df and lsblk pick their unit from the size. Pinning G only worked while
+#: the box was small enough to be measured in gigabytes -- on a terabyte
+#: root both patterns stopped matching and the check reported None vs None,
+#: which passes for neither agreement nor disagreement.
+_UNIT_KB = {"K": 1.0, "M": 1024.0, "G": 1024.0 ** 2, "T": 1024.0 ** 3,
+            "P": 1024.0 ** 4}
+
+
+def _sized(txt):
+    """The first human-readable size in `txt`, in KiB."""
+    m = re.search(r"([\d.]+)([KMGTP])\b", txt)
+    if not m:
+        return None
+    return float(m.group(1)) * _UNIT_KB[m.group(2)]
+
+
 @cross("mounts", "df total agrees with lsblk size")
 def _c(s):
-    d = re.search(r"\s([\d.]+)G\s+[\d.]+G", R(s, "df -h /")[0])
-    l = re.search(r"([\d.]+)G", R(s, "lsblk")[0])
-    return d and l and abs(float(d.group(1)) - float(l.group(1))) < float(l.group(1)) * 0.35, \
-        "df=%sG lsblk=%sG" % (d.group(1) if d else None, l.group(1) if l else None)
+    d = _sized(R(s, "df -h /")[0].splitlines()[-1])
+    l = _sized(R(s, "lsblk")[0])
+    return (d is not None and l is not None
+            and abs(d - l) < l * 0.35), "df=%s lsblk=%s KiB" % (d, l)
 
 
 @cross("mounts", "df -h and df -k agree")
 def _c(s):
-    h = re.search(r"\s([\d.]+)G\s", R(s, "df -h /")[0])
+    h = _sized(R(s, "df -h /")[0].splitlines()[-1])
     k = re.search(r"\s(\d+)\s+\d+\s+\d+\s+\d+%", R(s, "df -k /")[0])
-    if not h or not k:
-        return False, "h=%s k=%s" % (bool(h), bool(k))
-    return abs(float(h.group(1)) - int(k.group(1)) / 1024 ** 2) < 2, \
-        "%sG vs %dK" % (h.group(1), int(k.group(1)))
+    if h is None or not k:
+        return False, "h=%s k=%s" % (h, bool(k))
+    # -h rounds to one decimal, so allow a whole unit of slack at whatever
+    # scale it chose rather than a flat 2 GiB.
+    return abs(h - int(k.group(1))) < max(2.0 * 1024 ** 2, h * 0.02), \
+        "%.0f KiB vs %dK" % (h, int(k.group(1)))
 
 
 @cross("mounts", "df used+avail is consistent with the percentage")

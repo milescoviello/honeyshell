@@ -7,7 +7,7 @@ There were three answers and they shared nothing:
     crc32c_intel.
   - /sys/module held exactly one entry, kvm_intel, which appears in neither
     -- and which only exists on a KVM *host*, on a box that tells DMI,
-    lscpu, systemd-detect-virt and /sys/hypervisor/uuid it is a guest.
+    lscpu, systemd-detect-virt and dmesg it is a guest.
   - modules.builtin said ext4 was compiled in, which cannot be true of a
     module lsmod reports as loaded.
 
@@ -95,10 +95,18 @@ def t_three_views_name_the_same_modules():
     sysnames = set(sysm.split())
     missing = sorted(set(pm) - sysnames)
     eq("every loaded module has a /sys/module entry", missing, [])
-    # A /sys/module entry that is neither loaded nor built in is the
-    # kvm_intel case: a claim nothing else on the box supports.
+    # A /sys/module entry that is none of the three legitimate kinds is
+    # the kvm_intel case: a claim nothing else on the box supports.
+    # The kinds are loaded (lsmod + /proc/modules + /sys/module), built in
+    # (modules.builtin + /sys/module), and a parameter namespace, which is
+    # in /sys/module alone -- kernel, printk, vt, pcie_aspm, acpi are not
+    # modules and modinfo says so. This accounting knew only the first two,
+    # so adding the third made it fail, which is the check doing its job.
     builtin = set(n for n, _sub in fs.BUILTIN_MODULES)
-    orphan = sorted(sysnames - set(pm) - builtin)
+    namespaces = set(n for n, _params in fs.PARAM_NAMESPACES)
+    eq("the three kinds do not overlap",
+       sorted((builtin & namespaces) | (set(pm) & namespaces)), [])
+    orphan = sorted(sysnames - set(pm) - builtin - namespaces)
     eq("no /sys/module entry is unaccounted for", orphan, [])
 
 
@@ -122,6 +130,53 @@ def t_no_kvm_host_module_in_a_guest():
     check("no /sys/module/kvm_intel on a guest", rc != 0, o[:80])
     v, _ = run(s, "systemd-detect-virt")
     eq("and the box still says it is a guest", v.strip(), "kvm")
+
+
+def t_the_hypervisor_dir_does_not_leak_the_machine_uuid():
+    """/sys/hypervisor/uuid is a Xen file, and it was handing the system
+    UUID to any unprivileged session.
+
+    /sys/class/dmi/id/product_uuid is 0400 and correctly refuses a
+    non-root user -- measured on the reference box, where an ordinary
+    login account gets "Permission denied". This copy of the same value sat at 0444 beside
+    it, so one secret had two readers and one of them gave it away. On
+    the reference box, which is itself a KVM guest, `ls /sys/hypervisor`
+    prints nothing at all.
+    """
+    s = sh()
+    o, rc = run(s, "test -d /sys/hypervisor && echo yes")
+    eq("the directory still exists", o.strip(), "yes")
+    o, _ = run(s, "ls /sys/hypervisor")
+    eq("...and it is empty, as on a KVM guest", o.split(), [])
+    o, rc = run(s, "cat /sys/hypervisor/uuid 2>&1")
+    check("there is no uuid file", rc != 0 and "No such file" in o, o[:60])
+
+    # The UUID is still there for root by its real path, and still denied
+    # to anyone else -- which is the whole point of removing the copy.
+    import fakeshell as _fs
+    root = _fs.Shell(vfs=_fs.VFS(), user="root")
+    dep = _fs.Shell(vfs=_fs.VFS(), user="deploy")
+    ro = root.run("cat /sys/class/dmi/id/product_uuid 2>&1").strip()
+    de = dep.run("cat /sys/class/dmi/id/product_uuid 2>&1").strip()
+    check("root can still read product_uuid", "-" in ro and "denied" not in ro,
+          ro[:60])
+    check("deploy still cannot", "Permission denied" in de, de[:60])
+    check("...and has no other path to it",
+          "No such file" in dep.run("cat /sys/hypervisor/uuid 2>&1"),
+          dep.run("cat /sys/hypervisor/uuid 2>&1")[:60])
+
+    # Removing it must not have cost the guest story. Six other views.
+    v, _ = run(s, "systemd-detect-virt")
+    eq("systemd-detect-virt still says kvm", v.strip(), "kvm")
+    o, _ = run(s, "lscpu")
+    check("lscpu still names the hypervisor",
+          any(l.startswith("Hypervisor vendor:") and "KVM" in l
+              for l in o.split("\n")), "no Hypervisor line")
+    o, _ = run(s, "grep -m1 ^flags /proc/cpuinfo")
+    check("the cpuinfo hypervisor flag is still set", "hypervisor" in o,
+          o[:60])
+    o, _ = run(s, "cat /sys/class/dmi/id/sys_vendor")
+    eq("DMI still says QEMU", o.strip(), "QEMU")
 
 
 def t_dependency_order_and_refcounts():
@@ -385,6 +440,57 @@ def t_module_files_are_readable_and_typed():
               o.startswith("regular file") and int(o.split()[-1]) > 0, o[:60])
     o, rc = run(s, "ls -d /lib/modules/$(uname -r)/kernel/fs/ext4")
     eq("the kernel/ tree has real subdirectories", rc, 0)
+
+
+def t_parameter_namespaces_are_not_modules():
+    """/sys/module holds things lsmod will never mention, and should.
+
+    Three lists, and they overlap in a specific way. A loaded module is in
+    lsmod, /proc/modules and /sys/module. A built-in driver like scsi_mod
+    is in /sys/module and modules.builtin but not lsmod. And a parameter
+    namespace -- kernel, printk, vt, pcie_aspm, acpi -- is in /sys/module
+    and nothing else at all: not lsmod, not modules.builtin, and modinfo
+    denies it exists.
+
+    That third kind was missing entirely. /sys/module held 40 entries
+    against lsmod's 33, and none of the seven extras was /sys/module/kernel
+    -- which every Linux box has, because it is where the core's own
+    parameters live. Measured on a real 6.12 cloud kernel; the set follows
+    this persona's kernel config, which sets CONFIG_VT, CONFIG_PCIEASPM and
+    CONFIG_ACPI and has no CONFIG_USB, so usbcore is right to be absent.
+    """
+    s = sh()
+    lsmod = {l.split()[0] for l in run(s, "lsmod")[0].split("\n")[1:]
+             if l.split()}
+    sysmod = set(run(s, "ls /sys/module")[0].split())
+    check("every loaded module has a /sys/module entry",
+          lsmod <= sysmod, sorted(lsmod - sysmod)[:5])
+    builtin_list = run(s, "cat /lib/modules/%s/modules.builtin" % fs.KERNEL)[0]
+    for name in ("kernel", "printk", "vt", "pcie_aspm", "acpi"):
+        check("/sys/module/%s exists" % name, name in sysmod,
+              "a parameter namespace, not a module")
+        check("...and %s is in no lsmod row" % name, name not in lsmod, name)
+        check("...and in no modules.builtin line" % (),
+              ("/%s.ko" % name) not in builtin_list, name)
+        out, rc = run(s, "modinfo %s" % name)
+        eq("...and modinfo denies %s" % name, rc, 1)
+        check("...saying not found", "not found" in out, out[:60])
+        params = run(s, "ls /sys/module/%s/parameters" % name)[0].split()
+        check("...and it owns parameters", len(params) > 0, name)
+    # The version-bearing one, read off a running 6.12 rather than guessed:
+    # 6.8 ships 20230628, so a wrong value here dates the kernel wrongly.
+    eq("acpi carries the ACPICA release 6.12 has",
+       run(s, "cat /sys/module/acpi/parameters/acpica_version")[0].strip(),
+       "20240827")
+    # The config is the reason usbcore is absent, and it is on the box.
+    eq("the kernel config has no USB, so usbcore has no entry",
+       run(s, "grep -c '^CONFIG_USB=' /boot/config-%s" % fs.KERNEL)[0].strip(),
+       "0")
+    check("...and usbcore is indeed absent", "usbcore" not in sysmod, "")
+    # A built-in driver is the other shape: in modules.builtin and
+    # /sys/module, absent from lsmod.
+    check("scsi_mod is in modules.builtin", "/scsi_mod.ko" in builtin_list, "")
+    check("...and in /sys/module", "scsi_mod" in sysmod, "")
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]

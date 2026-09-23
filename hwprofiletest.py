@@ -49,6 +49,7 @@ Usage:  python3 hwprofiletest.py
 import sys
 
 import fakeshell as F
+import nvidia
 
 CHECKS, FAILS = [], []
 
@@ -148,10 +149,31 @@ def t_getconf_agrees_with_the_rest_of_the_box():
     check("_PHYS_PAGES * PAGESIZE == MemTotal",
           (phys * page // 1024) if (phys and page) else phys, memtotal)
 
-    avail = num(s.run("getconf _AVPHYS_PAGES"))
-    memfree = num(s.run("grep ^MemFree /proc/meminfo | awk '{print $2}'"))
-    check("_AVPHYS_PAGES * PAGESIZE == MemFree",
-          (avail * page // 1024) if (avail and page) else avail, memfree)
+    # Both out of ONE invocation, and then compared with a tolerance,
+    # because pairing the reads narrows the window and cannot close it.
+    # MemFree is not a constant -- it moves tens to hundreds of kB a
+    # second -- so two reads are two instants however close together they
+    # are issued. This check demanded exact equality and went red in the
+    # gate twice for that reason alone: 748 kB apart once, 272 kB apart
+    # once, both green standalone. Exactness was also never the real
+    # behaviour: the guest measurement this suite is built on is 319600 kB
+    # against MemFree 319852 kB, 252 kB apart, sampled a moment apart.
+    #
+    # 8192 kB is ten seconds of the fastest drift seen and 26000 times
+    # smaller than the thing this check exists to catch -- reading
+    # MemAvailable instead of MemFree, which on this persona is 217062124
+    # kB away. MemTotal above is safe because it does not move.
+    _pair = s.run("getconf _AVPHYS_PAGES; "
+                  "grep ^MemFree /proc/meminfo | awk '{print $2}'").split()
+    avail = num(_pair[0]) if len(_pair) == 2 else None
+    memfree = num(_pair[1]) if len(_pair) == 2 else None
+    _got = (avail * page // 1024) if (avail and page) else avail
+    _delta = (abs(_got - memfree)
+              if (_got is not None and memfree is not None) else None)
+    # True when it holds, the actual gap when it does not, so a failure
+    # reports the number rather than "False".
+    check("_AVPHYS_PAGES * PAGESIZE tracks MemFree (<=8192 kB apart)",
+          True if (_delta is not None and _delta <= 8192) else _delta, True)
 
     # getconf reports one cache instance; lscpu reports the total across
     # them. free(1)-style unit parsing, because lscpu prints KiB/MiB.
@@ -165,10 +187,20 @@ def t_getconf_agrees_with_the_rest_of_the_box():
             return int(val * mult)
         except Exception:                                      # noqa: BLE001
             return None
-    for label, var, inst in (("L1d cache", "LEVEL1_DCACHE_SIZE", ncpu),
-                             ("L1i cache", "LEVEL1_ICACHE_SIZE", ncpu),
-                             ("L2 cache", "LEVEL2_CACHE_SIZE", ncpu),
-                             ("L3 cache", "LEVEL3_CACHE_SIZE", 1)):
+    # How many instances of each cache the box has is a property of the
+    # sharing width, not of the CPU count: with SMT the L1/L2 pair belongs
+    # to a core, and L3 belongs to a CCD. Taking ncpu for the first three
+    # and 1 for L3 was only right for a box with neither.
+    def instances(idx):
+        _l, _t, _sz, _w, _st, cores_per = F.CPU_CACHES[idx]
+        return max(1, F.CPU_CORES // cores_per)
+
+    for label, var, inst in (("L1d cache", "LEVEL1_DCACHE_SIZE",
+                              instances(0)),
+                             ("L1i cache", "LEVEL1_ICACHE_SIZE",
+                              instances(1)),
+                             ("L2 cache", "LEVEL2_CACHE_SIZE", instances(2)),
+                             ("L3 cache", "LEVEL3_CACHE_SIZE", instances(3))):
         got = num(s.run("getconf %s" % var))
         check("%s: lscpu total == getconf * instances" % label,
               lscpu_bytes(label), (got * inst) if got else got)
@@ -225,17 +257,24 @@ def t_the_gpu_questions_it_actually_asked():
     s = sh()
     check("lspci names a VGA device",
           s.run("lspci | grep VGA | cut -f5- -d ' '").strip() != "", True)
-    check("VGA device count", s.run("lspci | grep VGA -c").strip(), "1")
+    # One QEMU display plus the passed-through cards, which is what a GPU
+    # node with a virtual console actually looks like.
+    check("VGA device count", s.run("lspci | grep VGA -c").strip(),
+          str(F.__dict__.get("_VGA_EXPECTED") or (nvidia.GPU_COUNT + 1)))
+    # The cards present as VGA controllers, not 3D controllers, which is
+    # how a consumer GeForce shows up.
     check("no 3D controller",
           s.run("lspci | grep '3D controller' | cut -f5- -d ' '").strip(), "")
-    # nvidia-smi is not installed, and that is the right answer for a box
-    # whose only display device is the QEMU one lspci reports.
-    check("nvidia-smi is not found",
-          s.run("nvidia-smi >/dev/null 2>&1; echo $?").strip(), "127")
-    check("the pipeline it used yields nothing",
-          s.run("nvidia-smi -q | grep 'Product Name' | head -n 1").strip(), "")
-    check("...and its counting form yields 0",
-          s.run("nvidia-smi -q | grep 'Product Name' | grep . -c").strip(), "0")
+    # 203.0.113.64 ran exactly this pipeline on 2026-08-27 before choosing a
+    # payload, and got "command not found" twice. The box now answers it.
+    check("nvidia-smi runs",
+          s.run("nvidia-smi >/dev/null 2>&1; echo $?").strip(), "0")
+    check("the pipeline it used names the card",
+          s.run("nvidia-smi -q | grep 'Product Name' | head -n 1").strip(),
+          "Product Name                          : " + nvidia.GPU_NAME)
+    check("...and its counting form counts every card",
+          s.run("nvidia-smi -q | grep 'Product Name' | grep . -c").strip(),
+          str(nvidia.GPU_COUNT))
     check("uptime -p answers", s.run("uptime -p").startswith("up "), True)
 
 

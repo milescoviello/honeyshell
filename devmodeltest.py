@@ -88,6 +88,15 @@ def layout():
     if fn is None:
         return []
     try:
+        # Every disk's layout, not just the default one -- gpt_layout()
+        # takes a disk argument now, and calling it bare listed sda's
+        # partitions while lsblk listed all of them.
+        disks = getattr(fakeshell, "DISKS", None)
+        if disks:
+            rows = []
+            for d in disks:
+                rows += list(fn(d[0]))
+            return rows
         return list(fn())
     except Exception as exc:                                   # noqa: BLE001
         return [("<raised %s>" % type(exc).__name__, 0, 0, 0, 0, "")]
@@ -110,7 +119,14 @@ disks_stat = sorted(l.split()[2] for l in lines(S, "cat /proc/diskstats")
 # Compared against the persona's disk set rather than against each other,
 # so a reader that is wrong fails on its own line instead of poisoning the
 # baseline for the next three.
-DISKS = ["sda", "sr0"]
+# From the emulator's own disk table plus the CD-ROM, which is not in it
+# (no partition table). This was ["sda", "sr0"], which made adding a
+# second drive look like a -dn parsing regression.
+# Sorted, because every reader above is sorted -- `ls /sys/block` sorts
+# and lsblk prints in table order, so comparing them to one *ordered*
+# list could only ever have worked while there was a single disk.
+DISKS = sorted([d[0] for d in getattr(fakeshell, "DISKS",
+                                      [("sda",)])] + ["sr0"])
 check("lsblk -d lists whole disks only", disks_lsblk, DISKS,
       "-d means --nodeps: drop the partitions. It was an alias for -l, "
       "which keeps them.")
@@ -122,23 +138,29 @@ check("/proc/diskstats minor-0 devices match", disks_stat, DISKS)
 # Partitions, four ways.
 parts_lsblk = sorted(l.split()[0] for l in lines(S, "lsblk -ln -o NAME,TYPE")
                      if l.split()[-1] == "part")
-parts_sys = sorted(n for n in out(S, "ls /sys/block/sda").split()
-                   if n.startswith("sda") and n != "sda")
+# Every partition on the box, not the ones whose names begin "sda".
+# Filtering by that prefix pinned all five readers to a single disk, so a
+# second drive's partition was invisible to the suite that exists to
+# check that every reader lists the same partitions.
+_wholedisks = set(DISKS)
+parts_sys = sorted(n for d in DISKS
+                   for n in out(S, "ls /sys/block/%s" % d).split()
+                   if n.startswith(d) and n != d)
 parts_part = sorted(l.split()[3] for l in lines(S, "cat /proc/partitions")[1:]
-                    if len(l.split()) == 4 and l.split()[3].startswith("sda")
-                    and l.split()[3] != "sda")
+                    if len(l.split()) == 4
+                    and l.split()[3] not in _wholedisks)
 parts_stat = sorted(l.split()[2] for l in lines(S, "cat /proc/diskstats")
-                    if len(l.split()) > 2 and l.split()[2].startswith("sda")
-                    and l.split()[2] != "sda")
+                    if len(l.split()) > 2
+                    and l.split()[2] not in _wholedisks)
 parts_fdisk = sorted(l.split()[0].rsplit("/", 1)[-1]
-                     for l in lines(S, "fdisk -l /dev/sda")
-                     if l.startswith("/dev/sda"))
+                     for l in lines(S, "fdisk -l")
+                     if l.startswith("/dev/"))
 
 check("gpt_layout() is the partition list", PARTNAMES,
-      ["sda1", "sda14", "sda15"],
+      ["nvme0n1p1", "sda1", "sda14", "sda15"],
       "if the persona's disk changes this line changes with it")
 check("lsblk partitions match the layout", parts_lsblk, PARTNAMES)
-check("/sys/block/sda partitions match", parts_sys, PARTNAMES,
+check("/sys/block partitions match", parts_sys, PARTNAMES,
       "sda14 was missing here and present in every other reader")
 check("/proc/partitions matches", parts_part, PARTNAMES)
 check("/proc/diskstats matches", parts_stat, PARTNAMES,
@@ -181,17 +203,22 @@ check("size through the link matches /proc/partitions",
       str(int([l.split()[2] for l in lines(S, "cat /proc/partitions")
                if l.split()[-1] == "sda"][0]) * 2))
 fdisk_rows = {l.split()[0].rsplit("/", 1)[-1]: l.split()
-              for l in lines(S, "fdisk -l /dev/sda") if l.startswith("/dev/")}
+              for l in lines(S, "fdisk -l") if l.startswith("/dev/")}
+# A partition lives under its own disk in /sys/block. This read
+# /sys/block/sda/<part> for every partition, which was fine while there
+# was one disk and answered nothing at all once there were two.
+_pdisk = getattr(fakeshell, "PART_DISK", {})
 for name, minor, start, sectors, _kb, _kind in PARTS:
     row = fdisk_rows.get(name, [])
+    disk = _pdisk.get(name, "sda")
     check("%s start agrees with fdisk" % name,
-          out(S, "cat /sys/block/sda/%s/start" % name).strip(),
+          out(S, "cat /sys/block/%s/%s/start" % (disk, name)).strip(),
           row[1] if len(row) > 1 else "<no fdisk row>")
     check("%s size agrees with fdisk" % name,
-          out(S, "cat /sys/block/sda/%s/size" % name).strip(),
+          out(S, "cat /sys/block/%s/%s/size" % (disk, name)).strip(),
           row[3] if len(row) > 3 else "<no fdisk row>")
     check("%s knows its partition number" % name,
-          out(S, "cat /sys/block/sda/%s/partition" % name).strip(),
+          out(S, "cat /sys/block/%s/%s/partition" % (disk, name)).strip(),
           str(minor))
 
 # ------------------------------------------------------------- the buses
@@ -252,8 +279,13 @@ check("the tree holds every device lspci lists",
       len(slots), len(lspci),
       "lspci reads this bus; the bus has to hold what it prints")
 ids = {}
+# `lspci -n` prints unbracketed numbers -- "00:00.0 0600: 8086:29c0".
+# The brackets belong to -nn, and this regex wanted them, which it only
+# ever got because the two flags were treated as one and both printed the
+# -nn form. Measured on the Debian 13 host: -n is slot, class, ids.
 for line in lines(S, "lspci -n"):
-    m = re.match(r"^(\S+)\b.*\[([0-9a-f]{4}):([0-9a-f]{4})\]", line)
+    m = re.match(r"^(\S+)\s+[0-9a-f]{4}:\s+([0-9a-f]{4}):([0-9a-f]{4})",
+                 line)
     if m:
         ids[m.group(1)] = (m.group(2), m.group(3))
 check("lspci -n gives an id for every device", sorted(ids),
@@ -321,7 +353,7 @@ check("-d is a subset of -l",
       set(nodeps.split()) <= set(listed.split()), True)
 check("-d drops the glyphs too", "─" in nodeps, False)
 check("bundled short flags are parsed",
-      out(S, "lsblk -dn -o NAME").split(), ["sda", "sr0"],
+      sorted(out(S, "lsblk -dn -o NAME").split()), DISKS,
       "-dn matched nothing and was silently ignored")
 check("-l and the default agree on trailing whitespace",
       [l.rstrip() == l for l in listed.splitlines()],
@@ -338,6 +370,596 @@ check("sysfs links are dated at boot, not now",
       "a driver binds at boot; a device link stamped this minute on a box "
       "claiming %d days of uptime is a contradiction on its own"
       % ((now - boot) // 86400))
+
+# ------------------------------------------- /sys/class is a view as well
+# The docstring above is about /sys/bus and /sys/block; /sys/class obeys
+# the same rule and had been left out of it. Every entry under
+# /sys/class/<class>/ is a symlink into /sys/devices -- the real guest has
+# 176 of them and not one plain directory -- and twenty of ours were plain
+# directories: /sys/class/dmi/id, /sys/class/net/{eth0,lo} and all
+# seventeen DRM nodes.
+#
+# The dmi one had both halves of the bug at once. /sys/class/dmi/id held
+# all 21 files as a real directory while /sys/devices/virtual/dmi/id held
+# product_name alone, so two paths to one SMBIOS table disagreed on
+# sixteen of them:
+#
+#     cat /sys/class/dmi/id/sys_vendor             QEMU
+#     cat /sys/devices/virtual/dmi/id/sys_vendor   No such file or directory
+#
+# and dmidecode, reading the same table, agreed with the path that worked.
+_plain = out(S, 'for d in /sys/class/*/; do for e in "$d"*; do '
+                '[ -d "$e" ] && [ ! -L "$e" ] && echo "$e"; done; done')
+check("no entry under /sys/class is a plain directory",
+      sorted(_plain.split()), [],
+      "sysfs makes every /sys/class/<class>/<device> a symlink into "
+      "/sys/devices; a real box has zero plain directories there")
+
+check("/sys/class/dmi/id is the documented symlink",
+      out(S, "readlink /sys/class/dmi/id").strip(),
+      "../../devices/virtual/dmi/id")
+check("...and it resolves into the devices tree",
+      out(S, "readlink -f /sys/class/dmi/id").strip(),
+      "/sys/devices/virtual/dmi/id")
+# Regular files only. power/ is a directory and subsystem a symlink to
+# one, and `cat` on either names the path it was given -- so comparing
+# their error text reports a difference that a real box has too.
+_dmi_diff = out(S, 'for f in $(ls /sys/class/dmi/id); do '
+                   '[ -f /sys/class/dmi/id/$f ] || continue; '
+                   'a=$(cat /sys/class/dmi/id/$f 2>&1); '
+                   'b=$(cat /sys/devices/virtual/dmi/id/$f 2>&1); '
+                   '[ "$a" = "$b" ] || echo "$f"; done')
+check("both paths to the SMBIOS table read the same",
+      sorted(_dmi_diff.split()), [],
+      "one directory reached two ways cannot answer differently")
+check("dmidecode agrees with sysfs on the vendor",
+      out(S, "dmidecode -s system-manufacturer").strip(),
+      out(S, "cat /sys/devices/virtual/dmi/id/sys_vendor").strip())
+
+# `readlink /sys/class/net/eth0` is how you tell a physical NIC from a
+# virtual one, and how you get its PCI address without lspci. It was empty.
+check("lo points into devices/virtual",
+      out(S, "readlink /sys/class/net/lo").strip(),
+      "../../devices/virtual/net/lo")
+_nic = out(S, "readlink /sys/class/net/eth0").strip()
+_nic_slot = out(S, "lspci -D | awk '/Ethernet controller/{print $1}'").strip()
+check("eth0 points at the PCI slot lspci gives for the NIC",
+      _nic.startswith("../../devices/pci0000:00/%s/" % _nic_slot)
+      and _nic.endswith("/net/eth0"), True,
+      "got %r for slot %r -- the two readers of one NIC have to name the "
+      "same device" % (_nic, _nic_slot))
+check("eth0's attributes are readable through the link",
+      out(S, "cat /sys/class/net/eth0/address").strip(),
+      out(S, "cat $(readlink -f /sys/class/net/eth0)/address").strip())
+
+# The DRM nodes, which is where fastfetch and btop look for GPUs.
+_drm_bad = out(S, 'for e in /sys/class/drm/card* /sys/class/drm/renderD*; do '
+                  '[ -L "$e" ] || echo "$e"; done')
+check("every DRM node is a link", sorted(_drm_bad.split()), [])
+check("/sys/class/drm/version is a file, not a node",
+      out(S, "cat /sys/class/drm/version").strip(), "drm 1.1.0 20060810",
+      "it is the one entry under /sys/class/drm that is not a device")
+_gpu_slot = out(S, "lspci -D | awk '/NVIDIA/{print $1; exit}'").strip()
+check("card1 hangs off the first NVIDIA slot lspci reports",
+      out(S, "readlink /sys/class/drm/card1").strip(),
+      "../../devices/pci0000:00/%s/drm/card1" % _gpu_slot)
+check("its render node hangs off the same device",
+      out(S, "readlink /sys/class/drm/renderD128").strip(),
+      "../../devices/pci0000:00/%s/drm/renderD128" % _gpu_slot)
+check("a DRM node holds what a real one holds",
+      sorted(out(S, "ls /sys/class/drm/card1").split()),
+      ["dev", "device", "power", "subsystem", "uevent"])
+check("the node's device link points back at the card",
+      out(S, "readlink /sys/class/drm/card1/device").strip(),
+      "../../../%s" % _gpu_slot)
+check("...and its subsystem link points back at the class",
+      out(S, "readlink /sys/class/drm/card1/subsystem").strip(),
+      "../../../../../class/drm")
+check("the PCI device carries both nodes",
+      sorted(out(S, "ls /sys/devices/pci0000:00/%s/drm" % _gpu_slot).split()),
+      ["card1", "renderD128"])
+# sysfs's dev file and the device node in /dev are the same question.
+# `ls -l` prints them in decimal, stat -c %t:%T in hex, so the comparison
+# goes through the listing rather than converting.
+for _n, _min in (("card1", 1), ("renderD128", 128)):
+    check("%s's dev file matches its node in /dev/dri" % _n,
+          out(S, "cat /sys/class/drm/%s/dev" % _n).strip(),
+          out(S, "ls -l /dev/dri/%s | awk '{print $5$6}'" % _n
+              ).strip().replace(",", ":"))
+    check("...and names minor %d" % _min,
+          out(S, "cat /sys/class/drm/%s/dev" % _n).strip(), "226:%d" % _min)
+
+# Making the class entry a symlink introduced a failure mode of its own,
+# and the gate caught it: the runtime writers pushed live state through
+# /sys/class/net/<if>/, which created nodes *behind* the link that no read
+# reached. `ip link set eth0 mtu 9000` returned 0, ip reported 9000, and
+# both spellings of the sysfs path still said 1500 -- while the interface
+# counters stopped moving altogether, because the statistics sync looked
+# its nodes up by the class path and got None. Three suites went red on it
+# (ifacetest, nstattest, nettest). This checks the view and the tree agree
+# after a change, not just at construction.
+W = shell()
+_ = out(W, "ip link set eth0 mtu 9000")
+_dev = out(W, "readlink -f /sys/class/net/eth0").strip()
+check("a runtime write reaches the tree through the view",
+      [out(W, "cat /sys/class/net/eth0/mtu").strip(),
+       out(W, "cat %s/mtu" % _dev).strip(),
+       out(W, "ip -o link show eth0 | grep -o 'mtu [0-9]*'").strip()],
+      ["9000", "9000", "mtu 9000"],
+      "a write through a symlinked directory that lands behind the link "
+      "is invisible to every reader")
+_ = out(W, "ip link set eth0 down")
+check("...and so does operstate",
+      [out(W, "cat /sys/class/net/eth0/operstate").strip(),
+       out(W, "cat %s/operstate" % _dev).strip()], ["down", "down"])
+check("the counters are live, not seeded zeros",
+      out(W, "cat /sys/class/net/eth0/statistics/rx_bytes").strip() not in
+      ("", "0"), True,
+      "sync_net_dev addressed these by the class path; after the link went "
+      "in it found no nodes and every counter stayed at 0")
+
+# ------------------------------------------------------- lspci -D and -s
+# -D was accepted and ignored, so `lspci -D` was byte-identical to `lspci`
+# -- and the domain-qualified form is the one that matches the directory
+# names under /sys/bus/pci/devices, so the two readers of one bus could
+# not produce each other's spelling.
+_plain_l = out(S, "lspci | head -1").split()[0]
+_dom_l = out(S, "lspci -D | head -1").split()[0]
+check("lspci -D prefixes the domain", _dom_l, "0000:" + _plain_l)
+check("...and combines with -nn",
+      out(S, "lspci -nnD | head -1").split()[0], "0000:" + _plain_l)
+check("-D changes every line, not just the first",
+      out(S, "diff <(lspci) <(lspci -D) >/dev/null; echo $?").strip(), "1")
+check("the device count is unchanged by -D",
+      out(S, "lspci -D | grep -c .").strip(),
+      out(S, "lspci | grep -c .").strip())
+check("-s takes a slot with the domain, as real lspci does",
+      out(S, "lspci -s 0000:%s" % _plain_l).strip(),
+      out(S, "lspci -s %s" % _plain_l).strip(),
+      "the spelling copied out of /sys/bus/pci/devices selected nothing")
+check("sysfs uses the domain-qualified name -D produces",
+      out(S, "ls /sys/bus/pci/devices/ | head -1").strip(), _dom_l)
+
+# ------------------------------------------- a link that points nowhere
+# The single check that would have caught every bug in this block. sysfs
+# links are made by the kernel when a driver binds; one that resolves to
+# nothing is not a state a running kernel is in. There were 37 of them,
+# all the same shape -- a relative target counted one level too far, so it
+# climbed past /sys and landed outside the tree:
+#
+#   /sys/devices/pci0000:00/<bdf>/driver   ../../../../bus/... (needs 3)
+#   /sys/block/<dev>/bdi                   ../..x9/virtual/... (needs 8)
+#   /sys/bus/virtio/drivers/<d>/virtio0    ../..x5/devices/... (needs 4)
+#
+# Each read correctly with readlink and resolved to nothing with
+# readlink -f, which is exactly the pair of answers no real box gives. The
+# bdi one is the instructive case: its text is byte-identical to the
+# guest's, because the guest's disk hangs off a PCI bridge this persona
+# does not have, so the real path carries one more component and the wrong
+# formula produces the right string there.
+D = shell()
+_dangling = out(D, 'for l in $(find /sys -type l 2>/dev/null); do '
+                   '[ -e "$l" ] || echo "$l"; done')
+check("no symlink under /sys dangles", sorted(_dangling.split()), [],
+      "readlink answering while readlink -f does not is a link into "
+      "nowhere")
+check("...and there are enough of them for that to mean something",
+      int(out(D, "find /sys -type l 2>/dev/null | wc -l").strip()) > 200,
+      True)
+
+# /sys/class/block holds partitions as well as whole disks, and was empty.
+# /sys/block holds whole devices only -- the two are different questions
+# and `ls /sys/class/block` is how you enumerate drives without lsblk.
+_parts = [l.split()[-1] for l in
+          out(D, "cat /proc/partitions").splitlines()[2:] if l.split()]
+check("/sys/class/block lists every device /proc/partitions does",
+      sorted(out(D, "ls /sys/class/block").split()), sorted(_parts))
+# A partition's name extends its disk's -- sda1 under sda, nvme0n1p1
+# under nvme0n1 -- which beats guessing from trailing digits, since
+# nvme0n1 is a whole disk whose name ends in one.
+_whole = sorted(q for q in _parts
+                if not any(q != r and q.startswith(r) for r in _parts))
+check("/sys/block lists whole disks only",
+      sorted(out(D, "ls /sys/block").split()), _whole,
+      "partitions belong in /sys/class/block, not /sys/block")
+for _b in ("sda", "sda1", "nvme0n1p1"):
+    check("/sys/class/block/%s resolves into the devices tree" % _b,
+          out(D, "readlink -f /sys/class/block/%s" % _b).strip().startswith(
+              "/sys/devices/"), True)
+
+# The bdi each block device points at, which did not exist.
+_disks = [p for p in _parts if p in ("sda", "nvme0n1", "sr0")]
+for _d in _disks:
+    check("%s's bdi link resolves" % _d,
+          out(D, "readlink -f /sys/block/%s/bdi" % _d).strip(),
+          "/sys/devices/virtual/bdi/%s"
+          % out(D, "cat /sys/block/%s/dev" % _d).strip())
+check("/sys/class/bdi has one entry per whole disk",
+      len(out(D, "ls /sys/class/bdi").split()), len(_disks))
+check("a bdi carries the attributes a real one does",
+      sorted(out(D, "ls /sys/devices/virtual/bdi/8:0").split()),
+      ["max_bytes", "max_ratio", "max_ratio_fine", "min_bytes", "min_ratio",
+       "min_ratio_fine", "power", "read_ahead_kb", "stable_pages_required",
+       "strict_limit", "subsystem", "uevent"])
+check("read_ahead_kb is the kernel default",
+      out(D, "cat /sys/devices/virtual/bdi/8:0/read_ahead_kb").strip(), "128")
+# The disk and the optical drive do not report the same max_bytes on the
+# guest, so neither of ours is invented from the other.
+check("the rom's max_bytes differs from the disk's",
+      out(D, "cat /sys/devices/virtual/bdi/8:0/max_bytes").strip()
+      != out(D, "cat /sys/devices/virtual/bdi/11:0/max_bytes").strip(), True)
+
+# Every PCI device claims a driver; the link has to reach it, and the
+# driver has to list the device back.
+_pci = out(D, "ls /sys/bus/pci/devices").split()
+check("the pci bus has devices to check", len(_pci) > 10, True)
+_baddrv, _backref = [], []
+for _slot in _pci:
+    # A device with no driver bound has no link at all, which is normal --
+    # the host bridge and the PCI bridges are like that. readlink -f on a
+    # path that is not there echoes the path back, so the link has to be
+    # tested for rather than inferred from the output being non-empty.
+    if out(D, "test -L /sys/bus/pci/devices/%s/driver && echo y"
+           % _slot).strip() != "y":
+        continue
+    _t = out(D, "readlink -f /sys/bus/pci/devices/%s/driver" % _slot).strip()
+    if not _t.startswith("/sys/bus/pci/drivers/"):
+        _baddrv.append("%s -> %r" % (_slot, _t))
+        continue
+    if _slot not in out(D, "ls " + _t).split():
+        _backref.append("%s not listed under %s" % (_slot, _t))
+check("every bound PCI device's driver link resolves", _baddrv, [],
+      "all 37 of these pointed above /sys and resolved to nothing")
+check("...and the driver lists the device back", _backref, [],
+      "the bus view and the driver view are one relationship")
+
+# ------------------------------- the character devices this box claims
+# /sys/class/mem, /sys/class/tty and /sys/class/misc existed and listed
+# nothing, on a machine that names these devices in three other places:
+#
+#   /proc/consoles   ttyS0 ... 4:64   and   tty0 ... 4:1
+#   dmesg            00:00: ttyS0 at I/O 0x3f8 (irq = 4 ...) is a 16550A
+#   ps               /sbin/agetty ... tty1 linux
+#
+# against a /dev that held /dev/tty and nothing else of the kind. Three
+# assertions that a device exists and no device.
+C = shell()
+
+# The cross-check first, because it is the one that found this: anything
+# the box says it has a console on has to be there.
+_missing = []
+for _line in out(C, "cat /proc/consoles").splitlines():
+    _nm = _line.split()[0] if _line.split() else ""
+    if not _nm:
+        continue
+    if out(C, "test -c /dev/%s && echo y" % _nm).strip() != "y":
+        _missing.append("/dev/" + _nm)
+    if out(C, "test -e /sys/class/tty/%s && echo y" % _nm).strip() != "y":
+        _missing.append("/sys/class/tty/" + _nm)
+check("every console /proc/consoles names exists", _missing, [],
+      "a box cannot have a console on a device that is not there")
+# ...and the tty agetty is sitting on. The name has to come from an
+# argument: 'tty[0-9]*' matches the tty inside "agetty" itself, which on
+# HEAD picked up /dev/tty -- a device that does exist -- and passed while
+# /dev/tty1 was missing.
+_gt = ""
+for _tok in out(C, "ps -e -o args= | grep agetty").split():
+    if _tok.startswith("tty") and _tok[3:].isdigit():
+        _gt = _tok
+        break
+check("agetty is running on a virtual console", _gt.startswith("tty"), True,
+      "found %r in agetty's arguments" % _gt)
+check("...and that console exists as a device node",
+      out(C, "test -c /dev/%s && echo y" % (_gt or "nonexistent")).strip(),
+      "y", "agetty was on %r" % _gt)
+# /proc/consoles prints the device numbers; they have to be the same ones.
+for _line in out(C, "cat /proc/consoles").splitlines():
+    _f = _line.split()
+    if len(_f) < 2 or ":" not in _f[-1]:
+        continue
+    check("/proc/consoles and sysfs agree on %s's device number" % _f[0],
+          out(C, "cat /sys/class/tty/%s/dev" % _f[0]).strip()
+          if _f[0] != "tty0" else _f[-1], _f[-1],
+          "tty0's entry reports 4:0 while /proc/consoles shows the active "
+          "vc, so only the others are compared here")
+
+# The three classes, against what the guest lists.
+check("/sys/class/mem holds the seven memory devices",
+      sorted(out(C, "ls /sys/class/mem").split()),
+      ["full", "kmsg", "mem", "null", "random", "urandom", "zero"])
+check("/sys/class/misc holds the twelve the guest does",
+      sorted(out(C, "ls /sys/class/misc").split()),
+      ["autofs", "cpu_dma_latency", "device-mapper", "fuse", "hpet",
+       "hw_random", "snapshot", "udmabuf", "userfaultfd", "vga_arbiter",
+       "vmci", "vsock"])
+check("/sys/class/tty holds 71 entries", 
+      len(out(C, "ls /sys/class/tty").split()), 71,
+      "console, ptmx, tty, 64 virtual consoles and 4 8250 ports")
+check("...including all 64 virtual consoles",
+      sorted(int(x[3:]) for x in out(C, "ls /sys/class/tty").split()
+             if x.startswith("tty") and x[3:].isdigit()), list(range(64)))
+
+# Each class entry's dev file and its /dev node are the same device.
+_devmismatch = []
+for _cls, _names in (("mem", ["full", "kmsg", "mem", "null", "random",
+                              "urandom", "zero"]),
+                     ("tty", ["console", "ptmx", "tty", "tty0", "tty1",
+                              "ttyS0", "ttyS3"])):
+    for _nm in _names:
+        _sysdev = out(C, "cat /sys/class/%s/%s/dev" % (_cls, _nm)).strip()
+        _lsdev = out(C, "ls -l /dev/%s" % _nm).split()
+        _got = ("%s:%s" % (_lsdev[4].rstrip(","), _lsdev[5])
+                if len(_lsdev) > 5 else "?")
+        if _got != _sysdev:
+            _devmismatch.append("%s: sysfs %s, /dev %s" % (_nm, _sysdev, _got))
+check("sysfs and /dev agree on every device number", _devmismatch, [])
+
+# The two misc entries whose node is not named after the class entry.
+check("device-mapper's node is /dev/mapper/control",
+      out(C, "test -c /dev/mapper/control && echo y").strip(), "y")
+check("hw_random's node is /dev/hwrng",
+      out(C, "test -c /dev/hwrng && echo y").strip(), "y")
+
+# active belongs to console and tty0 and to nothing else in the class.
+_withactive = sorted(
+    n for n in out(C, "ls /sys/class/tty").split()
+    if out(C, "test -e /sys/class/tty/%s/active && echo y" % n).strip() == "y")
+check("only console and tty0 carry an active file", _withactive,
+      ["console", "tty0"])
+check("console's active names the consoles in use",
+      out(C, "cat /sys/class/tty/console/active").strip(), "tty0 ttyS0")
+
+# Of the four 8250 ports only the one the firmware declares has a UART
+# behind it -- which is what "4 ports" in dmesg means beside one console.
+check("ttyS0 is the port dmesg describes",
+      [out(C, "cat /sys/class/tty/ttyS0/port").strip(),
+       out(C, "cat /sys/class/tty/ttyS0/irq").strip(),
+       out(C, "cat /sys/class/tty/ttyS0/type").strip()],
+      ["0x3F8", "4", "4"],
+      "dmesg says ttyS0 at I/O 0x3f8 irq 4, a 16550A, and type 4 is that")
+check("...and it is the only one with a detected UART",
+      sorted(n for n in ("ttyS0", "ttyS1", "ttyS2", "ttyS3")
+             if out(C, "test -e /sys/class/tty/%s/rx_trig_bytes && echo y"
+                    % n).strip() == "y"), ["ttyS0"],
+      "rx_trig_bytes appears only where a real UART was found")
+def _bus_of(name):
+    """The bus directory a tty's device link goes through, or "" if the
+    link is not there -- indexing a missing link crashed the suite and
+    took every check after it with it."""
+    parts = out(C, "readlink /sys/class/tty/%s" % name).strip().split("/")
+    return parts[3] if len(parts) > 3 else ""
+
+
+check("ttyS0 hangs off pnp0, the others off the platform driver",
+      [_bus_of("ttyS0"), _bus_of("ttyS1")], ["pnp0", "platform"])
+
+# -- every device directory carries power/, subsystem and uevent ----------
+# The builders had drifted apart: of the 186 device directories reachable
+# through /sys/class, 73 had no subsystem link, 69 no power/ and 2 no
+# uevent. thermal alone was 64 of each. On a real box all three are on
+# every one of them, so `ls` was short by up to three entries and
+# `readlink .../subsystem` -- how you ask a device what class it is in
+# without trusting the path you reached it by -- answered nothing.
+_sh = shell()
+_devdirs = [x for x in out(_sh, "ls -d /sys/class/*/* 2>/dev/null").split()
+            if x.startswith("/sys/")]
+check("there are device directories to check", len(_devdirs) > 150, True,
+      "if the glob stops matching this whole block silently checks nothing")
+
+_missing = {"power": [], "subsystem": [], "uevent": []}
+for _d in _devdirs:
+    # /sys/class/drm/version is a plain attribute file, not a device.
+    if "No such" not in out(_sh, "ls -d %s/ 2>&1" % _d) and \
+            out(_sh, "readlink %s" % _d).strip() == "":
+        continue
+    for _e in _missing:
+        if "No such" in out(_sh, "ls -d %s/%s 2>&1" % (_d, _e)):
+            _missing[_e].append(_d)
+for _e, _bad in _missing.items():
+    check("every device dir has %s" % _e, _bad[:4], [],
+          "%d of %d lack it" % (len(_bad), len(_devdirs)))
+
+# The link is relative and its depth counts the device path, not the
+# /sys/class path it was reached by. Both of these are four below /sys.
+check("net/lo names its class",
+      out(_sh, "readlink /sys/class/net/lo/subsystem").strip(),
+      "../../../../class/net")
+check("a cooling device names its class",
+      out(_sh, "readlink /sys/class/thermal/cooling_device0/subsystem").strip(),
+      "../../../../class/thermal")
+check("dmi names its class",
+      out(_sh, "readlink /sys/class/dmi/id/subsystem").strip(),
+      "../../../../class/dmi")
+# ...and it resolves to a directory that exists, rather than dangling --
+# 37 links pointing above /sys and resolving to nothing is a bug this
+# tree has had before.
+for _p in ("/sys/class/net/lo", "/sys/class/thermal/cooling_device0",
+           "/sys/class/dmi/id"):
+    check("%s/subsystem resolves" % _p,
+          out(_sh, "test -d %s/subsystem && echo yes" % _p).strip(), "yes")
+
+check("power/ holds the five attributes a real one does",
+      sorted(out(_sh, "ls /sys/class/thermal/cooling_device0/power/").split()),
+      ["autosuspend_delay_ms", "control", "runtime_active_time",
+       "runtime_status", "runtime_suspended_time"])
+check("runtime_status is unsupported",
+      out(_sh, "cat /sys/class/thermal/cooling_device0/power/runtime_status"
+               " 2>&1").strip(), "unsupported")
+check("control is auto",
+      out(_sh, "cat /sys/class/net/lo/power/control 2>&1").strip(), "auto")
+
+# -- the perf PMU roots, and the bus that lists them ----------------------
+# `ls /sys/devices` answered with five entries against the guest's twelve
+# and `ls /sys/bus` with two against twenty-five. The seven added here are
+# on any x86_64 Linux regardless of hardware -- they are software event
+# sources, not devices -- so their absence described no machine.
+_P = shell()
+_devroots = out(_P, "ls /sys/devices").split()
+for _r in ("breakpoint", "isa", "kprobe", "msr", "software", "tracepoint",
+           "uprobe"):
+    check("/sys/devices has %s" % _r, _r in _devroots, True, str(_devroots))
+
+# The bus and the tree list the same six, which is the point of adding
+# only a closed set: they cannot drift apart.
+check("event_source lists exactly the six PMUs",
+      sorted(out(_P, "ls /sys/bus/event_source/devices").split()),
+      ["breakpoint", "kprobe", "msr", "software", "tracepoint", "uprobe"])
+for _pmu in ("breakpoint", "kprobe", "msr", "software", "tracepoint",
+             "uprobe"):
+    check("%s links back to its device" % _pmu,
+          out(_P, "readlink /sys/bus/event_source/devices/%s" % _pmu).strip(),
+          "../../../devices/" + _pmu)
+    check("%s names its bus" % _pmu,
+          out(_P, "readlink /sys/devices/%s/subsystem" % _pmu).strip(),
+          "../../bus/event_source")
+    check("...and that resolves" % (),
+          out(_P, "test -d /sys/devices/%s/subsystem && echo yes" % _pmu
+              ).strip(), "yes")
+check("the PMU types are the kernel's own numbers",
+      [out(_P, "cat /sys/devices/%s/type" % p).strip()
+       for p in ("software", "tracepoint", "breakpoint", "kprobe", "uprobe",
+                 "msr")],
+      ["1", "2", "5", "8", "9", "10"])
+check("msr carries its one event", out(_P, "cat /sys/devices/msr/events/tsc"
+                                       ).strip(), "event=0x00")
+check("uprobe carries both format fields",
+      sorted(out(_P, "ls /sys/devices/uprobe/format").split()),
+      ["ref_ctr_offset", "retprobe"])
+# isa is the odd one out: power/ and uevent, and no subsystem at all.
+check("isa has no subsystem link",
+      out(_P, "readlink /sys/devices/isa/subsystem").strip(), "")
+check("...but it does have power/ and uevent",
+      sorted(out(_P, "ls /sys/devices/isa").split()), ["power", "uevent"])
+check("the bus dir has its own furniture",
+      sorted(out(_P, "ls /sys/bus/event_source").split()),
+      ["devices", "drivers", "drivers_autoprobe", "drivers_probe", "uevent"])
+
+# -- cooling devices have stats/ ------------------------------------------
+check("a cooling device has stats/",
+      sorted(out(_P, "ls /sys/class/thermal/cooling_device0/stats").split()),
+      ["reset", "time_in_state_ms", "total_trans", "trans_table"])
+check("trans_table is byte-exact, trailing spaces and all",
+      out(_P, "cat /sys/class/thermal/cooling_device0/stats/trans_table"),
+      " From  :    To\n       : state 0  \nstate 0:       0 \n")
+check("total_trans is zero",
+      out(_P, "cat /sys/class/thermal/cooling_device0/stats/total_trans"
+          ).strip(), "0")
+# The counter is milliseconds since boot. Frozen, it would contradict
+# /proc/uptime the moment anyone divided one by the other.
+_ms = out(_P, "cat /sys/class/thermal/cooling_device0/stats/time_in_state_ms")
+_up = out(_P, "cat /proc/uptime").split()[0]
+check("time_in_state_ms names state0", _ms.startswith("state0\t"), True, _ms)
+try:
+    _drift = abs(int(_ms.split("\t")[1].strip()) / 1000.0 - float(_up))
+except (IndexError, ValueError):
+    _drift = 1e9
+check("...and it tracks /proc/uptime", _drift < 5.0, True,
+      "%s vs %s" % (_ms.strip(), _up))
+check("reset is write-only",
+      out(_P, "stat -c %a /sys/class/thermal/cooling_device0/stats/reset"
+          ).strip(), "200")
+
+# -- the NUMA node, which lscpu was already describing -------------------
+# lscpu printed "NUMA node(s): 1" and "NUMA node0 CPU(s): 0-63" and reads
+# exactly /sys/devices/system/node to produce those lines -- and that
+# directory did not exist. The box asserted a topology its own sysfs could
+# not confirm.
+_N = shell()
+_nd = "/sys/devices/system/node"
+check("the node tree exists",
+      sorted(out(_N, "ls %s" % _nd).split()),
+      ["has_cpu", "has_generic_initiator", "has_memory",
+       "has_normal_memory", "node0", "online", "possible", "power",
+       "uevent"])
+# These are node lists, not booleans: "0" means node zero is in the set.
+for _f in ("has_cpu", "has_memory", "has_normal_memory", "online",
+           "possible"):
+    check("%s is the node list" % _f,
+          out(_N, "cat %s/%s" % (_nd, _f)).strip(), "0")
+check("has_generic_initiator is empty",
+      out(_N, "cat %s/has_generic_initiator" % _nd).strip(), "")
+
+# The reader that was already talking about this must agree with it.
+_lsnuma = [l for l in out(_N, "lscpu").split("\n") if "NUMA node0" in l]
+check("lscpu names node0's CPUs", bool(_lsnuma), True)
+if _lsnuma:
+    check("...and node0/cpulist says the same",
+          _lsnuma[0].split(":", 1)[1].strip(),
+          out(_N, "cat %s/node0/cpulist" % _nd).strip())
+check("there is a cpu link per CPU",
+      len([x for x in out(_N, "ls %s/node0" % _nd).split()
+           if x.startswith("cpu") and x[3:].isdigit()]),
+      len([x for x in out(_N, "ls /sys/devices/system/cpu").split()
+           if x.startswith("cpu") and x[3:].isdigit()]))
+check("cpu0 points into the cpu tree",
+      out(_N, "readlink %s/node0/cpu0" % _nd).strip(), "../../cpu/cpu0")
+check("cpumap is the 32-bit-grouped mask",
+      out(_N, "cat %s/node0/cpumap" % _nd).strip(), "ffffffff,ffffffff")
+check("the only distance is the node to itself",
+      out(_N, "cat %s/node0/distance" % _nd).strip(), "10")
+check("node0 names its bus",
+      out(_N, "readlink %s/node0/subsystem" % _nd).strip(),
+      "../../../../bus/node")
+check("...and it resolves",
+      out(_N, "test -d %s/node0/subsystem && echo yes" % _nd).strip(), "yes")
+check("the bus lists the node",
+      out(_N, "readlink /sys/bus/node/devices/node0").strip(),
+      "../../../devices/system/node/node0")
+
+# meminfo: 35 of its 37 fields are the same number /proc/meminfo reports,
+# and the other two are the node's own arithmetic. Generated from the same
+# rows, so this cannot drift.
+def _kv(text, strip=""):
+    d = {}
+    for _l in text.split("\n"):
+        if strip:
+            _l = _l.replace(strip, "", 1)
+        _m = re.match(r"([^:]+):\s+(\d+)", _l)
+        if _m:
+            d[_m.group(1).strip()] = int(_m.group(2))
+    return d
+
+
+_nmi = _kv(out(_N, "cat %s/node0/meminfo" % _nd), "Node 0 ")
+_pmi = _kv(out(_N, "cat /proc/meminfo"))
+check("node meminfo has all 37 fields", len(_nmi), 37)
+check("every shared field matches /proc/meminfo",
+      [k for k, v in _nmi.items() if k in _pmi and _pmi[k] != v], [])
+check("MemUsed is MemTotal minus MemFree",
+      _nmi.get("MemUsed"), _nmi.get("MemTotal", 0) - _nmi.get("MemFree", 0))
+check("FilePages is Cached plus Buffers",
+      _nmi.get("FilePages"), _pmi.get("Cached", 0) + _pmi.get("Buffers", 0))
+check("the HugePages lines carry no kB",
+      "HugePages_Surp:" in out(_N, "cat %s/node0/meminfo" % _nd)
+      and not any(l.endswith("kB") for l in
+                  out(_N, "cat %s/node0/meminfo" % _nd).split("\n")
+                  if "HugePages_" in l), True)
+
+# vmstat is a filter over /proc/vmstat, never a second source. The
+# monotonic counters advance between two reads -- /proc/vmstat does that
+# against itself -- so the assertion is on the key set, not the values.
+_nvm = dict(l.split() for l in
+            out(_N, "cat %s/node0/vmstat" % _nd).strip().split("\n") if l.split())
+_pvm = dict(l.split() for l in
+            out(_N, "cat /proc/vmstat").strip().split("\n") if l.split())
+check("every node vmstat key is a /proc/vmstat key",
+      [k for k in _nvm if k not in _pvm], [])
+check("node vmstat is not empty", len(_nvm) > 10, True, str(len(_nvm)))
+
+# numastat reports the same six counters under other names. Within one
+# read they are computed together, so these invariants hold exactly.
+_ns = dict(l.split() for l in
+           out(_N, "cat %s/node0/numastat" % _nd).strip().split("\n") if l.split())
+check("numastat has its six counters", sorted(_ns),
+      ["interleave_hit", "local_node", "numa_foreign", "numa_hit",
+       "numa_miss", "other_node"])
+check("on one node every hit is local", _ns.get("numa_hit"),
+      _ns.get("local_node"))
+check("and nothing is foreign, missed or remote",
+      [_ns.get("numa_miss"), _ns.get("numa_foreign"), _ns.get("other_node")],
+      ["0", "0", "0"])
+check("compact is write-only",
+      out(_N, "stat -c %a " + _nd + "/node0/compact").strip(), "200")
 
 print("%d checks, %d failed" % (len(CHECKS), len(FAILS)))
 for f in FAILS:

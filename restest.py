@@ -53,10 +53,20 @@ def main():
                 "SwapTotal", "SwapFree"):
         check("/proc/meminfo has %s" % key, key in mi, str(sorted(mi)[:6]))
 
-    # one command, so all three are the same sample
+    # One command, so all of these are the same sample -- meminfo included.
+    # It was read in its own s.run() above while the comment already claimed
+    # otherwise, so `free` and `/proc/meminfo` were two samples compared to
+    # a 1 MiB tolerance against a meminfo that is generated live on every
+    # read. Green on an idle machine and red under the parallel pool: the
+    # gate caught it at 762461 vs 762555, 94 MiB of drift between the two
+    # reads. A suite that only passes when the box is quiet is not pinning
+    # anything.
     out = s.run("free -m; echo __S__; top -bn1 | head -5; echo __S__; "
-                "cat /proc/loadavg; echo __S__; uptime")
-    fm, tp, la_raw, up = out.split("__S__")
+                "cat /proc/loadavg; echo __S__; uptime; echo __S__; "
+                "cat /proc/meminfo")
+    fm, tp, la_raw, up, mi_raw = out.split("__S__")
+    mi = {k: int(v) for k, v in
+          re.findall(r"^(\w+):\s+(\d+) kB", mi_raw, re.M)} or mi
     fline = [l for l in fm.splitlines() if l.startswith("Mem:")][0].split()
     sline = [l for l in fm.splitlines() if l.startswith("Swap:")][0].split()
     check("free's total matches MemTotal",
@@ -279,6 +289,44 @@ def main():
     ceil = int(s.run("wc -c < /tmp/cap2").strip() or 0)
     check("...and still ceilinged at 64MiB",
           ceil == 64 * 1024 * 1024, "%d bytes" % ceil)
+
+    # ---- how many tasks does this box have? three readers, one answer.
+    #
+    # /proc/loadavg's `running/total` counts THREADS, not processes. Verified
+    # on a real kernel, where the two are nowhere near each other and the
+    # thread reading is exact: loadavg 2/2551, 719 processes, 2551 threads.
+    #
+    # Ours answered 488 -- the process count -- while /proc/*/status summed
+    # to 557, because the function behind it was written when every process
+    # here really was single-threaded and was never revisited once
+    # MULTITHREADED_COMMS gave mariadbd 32 threads.
+    status = s.run("cat /proc/[0-9]*/status 2>/dev/null")
+    thread_sum = sum(int(x) for x in re.findall(r"^Threads:\s+(\d+)",
+                                                status, re.M))
+    proc_n = len([x for x in s.run("ls /proc").split() if x.isdigit()])
+    la_total = int(re.search(r"\d+/(\d+)", s.run("cat /proc/loadavg")).group(1))
+    check("loadavg's total is the thread count",
+          la_total == thread_sum,
+          "loadavg %d vs Threads: sum %d" % (la_total, thread_sum))
+    check("...which is not the process count",
+          la_total != proc_n, "threads %d vs processes %d" % (thread_sum, proc_n))
+    check("some process really is multi-threaded",
+          thread_sum > proc_n, "%d threads over %d processes" % (thread_sum, proc_n))
+
+    # /proc/<pid>/task has one entry per thread, so it is a third reader of
+    # the same fact and must agree with that process's own Threads: line.
+    multi = re.search(r"Name:\s+(\S+)\nUmask.*?\nState.*?\nTgid:\s+(\d+)",
+                      status, re.S)
+    for pid in [x for x in s.run("ls /proc").split() if x.isdigit()][:400]:
+        st = s.run("cat /proc/%s/status 2>/dev/null" % pid)
+        m = re.search(r"^Threads:\s+(\d+)", st, re.M)
+        if not m or m.group(1) == "1":
+            continue
+        n = int(m.group(1))
+        got = len(s.run("ls /proc/%s/task" % pid).split())
+        check("/proc/%s/task has Threads: entries" % pid, got == n,
+              "%d task dirs vs Threads: %d" % (got, n))
+        break
 
     print()
     print("=" * 62)

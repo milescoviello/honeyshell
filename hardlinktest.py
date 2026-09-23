@@ -230,9 +230,23 @@ def t_plus_one_is_not_the_unlinked_file():
 
 def t_links_and_size_read_the_sign_the_same_way():
     s = shell()
-    small = names(s, "find . -type f -size -1k")
-    check("-size -1k matches the small files", len(small) >= 4, str(small))
+    # Every file here is two bytes, which is one 1K unit rounded up. find
+    # rounds the file up before it compares, for -N as much as for +N, so
+    # -1k means "less than one unit" and matches nothing at all here. This
+    # expected four or more, which is what a raw byte comparison gives and
+    # not what find gives. Measured on the guest with an empty file beside
+    # a 2-byte, a 4-byte and a 900-byte one: `-size -1k` printed
+    # ./empty.txt and nothing else, while `-size 1k` printed the other
+    # three.
+    eq("-size -1k matches nothing when nothing is empty",
+       names(s, "find . -type f -size -1k"), [])
+    got = names(s, "find . -type f -size 1k")
+    check("-size 1k matches all six", len(got) == 6, str(got))
     eq("-size +1k matches none", names(s, "find . -type f -size +1k"), [])
+    s.run("cd /tmp/hl && : > empty.txt")
+    s._err.clear()
+    eq("an empty file is the one thing -1k does match",
+       names(s, "find . -type f -size -1k"), ["./empty.txt"])
 
 
 # -- a missing reference is an error, not an empty result -----------------

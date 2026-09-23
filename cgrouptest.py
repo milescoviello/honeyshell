@@ -198,6 +198,56 @@ def main():
 
     for label, got, want in FAILS:
         print("FAIL %s\n  got  %r\n  want %r" % (label, got, want))
+    # -- the task count, which four things quote and one file holds ---------
+    # pids.current counted processes, so a mariadbd with 32 threads read 1.
+    # The kernel's pids controller charges every task: on a real box
+    # pids.current tracks Threads: exactly for a single-process unit
+    # (accounts-daemon 4, comfyui 114) and exceeds it when the cgroup holds
+    # several (containerd 31 threads, 109 tasks).
+    #
+    # And systemctl status quoted none of it. Tasks, Memory and CPU were
+    # constants there -- 3, 12.4M and 1min 19.204s -- so status gave
+    # mariadb, nginx, ssh and cron identical numbers while show read the
+    # cgroup and gave four different ones. That is the same tell the
+    # TasksCurrent comment in fakeshell says was fixed once: it was fixed
+    # for show and not for status.
+    mp = s.run("systemctl show mariadb -p MainPID --value").strip()
+    threads = s.run("grep ^Threads: /proc/%s/status" % mp).split()[-1]
+    check("mariadbd is multi-threaded to begin with", int(threads) > 1, True)
+    pc = s.run("cat /sys/fs/cgroup/system.slice/mariadb.service/"
+               "pids.current").strip()
+    check("pids.current counts tasks, not processes", pc, threads)
+    check("...and TasksCurrent quotes that file",
+          s.run("systemctl show mariadb -p TasksCurrent --value").strip(), pc)
+    st = [l.strip() for l in s.run("systemctl status mariadb").splitlines()
+          if l.strip().startswith("Tasks:")]
+    check("...and so does systemctl status", bool(st) and
+          st[0].split()[1] == pc, True)
+    cg = [l for l in s.run("systemd-cgtop -n 1 -b").splitlines()
+          if "mariadb.service" in l]
+    check("...and cgtop's Tasks column", bool(cg) and cg[0].split()[1] == pc,
+          True)
+
+    # status must quote the cgroup for memory and cpu too, which means the
+    # four services cannot all show one number.
+    mems, cpus, tasks = set(), set(), set()
+    for unit in ("mariadb", "nginx", "ssh", "cron"):
+        body = s.run("systemctl status %s" % unit)
+        for line in body.splitlines():
+            t = line.strip()
+            if t.startswith("Memory:"):
+                mems.add(t)
+            elif t.startswith("CPU:"):
+                cpus.add(t)
+            elif t.startswith("Tasks:"):
+                tasks.add(t)
+        cur = s.run("systemctl show %s -p MemoryCurrent --value" % unit).strip()
+        check("%s: status Memory is not a constant" % unit,
+              ("Memory:" in body) and cur.isdigit() and int(cur) > 0, True)
+    check("the four services do not share one Memory line", len(mems), 4)
+    check("...nor one CPU line", len(cpus), 4)
+    check("...nor one Tasks line", len(tasks), 4)
+
     return len(FAILS)
 
 

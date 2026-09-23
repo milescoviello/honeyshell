@@ -162,7 +162,7 @@ def t_commands_that_do_exist_still_run():
     for cmd, want in (("sudo id", "uid=0(root)"),
                       ("sudo /bin/id", "uid=0(root)"),
                       ("sudo whoami", "root"),
-                      ("sudo nproc", "4"),
+                      ("sudo nproc", str(fs.NCPU)),
                       ('sudo sh -c "echo hi"', "hi")):
         out, rc = run(s, cmd)
         eq("%s rc" % cmd, rc, 0)
@@ -195,7 +195,10 @@ def t_the_live_actors_own_line():
         s, "echo '123456' | sudo -S sh -c 'nproc 2>/dev/null || "
            "grep -c ^processor /proc/cpuinfo'")
     eq("rc", rc, 0)
-    eq("answers the cpu count", out.strip(), "4")
+    # The number is the persona's, not a constant: this is the exact
+    # command three separate actors have run through sudo on this box, and
+    # what it should answer is whatever nproc answers.
+    eq("answers the cpu count", out.strip(), str(fs.NCPU))
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]

@@ -314,6 +314,17 @@ def t_no_alternative_succeeds_silently():
             # stdin really is an empty program: no output, status 0. That is
             # a silent success a real box also gives, not a missing handler.
             continue
+        if name in ("pager", "less"):
+            # Same shape, and also real. A pager with no file pages its
+            # stdin, and an empty stdin is nothing to page. Measured in a
+            # debian:trixie container with the real package:
+            #     less </dev/null        rc 0, no output
+            #     echo piped | less      rc 0, "piped"
+            # This check used to pass because less had no implementation
+            # and the stock-binary answer printed a version banner at
+            # anything -- so what it was really asserting was that less
+            # was unimplemented.
+            continue
         o, rc = run(sh(), name)
         check("%s says something or fails" % name,
               not (rc == 0 and not o.strip()), "rc=%s out=%r" % (rc, o[:40]))

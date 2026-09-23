@@ -153,14 +153,22 @@ def t_w_header_matches_procps():
     check("w -h drops the header", "USER" not in o, o[:60])
 
 
-def t_lastlog_is_gone_and_its_file_is_empty():
+def t_lastlog_is_gone_but_its_file_is_not():
     s = sh()
     o, rc = run(s, "lastlog")
     eq("lastlog is not a command", rc, 127)
     o, rc = run(s, "command -v lastlog")
     eq("and command -v agrees", rc, 1)
+    # This asserted the file was 0 bytes, which said nobody had ever
+    # logged in while `last` on the same box printed deploy's sessions.
+    # lastlog is indexed by uid -- record N at offset N*292 -- so it is
+    # (highest logged-in uid + 1) * 292 long. The exact size and the
+    # derivation from the wtmp seed belong to logtest.py; what matters
+    # here is only that removing the *command* did not empty the file.
     o, rc = run(s, "wc -c < /var/log/lastlog")
-    eq("the legacy file is still there and empty", o.strip(), "0")
+    n = o.strip()
+    check("the legacy file is still there, and not empty",
+          n.isdigit() and int(n) > 0 and int(n) % 292 == 0, n)
     o, rc = run(s, "dpkg -S /usr/bin/lastlog")
     eq("no package claims it", rc, 1)
 

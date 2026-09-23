@@ -106,6 +106,109 @@ INVOKE = [
     "chmod -x s.sh; sh s.sh; echo rc=$?",
     "chmod +x n.sh; ./n.sh; echo rc=$?",
     "set -e; ./s.sh; echo after",
+    # --- python3 -c, which used to do nothing at all -------------------
+    #
+    # `python3 -c "print(6*7)"` printed nothing here; a file write created
+    # nothing; only --version answered. On a box whose story is an ML
+    # training node that is instantly wrong, and it is also a capture
+    # loss, because `python3 -c` is a standard stager idiom -- every
+    # one-liner an attacker ran was evidence we did not take.
+    #
+    # These run through the same differential harness as the shell cases,
+    # so the left-hand side is a real python3 and any drift shows up as a
+    # diff rather than as a guess about what python does.
+    """python3 -c 'print(6*7)'; echo rc=$?""",
+    """python3 -c 'print("hello".upper())'""",
+    """python3 -c 'print(len("abcdef"))'""",
+    """python3 -c 'print([x*2 for x in range(4)])'""",
+    """python3 -c 'print(",".join(str(i) for i in range(4)))'""",
+    """python3 -c 'print("%s-%d" % ("a", 7))'""",
+    """python3 -c 'print(f"{2+2} ok")'""",
+    """python3 -c 'print("abc"[::-1])'""",
+    """python3 -c 'import base64; print(base64.b64encode(b"hi"))'""",
+    """python3 -c 'import hashlib; print(hashlib.md5(b"x").hexdigest())'""",
+    """python3 -c 'import sys; print(sys.platform)'""",
+    """python3 -c 'for i in range(3): print(i)'""",
+    # the failure modes matter as much as the successes: an unsupported
+    # construct has to look like a mistake in their code, not a gap here
+    """python3 -c 'print(undefined_name)' 2>&1; echo rc=$?""",
+    """python3 -c 'import nosuchmodule' 2>&1; echo rc=$?""",
+    """python3 -c 'import sys; sys.exit(3)'; echo rc=$?""",
+    """python3 -c 'print(1/0)' 2>&1 | tail -1""",
+    # ...and the stager shape itself: write a script, then run it
+    # the stager shape itself: write a script through python,
+    # then run it. chr(10) rather than an escape so the case
+    # survives this file's own quoting -- written with a
+    # backslash-n it became an unterminated string literal and
+    # tested the SyntaxError path twice instead.
+    'python3 -c \'open("p.sh","w").write("echo staged"+chr(10))\' && sh p.sh',
+    # --- sys.stdin, which was simply absent -----------------------------
+    #
+    # `python3 -c "import sys; print(sys.stdin.read())"` raised
+    #   AttributeError: module 'sys' has no attribute 'stdin'
+    # on a box whose python otherwise works, and piping into python is the
+    # ordinary way to hand it data -- `json.load(sys.stdin)` fails the same
+    # way. The shell already passed the piped text through to the
+    # interpreter; nothing exposed it.
+    #
+    # These constructs behave identically on 3.12 and 3.13, so the local
+    # python3 is a valid reference for them. Anything version-dependent
+    # (sys.version, sys.version_info) must not be added here: the dev host
+    # is not the persona's python.
+    """printf 'a\nb\n' | python3 -c 'import sys; print(repr(sys.stdin.read()))'""",
+    """printf 'a\nb\n' | python3 -c 'import sys; print(sys.stdin.readlines())'""",
+    """printf 'a\nb\n' | python3 -c 'import sys; """
+    """print(repr(sys.stdin.readline()))'""",
+    """printf 'a\nb\n' | python3 -c 'import sys
+for l in sys.stdin: print(repr(l))'""",
+    # No trailing newline, and nothing at all: both are real shapes for a
+    # pipe and neither may invent or drop a byte.
+    """printf 'a' | python3 -c 'import sys; print(repr(sys.stdin.read()))'""",
+    """printf '' | python3 -c 'import sys; print(repr(sys.stdin.read()))'""",
+    """printf 'x' | python3 -c 'import sys; print(sys.stdin.isatty())'""",
+    """printf 'x' | python3 -c 'import sys; print(sys.stdin.fileno())'""",
+    """echo '{"a":1}' | python3 -c 'import sys,json; """
+    """print(json.load(sys.stdin))'""",
+    # input() shares that one position. It used to return
+    # stdin.split(chr(10))[0] every time, so two calls read the same line
+    # twice and a two-prompt script saw one answer; and at EOF it returned
+    # "" where the real one raises.
+    """printf 'one\ntwo\n' | python3 -c 'print(input()); print(input())'""",
+    """printf '' | python3 -c 'print(input())' 2>&1; echo rc=$?""",
+    # --- -c takes one argument, and the rest is argv --------------------
+    #
+    # `src = " ".join(a[1:])` folded every later argument into the program,
+    # so `python3 -c "import sys; print(sys.argv)" a b` compiled
+    # "print(sys.argv) a b" and died with SyntaxError -- while argv itself
+    # was already being built correctly two lines below. Passing arguments
+    # to a -c program is ordinary usage.
+    """python3 -c 'import sys; print(sys.argv)' a b""",
+    """python3 -c 'import sys; print(sys.argv)'""",
+    """python3 -c 'import sys; print(sys.argv[0], len(sys.argv))' x y z""",
+    """python3 -c 'import sys; print(sys.argv[2])' p q r""",
+    # --- and the program itself can arrive on stdin ---------------------
+    #
+    # With no script and no -c, python reads the program from stdin.
+    # `curl ... | python3` and `base64 -d | python3` are stager idioms as
+    # common as -c, and this did nothing at all: `echo 'print(99)' | python3`
+    # printed nothing and returned 0, so the second stage was lost as
+    # evidence whether or not it would have run. It is logged as
+    # python_exec now, like every other route in.
+    """echo 'print(99)' | python3""",
+    """echo 'import sys; sys.exit(4)' | python3; echo rc=$?""",
+    """echo 'print(7)' | python3 -""",
+    """printf 'x=5\nprint(x*2)\n' | python3""",
+    """echo cHJpbnQoOTkp | base64 -d | python3""",
+    """python3 <<< 'print(11)'""",
+    """printf '' | python3; echo rc=$?""",
+    # The program is the stdin, so the program's own sys.stdin is already
+    # at EOF -- and argv is [''] for the bare form, ['-', ...] with the
+    # dash spelled out.
+    """echo 'import sys; print(repr(sys.stdin.read()))' | python3""",
+    """echo 'import sys; print(sys.argv)' | python3""",
+    """echo 'import sys; print(sys.argv)' | python3 - a b""",
+    # A broken program has to blame <stdin>, not <string> or a filename.
+    """echo 'print(' | python3 2>&1; echo rc=$?""",
 ]
 
 MODES = [

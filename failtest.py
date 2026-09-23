@@ -153,17 +153,22 @@ def main():
         out = s.run("cd /tmp/ep && %s echo ran" % wrapper)
         check("%s still runs a real command" % wrapper.split()[0],
               "ran" in out, True)
-    # nohup is the exception: it runs the command and sends the output to
-    # nohup.out, so stdout is empty by design. The first draft of this
-    # check expected "ran" on stdout, which is the one wrapper where that
-    # is wrong -- the box was right.
+    # nohup was once the exception here, on the belief that it always sends
+    # output to nohup.out. It only does that when stdout is a terminal, and
+    # this shell is an exec channel (exec_mode above), which has none -- so
+    # nohup takes over nothing and behaves like every other wrapper.
+    # Measured on the guest over a channel with no tty:
+    #     nohup echo hello   ->  hello, no notice, no nohup.out
     s._err = []
     out = s.run("cd /tmp/ep && nohup echo ran")
-    check("nohup runs it and redirects the output", out.strip(), "")
-    check("...into nohup.out",
-          s.run("cd /tmp/ep && cat nohup.out").strip(), "ran")
-    check("...saying so on stderr",
-          "appending output to" in "".join(s._err), True)
+    # With no terminal the output comes back to the caller.
+    check("nohup still runs a real command", out.strip(), "ran")
+    # nohup.out here would be nohup claiming a stream that is not a
+    # terminal. Other fixtures live in this directory, so name the file.
+    check("...and creates no nohup.out",
+          "nohup.out" in s.run("cd /tmp/ep && ls").split(), False)
+    # The notice exists only to explain a takeover that did not happen.
+    check("...and says nothing on stderr", "".join(s._err).strip(), "")
 
     # -- sh is dash ------------------------------------------------------------
     check("sh -c on a missing path", fail(s, "sh -c ./nosuchfile"),
@@ -244,6 +249,54 @@ def main():
            s3.run("command -v nosuchcmd; echo $?").strip(),
            s3.run("type nosuchcmd >/dev/null 2>&1; echo $?").strip()),
           ("1", "1", "1"))
+
+    # -- find refuses an owner that names nobody ---------------------------
+    # -uid and -gid take a number and nothing else; -user and -group take a
+    # name or a raw number. A name that resolves to no one is a usage
+    # error, not an empty result -- and find decides that before it walks
+    # anything, so it errors even on a starting path that does not exist.
+    # This accepted any string and quietly matched nothing, so
+    # `find / -user nosuchuser` was indistinguishable from "that user owns
+    # no files". Wording and status from GNU findutils 4.10.0 on the
+    # Debian 13 host this persona is modelled on.
+    for _cmd, _msg in (
+        ("find /etc -maxdepth 1 -user nosuchuser",
+         u"find: invalid user name or UID argument to -user: "
+         u"\u2018nosuchuser\u2019"),
+        ("find /etc -maxdepth 1 -group nosuchgroup",
+         u"find: invalid group name or GID argument to -group: "
+         u"\u2018nosuchgroup\u2019"),
+        ("find /etc -maxdepth 1 -uid abc",
+         u"find: non-numeric argument to -uid: \u2018abc\u2019"),
+        ("find /etc -maxdepth 1 -gid abc",
+         u"find: non-numeric argument to -gid: \u2018abc\u2019"),
+        ("find /nonexistent -user nosuchuser",
+         u"find: invalid user name or UID argument to -user: "
+         u"\u2018nosuchuser\u2019"),
+    ):
+        _v, _s = sh()
+        _s._err = []
+        _s.run(_cmd)
+        check("%s says so" % _cmd.split(" -", 2)[-1][:22],
+              "".join(_s._err).strip(), _msg)
+        check("...at exit 1", _s.last_rc, 1)
+
+    # ...and the forms that are legitimate still work
+    for _cmd, _want_rc, _nonempty in (
+        ("find /etc -maxdepth 1 -user root", 0, True),
+        ("find /etc -maxdepth 1 -user 0", 0, True),
+        ("find /etc -maxdepth 1 -uid 0", 0, True),
+        ("find /etc -maxdepth 1 -group root", 0, True),
+        # a bare number is a raw id: no such owner, but not an error
+        ("find /etc -maxdepth 1 -user 4242", 0, False),
+    ):
+        _v, _s = sh()
+        _out = _s.run(_cmd) or ""
+        check("%s exits %d" % (_cmd.split(" -", 2)[-1][:20], _want_rc),
+              _s.last_rc, _want_rc)
+        check("%s output is %s" % (_cmd.split(" -", 2)[-1][:20],
+                                   "non-empty" if _nonempty else "empty"),
+              bool([l for l in _out.splitlines() if l.strip()]), _nonempty)
 
     for label, got, want in FAILS:
         print("FAIL %s\n  got  %r\n  want %r" % (label, got, want))

@@ -25,6 +25,17 @@ Two more spellings of the same question were silent: `mawk --version`
 <(mawk --version)` is empty on the guest) and `awk -W version`, mawk's own
 spelling, which the option loop consumed as "skip the next word".
 
+Then a third, much larger escape: the function knew **eleven** util-linux
+binaries by name, and it returns None for anything it does not recognise,
+which drops the command through to its real implementation. So 46 more
+answered `--version` by doing their job -- `ps --version` printed "N",
+`uptime --version` printed the uptime, `taskset --version` printed an
+affinity mask and `script --version` started a typescript session -- and
+eleven others printed "col 2.41", a format none of them uses. The set is
+derived from dpkg now, across the six binary packages Debian builds from
+the util-linux source plus procps and psmisc, each of which has its own
+banner shape.
+
 Everything here was measured on the guest, banner text byte for byte.
 
 Usage:  python3 verbannertest.py
@@ -150,6 +161,204 @@ check("...including with -W posix",
       r("echo a b c | awk -W posix '{print $3}'"), "c")
 check("...and -v assignment still works",
       r("awk -v n=7 'BEGIN{print n+1}'"), "8")
+
+# ------------------------- the util-linux / procps / psmisc families
+# _version_text knew eleven util-linux binaries by name, and it returns None
+# for anything it does not recognise -- which drops the command through to
+# its real implementation. So the other 46 binaries in the family answered
+# `--version` by doing their job: `ps --version` printed "N", `uptime
+# --version` and `w --version` printed the uptime, `taskset --version`
+# printed an affinity mask, `mountpoint --version` reported on /root,
+# `ionice --version` said "none: prio 0", and `script --version` started a
+# typescript session. Eleven more printed "col 2.41" -- their own name and
+# a version, a format none of them uses.
+#
+# Debian builds util-linux-extra, bsdutils, bsdextrautils, mount,
+# uuid-runtime and login from the util-linux source, so every one of their
+# binaries names util-linux and not its own package: `logger` is bsdutils
+# and `sg` is login, and both say "from util-linux". Measured across 40 of
+# them on the guest with no exceptions, so this walks dpkg rather than
+# listing names -- a name-based list is what broke last time.
+UL_SRC = ("util-linux", "util-linux-extra", "bsdutils", "bsdextrautils",
+          "mount", "uuid-runtime", "login")
+ULV = upstream("util-linux")
+
+
+def shipped(pkgs):
+    """Binaries in /usr/bin or /usr/sbin that these packages ship."""
+    out = []
+    for pkg in pkgs:
+        for line in r("dpkg -L %s 2>/dev/null" % pkg).splitlines():
+            line = line.strip()
+            if line.startswith(("/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/")):
+                out.append(line.rsplit("/", 1)[-1])
+    return sorted(set(out))
+
+
+ul_bins = shipped(UL_SRC)
+check("dpkg lists a util-linux family to check", len(ul_bins) > 30, True,
+      "if dpkg -L goes quiet this whole block silently checks nothing")
+ul_bad = []
+for b in ul_bins:
+    got = line0(r("%s --version 2>&1" % b))
+    # Six of them append a compile-time list; the rest print the bare
+    # banner. This used to say "mount and umount alone", which is what
+    # made the other four look correct while they were still missing it.
+    # The libraries version themselves in three components where
+    # util-linux uses two -- 2.41 ships libmount 2.41.0.
+    ULLIB = ULV if ULV.count(".") >= 2 else ULV + ".0"
+    if b in ("mount", "umount"):
+        want = ("%s from util-linux %s (libmount %s: selinux, smack, btrfs,"
+                " verity, namespaces, idmapping, fd-based-mount, statmount,"
+                " statx, assert, debug)" % (b, ULV, ULLIB))
+    elif b == "blkid":
+        want = ("%s from util-linux %s  (libblkid %s, 18-Mar-2025)"
+                % (b, ULV, ULLIB))
+    elif b in ("agetty", "getty"):
+        want = ("%s from util-linux %s (flow control, hints, issue, issue.d,"
+                " keyboard mode, plymouth, reload, syslog, systemd,"
+                " widechar)" % (b, ULV))
+    elif b == "mkswap":
+        want = ("%s from util-linux %s (features: extends-check, nocow,"
+                " fallocate, blkid-check, uuid, selinux)" % (b, ULV))
+    else:
+        want = "%s from util-linux %s" % (b, ULV)
+    if got != want:
+        ul_bad.append("%s -> %r" % (b, got[:60]))
+check("every util-linux family binary prints its banner", ul_bad, [],
+      "one line, '<name> from util-linux <version>', for all %d of them"
+      % len(ul_bins))
+
+# The short spelling is the one a loader reaches for, and it is version for
+# the whole family except setterm and watch (see below).
+ulv_bad = []
+for b in ul_bins:
+    if b in ("setterm", "watch"):
+        continue
+    if line0(r("%s -V 2>&1" % b)) != line0(r("%s --version 2>&1" % b)):
+        ulv_bad.append(b)
+check("-V agrees with --version across the family", ulv_bad, [],
+      "measured on the guest: -V is the version flag for all of them")
+
+# procps-ng and psmisc have their own one-liners.
+pv = upstream("procps")
+proc_bad = []
+for b in shipped(("procps",)):
+    # kill is a shell builtin, so `kill --version` never reaches the procps
+    # binary and errors on the signal name; pidof is sysvinit-utils' on real
+    # trixie and prints nothing at all. Both already matched the guest.
+    if b in ("kill", "pidof"):
+        continue
+    got = line0(r("%s --version 2>&1" % b))
+    if got != "%s from procps-ng %s" % (b, pv):
+        proc_bad.append("%s -> %r" % (b, got[:60]))
+check("every procps binary prints its banner", proc_bad, [],
+      "'<name> from procps-ng <version>'")
+check("kill is the builtin, not procps'",
+      line0(r("kill --version 2>&1")),
+      "bash: kill: -version: invalid signal specification",
+      "the builtin shadows /usr/bin/kill, so this errors on the signal name")
+check("pidof prints nothing", r("pidof --version 2>&1"), "",
+      "pidof is sysvinit-utils' on trixie and has no banner")
+
+sv = upstream("psmisc")
+#: pstree.x11 is a symlink to pstree, and its banner names pstree -- the
+#: compiled-in name, not argv[0]. Measured on the guest:
+#:     pstree.x11 -V      -> "pstree (PSmisc) 23.7"
+#:     pstree.x11 --help  -> "pstree.x11: unrecognized option '--help'"
+#: So one binary uses argv[0] for its errors and the built-in name for its
+#: version, and this loop's rule -- every binary names itself -- is not
+#: true of it. Contrast getty, which is agetty under another name and does
+#: use argv[0] for its version. Two symlinks, two conventions, both
+#: measured rather than reasoned about.
+PSMISC_NAME = {"pstree.x11": "pstree"}
+psm_bad = []
+for b in shipped(("psmisc",)):
+    got = line0(r("%s --version 2>&1" % b))
+    if got != "%s (PSmisc) %s" % (PSMISC_NAME.get(b, b), sv):
+        psm_bad.append("%s -> %r" % (b, got[:60]))
+check("every psmisc binary prints its banner", psm_bad, [],
+      "'<name> (PSmisc) <version>' -- a different shape again")
+check("pstree.x11's banner names pstree, not itself",
+      line0(r("pstree.x11 --version 2>&1")), "pstree (PSmisc) %s" % sv)
+check("...while its errors do name itself",
+      line0(r("pstree.x11 --help 2>&1")),
+      "pstree.x11: unrecognized option '--help'")
+
+# setterm and watch reject the capital spelling and take a lowercase -v,
+# which for every other tool in the family means verbose. The two sets are
+# disjoint, so neither can be applied family-wide.
+check("watch -v is the version", line0(r("watch -v 2>&1")),
+      "watch from procps-ng %s" % pv,
+      "watch spells it -v; -V is 'invalid option'")
+check("watch --version too", line0(r("watch --version 2>&1")),
+      "watch from procps-ng %s" % pv)
+check("watch still runs a command", line0(r("watch -n 2 date 2>&1")),
+      "Every 2.0s: date",
+      "the version shortcut must not shadow a real invocation")
+# ...and the capital is an error, not a different complaint. This answered
+# "watch: no command specified" -- which is what watch says when you give
+# it no command at all, a different mistake from giving it an option it
+# does not have. Measured on the guest: rc 1 and 1053 bytes on stderr.
+check("watch -V is an invalid option", line0(r("watch -V 2>&1")),
+      "watch: invalid option -- 'V'")
+check("...and it exits 1", r("watch -V >/dev/null 2>&1; echo $?"), "1")
+check("...printing the usage after it",
+      r("watch -V 2>&1 | tail -1"), "For more details see watch(1).")
+check("...all 1053 bytes of it", r("watch -V 2>&1 | wc -c"), "1053",
+      "byte-for-byte against the guest's own stderr")
+check("the usage lists -v as the version flag",
+      "-v, --version" in r("watch -V 2>&1"), True)
+
+# The banners move with dpkg rather than being written down.
+check("the util-linux banner tracks dpkg",
+      line0(r("hexdump --version 2>&1")),
+      "hexdump from util-linux %s" % upstream("util-linux"))
+# -- util-linux's compiled-in feature lists -------------------------------
+# Four of these binaries print a parenthesised list after the version, and
+# only mount and umount had one. Every expectation here was read out of the
+# shipping util-linux 2.41-5 .deb rather than off the guest, because the
+# guest runs 2.41.5 and two of these strings move with the version.
+
+_UL = upstream("util-linux")
+_ULLIB = _UL if _UL.count(".") >= 2 else _UL + ".0"
+_AGETTY = ("flow control, hints, issue, issue.d, keyboard mode, plymouth, "
+           "reload, syslog, systemd, widechar")
+
+check("agetty carries its feature list", r("agetty --version"),
+      "agetty from util-linux %s (%s)" % (_UL, _AGETTY))
+check("getty is the same binary, so the same list", r("getty --version"),
+      "getty from util-linux %s (%s)" % (_UL, _AGETTY))
+check("...and by absolute path too", r("/sbin/agetty --version"),
+      "agetty from util-linux %s (%s)" % (_UL, _AGETTY))
+check("mkswap lists its features in source order", r("mkswap --version"),
+      "mkswap from util-linux %s (features: extends-check, nocow, "
+      "fallocate, blkid-check, uuid, selinux)" % _UL)
+
+# blkid's own format string is "%s from %s  (libblkid %s, %s)" -- two
+# spaces. The date is libblkid's release date and is compiled in.
+check("blkid names libblkid and its date", r("blkid --version"),
+      "blkid from util-linux %s  (libblkid %s, 18-Mar-2025)" % (_UL, _ULLIB))
+check("...with two spaces before the paren",
+      "  (libblkid" in r("blkid --version"), True)
+
+# The libraries version themselves in three components where util-linux
+# uses two, which is why this is not simply the package version.
+check("libmount is the three-component version",
+      "(libmount %s:" % _ULLIB in r("mount --version"), True)
+check("...and that is not the util-linux version itself",
+      _ULLIB != _UL, True,
+      "if these ever match, the check above stops proving anything")
+check("umount agrees with mount",
+      r("umount --version").split(" ", 1)[1],
+      r("mount --version").split(" ", 1)[1])
+# A util-linux tool with no feature list still prints the plain banner.
+check("lscpu has no list", r("lscpu --version"),
+      "lscpu from util-linux %s" % _UL)
+
+check("the procps banner tracks dpkg",
+      line0(r("ps --version 2>&1")),
+      "ps from procps-ng %s" % upstream("procps"))
 
 for f in FAILS:
     print(" ", f)

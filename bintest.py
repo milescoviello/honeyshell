@@ -205,8 +205,14 @@ def t_wall_and_write_match_trixie():
     eq("wall is a plain 755 root root", o.strip(), "755 root root")
     o2, rc = run(s, "ls /usr/bin/write")
     eq("write is not on the box", rc, 2)
-    o3, rc3 = run(s, "dpkg -l bsdextrautils")
-    eq("because the package that ships it is not installed", rc3, 1)
+    # Not because bsdextrautils is missing -- that package is installed
+    # and its deb does not contain write either. Nothing in trixie main
+    # ships /usr/bin/write at all: it went the way of the other utmp-era
+    # terminal tools when Debian moved to wtmpdb. Checked against the
+    # trixie Contents index (0 hits across 68,750 packages) and against
+    # dpkg-deb -c on bsdutils, bsdextrautils and util-linux.
+    o3, rc3 = run(s, "dpkg -S /usr/bin/write")
+    eq("and no installed package claims to ship it", rc3, 1)
 
 
 def t_suid_bits_agree_across_every_reader():
@@ -288,6 +294,59 @@ def t_passwd_help_is_a_usage_message():
     eq("an unknown flag is rc 1", rc3, 1)
     check("named in the error", "unrecognized option '--nosuchflag'" in o3,
           o3[:70])
+
+
+def t_a_deleted_binary_answers_nothing_at_all():
+    """--version and --help answered from a file that had been removed.
+
+    The dispatcher already refuses a command whose file is gone -- "a
+    command answers only if the box has a file for it" -- but the generic
+    help and version tables are consulted before that check and never
+    asked. After `rm -f /usr/bin/curl`:
+
+        curl              bash: curl: command not found   rc 127
+        curl http://x/    bash: curl: command not found   rc 127
+        curl --version    curl 8.14.1 (x86_64-pc-linux-gnu) ...   rc 0
+        curl --help       Usage: curl [options...] <url>          rc 0
+
+    while `type curl` and `command -v curl` both said it was gone. Four
+    readers of "is curl here", two answers, and the two that disagreed are
+    the ones a loader uses to pick a download tool.
+
+    Deleting binaries is not an exotic thing to do to this box: the Diicot
+    eviction step resolves /proc/<pid>/exe for every process over 40% CPU
+    and rm -f's it, which is how /usr/bin/python3.13 gets removed here
+    several times a day.
+    """
+    s = sh()
+    # Present: all the spellings answer.
+    for c in ("curl --version", "curl --help", "wget --version"):
+        out, rc = run(s, c)
+        check("%s answers while the file is there" % c, rc == 0 and out.strip(),
+              "rc=%s %r" % (rc, out[:50]))
+    run(s, "rm -f /usr/bin/curl")
+    # Gone: every spelling agrees it is gone.
+    for c in ("curl", "curl http://x/", "curl --version", "curl -V",
+              "curl --help"):
+        out, rc = run(s, c)
+        eq("%s is rc 127 once the file is gone" % c, rc, 127)
+        check("...and says command not found",
+              "curl: command not found" in out, out[:60])
+    # The shell's own two answers, which were right all along.
+    out, rc = run(s, "command -v curl")
+    eq("command -v agrees", (out.strip(), rc), ("", 1))
+    out, rc = run(s, "type curl")
+    check("type agrees", "not found" in out, out[:60])
+    out, rc = run(s, "ls /usr/bin/curl")
+    check("and so does ls", rc != 0, "rc=%s" % rc)
+    # A binary that is still there is untouched by any of this.
+    out, rc = run(s, "id --version")
+    check("a present binary still answers --version",
+          rc == 0 and "coreutils" in out, "rc=%s %r" % (rc, out[:40]))
+    # The same for a second tool, so this is not curl-shaped.
+    run(s, "rm -f /usr/bin/wget")
+    out, rc = run(s, "wget --version")
+    eq("wget --version is rc 127 too", rc, 127)
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]

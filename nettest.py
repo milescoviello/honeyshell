@@ -47,7 +47,114 @@ def check(name, ok, detail=""):
 def main():
     s = fs.Shell(fs.VFS(), peer="203.0.113.77", peer_port=51234)
 
+    # ---- netstat's own flags, which it used to answer by accident --------
+    # The parser split every "-"-prefixed word into single letters, so a
+    # long option was read as a bundle: `netstat --version` printed the
+    # ROUTING TABLE, because there is an "r" in "version", and
+    # `netstat --help` printed the listening sockets, because there is an
+    # "l" in "help". Both exited 0, so nothing looked wrong.
+    import helpdb
+    _usage, _aflist, _ = helpdb.HELP["netstat"]
+    for form in ("-V", "--version"):
+        out = s.run("netstat %s 2>/dev/null" % form)
+        check("netstat %s names net-tools" % form,
+              out.startswith("net-tools 2.10\n"), out[:40])
+        check("netstat %s is not a table" % form,
+              "Kernel IP routing table" not in out
+              and "Active Internet" not in out, out[:40])
+    out = s.run("netstat -V 2>/dev/null")
+    check("...and carries the compile-time feature lines",
+          "\nAF: (inet) +UNIX" in out and "\nHW:  +ETHER" in out, out[-60:])
+    check("...and the signature line",
+          "Fred Baumgarten, Alan Cox" in out, out[:80])
+
+    # --help splits its streams: usage() writes to stdout at status 0 and
+    # print_aflist() writes to stderr unconditionally.
+    for form in ("-h", "--help"):
+        s._err[:] = []
+        out = s.run("netstat %s 2>/dev/null" % form)
+        err = s.run("netstat %s 2>&1 >/dev/null" % form)
+        check("netstat %s prints the usage on stdout" % form,
+              out == _usage, "%d bytes" % len(out))
+        check("...and the family list on stderr", err.strip() == _aflist.strip(),
+              "%d bytes" % len(err))
+        check("...and it is not a socket table",
+              "Active Internet" not in out, out[:40])
+
+    # An unrecognised option is rc 3 -- E_OPTERR -- with everything on
+    # stderr and nothing on stdout.
+    out = s.run("netstat --zzz 2>/dev/null")
+    err = s.run("netstat --zzz 2>&1 >/dev/null")
+    rc = s.run("netstat --zzz >/dev/null 2>&1; echo $?").strip()
+    check("an unknown option exits 3", rc == "3", rc)
+    check("...with nothing on stdout", out == "", out[:40])
+    check("...and names itself and the option",
+          err.startswith("netstat: unrecognized option '--zzz'"), err[:50])
+    check("...then prints the usage too", "usage: netstat" in err, err[:60])
+
+    # The long options have to mean what their short spellings mean.
+    import re as _re
+    _mask = lambda t: [_re.sub(r"[0-9]+", "N", l) for l in t.split("\n")]
+    for short, lng in (("-r", "--route"),
+                       ("-tln", "--tcp --listening --numeric"),
+                       ("-i", "--interfaces"),
+                       ("-tan", "--tcp --all --numeric")):
+        # Masked, because the interface counters advance between two reads
+        # -- netstat -i differs from itself for the same reason.
+        check("netstat %s == netstat %s" % (short, lng),
+              _mask(s.run("netstat %s" % short))
+              == _mask(s.run("netstat %s" % lng)), lng)
+    check("--numeric-hosts is a real option",
+          "unrecognized" not in s.run("netstat -tl --numeric-hosts 2>&1"))
+    # ...and -4/-6 select a family instead of being ignored.
+    _n = lambda c: len([l for l in s.run(c).split("\n") if l.startswith("tcp")])
+    check("netstat -4 and -6 partition the table",
+          (_n("netstat -tln -4"), _n("netstat -tln -6")) == (6, 1),
+          "%s" % ((_n("netstat -tln -4"), _n("netstat -tln -6")),))
+
+    # ---- and the rest of net-tools, which had the same fault ------------
+    # Every one of the nine answered --help and -V by printing its own
+    # table. No two of them have the same shape, which is why each is
+    # pinned against the shipped binary's own output rather than a rule:
+    # ifconfig --help splits 652/799 across the streams, ifconfig -V is
+    # the release line alone, route -V carries a feature block that is not
+    # netstat's, nameif has no -V and says so on stderr, and slattach
+    # --help writes to stderr and exits 3.
+    for _nm, (_wo, _we, _wrc) in sorted(helpdb.NETTOOLS_VERSION.items()):
+        got_o = s.run("%s -V 2>/dev/null" % _nm)
+        got_e = s.run("%s -V 2>&1 >/dev/null" % _nm)
+        got_rc = s.run("%s -V >/dev/null 2>&1; echo $?" % _nm).strip()
+        check("%s -V matches the binary" % _nm,
+              (got_o, got_e.strip(), got_rc) == (_wo, _we.strip(), str(_wrc)),
+              "o=%d/%d e=%d/%d rc=%s/%d" % (len(got_o), len(_wo),
+                                            len(got_e), len(_we),
+                                            got_rc, _wrc))
+        _ho, _he, _hrc = helpdb.HELP[_nm]
+        got_o = s.run("%s --help 2>/dev/null" % _nm)
+        got_e = s.run("%s --help 2>&1 >/dev/null" % _nm)
+        got_rc = s.run("%s --help >/dev/null 2>&1; echo $?" % _nm).strip()
+        check("%s --help matches the binary" % _nm,
+              (got_o, got_e.strip(), got_rc) == (_ho, _he.strip(), str(_hrc)),
+              "o=%d/%d e=%d/%d rc=%s/%d" % (len(got_o), len(_ho),
+                                            len(got_e), len(_he),
+                                            got_rc, _hrc))
+    # None of them may answer a help request with their own table.
+    for _nm in ("ifconfig", "route", "arp"):
+        for _f in ("--help", "-V"):
+            _out = s.run("%s %s 2>/dev/null" % (_nm, _f))
+            check("%s %s is not a table" % (_nm, _f),
+                  not _out.startswith(("eth0:", "Kernel IP routing table",
+                                       "Address  ")), _out[:40])
+    # ...and they still do their actual jobs.
+    check("ifconfig still lists eth0",
+          s.run("ifconfig").startswith("eth0:"), s.run("ifconfig")[:40])
+    check("route still prints the table",
+          s.run("route").startswith("Kernel IP routing table"),
+          s.run("route")[:40])
+
     # ---- one address, however you ask for it
+
+
     ipa = s.run("ip a")
     ifc = s.run("ifconfig")
     addr = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/(\d+) brd", ipa)
@@ -198,6 +305,11 @@ def main():
     check("every unit systemd calls active has its process in ps", not bad,
           str(bad[:4]))
 
+    # A daemon is a process systemd is running, and the box says which
+    # those are: anything in /system.slice/<unit>. A long-running job in a
+    # user's own slice is not a daemon and has no unit by design -- the
+    # training run this machine exists for is exactly that, and demanding a
+    # unit for it would mean inventing python3.service.
     daemons = set()
     for line in s.run("ps -eo pid,comm,cmd").splitlines()[1:]:
         f = line.split(None, 2)
@@ -205,6 +317,9 @@ def main():
             continue
         if f[1] in ("bash", "ps", "sshd", "sshd-session", "agetty",
                     "systemd", "sh", "su"):
+            continue
+        cg = s.run("cat /proc/%s/cgroup 2>/dev/null" % f[0]).strip()
+        if "/system.slice/" not in cg:
             continue
         daemons.add(f[1])
     unit_comms = {c for _u, (_d, _p, c) in fs.Shell._UNITS.items()}
@@ -445,6 +560,125 @@ def main():
 
     print()
     print("=" * 62)
+    # ---- the interface counters against the traffic this box can account
+    # ---- for
+    #
+    # They averaged ~55 MB/s in, which over 41 days of uptime is 195 TB
+    # received and 64 TB sent -- 0.58 Gbit/s sustained, for six weeks, on
+    # a host whose own processes moved 1.59 GB in total and whose nginx
+    # logged 62 requests carrying 19,529 bytes. Five orders of magnitude
+    # between two counters describing one box.
+    #
+    # They had been raised from 594 B/s because btop's network panel read
+    # "0 Byte/s" and flat, which was a real complaint -- but the reason
+    # given, that the box pulls training shards over the wire, is not this
+    # box: its own config says dataset: /data/shards, a local NVMe volume.
+    # So the rate is sized to what it does have, a public IP under
+    # continuous brute-force and scanning, and the burst structure is kept
+    # so the panel still moves.
+    import re as _re
+    import time as _time
+
+    def _o(cmd):
+        r = s.run(cmd)
+        return ((r[0] if isinstance(r, tuple) else r) or "").strip()
+
+    _up = float(_o("cut -d' ' -f1 /proc/uptime") or 1)
+    _dev = _o("grep eth0 /proc/net/dev").split()
+    _rx, _tx = int(_dev[1]), int(_dev[9])
+    _rate = (_rx + _tx) / max(_up, 1.0)
+    check("eth0's average rate is a public host's, not a datacentre link",
+          20e3 < _rate < 3e6,
+          "%.0f KB/s averaged over %.1f days" % (_rate / 1e3, _up / 86400.0))
+    check("...so the lifetime total is plausible",
+          (_rx + _tx) < 20e12,
+          "%.1f TB over %.1f days" % ((_rx + _tx) / 1e12, _up / 86400.0))
+    check("rx exceeds tx, as it does on a server being scanned",
+          _rx > _tx, "rx %d tx %d" % (_rx, _tx))
+    _bpp = _rx / max(int(_dev[2]), 1)
+    check("the average packet is a small one",
+          40 < _bpp < 1600, "%.0f bytes per packet" % _bpp)
+    # every reader of the same counter
+    _sys = int(_o("cat /sys/class/net/eth0/statistics/rx_bytes") or 0)
+    check("sysfs and /proc/net/dev agree on rx_bytes",
+          abs(_sys - _rx) < 5_000_000,
+          "sysfs %d vs proc %d" % (_sys, _rx))
+    _ipm = _re.findall(r"^\s+(\d+)\s+\d+\s+\d+", _o("ip -s link show eth0"),
+                       _re.M)
+    if _ipm:
+        check("ip -s link agrees too", abs(int(_ipm[0]) - _rx) < 5_000_000,
+              "ip %s vs proc %d" % (_ipm[0], _rx))
+    # and it still moves, which is why the rate was raised in the first place
+    _a = int(_o("grep eth0 /proc/net/dev").split()[1])
+    _time.sleep(2)
+    _b = int(_o("grep eth0 /proc/net/dev").split()[1])
+    check("the counter is strictly increasing", _b >= _a, "%d -> %d" % (_a, _b))
+    check("...and moves enough for a graph to show it",
+          (_b - _a) / 2.0 > 10e3,
+          "%.0f KB/s observed" % ((_b - _a) / 2.0 / 1e3))
+
+    # ---- a daemon with a pid and no socket -------------------------------
+    #
+    # `ps` showed jupyter-lab, node_exporter and dcgm-exporter running and
+    # `ss -tlnp` listed only 22, 80 and 3306. Both are standard recon and
+    # the pair contradicts itself. Giving them sockets that then served
+    # the WordPress front page would have been worse, so each answers on
+    # its own port -- and every number in those answers is read from the
+    # same place the shell's own commands read it.
+    import re as _re2
+
+    def _o2(cmd):
+        r = s.run(cmd)
+        return ((r[0] if isinstance(r, tuple) else r) or "").strip()
+
+    _ss = _o2("ss -tlnp")
+    # Matched on the argv that is unique to each, not on the comm: several
+    # processes are python3, so grepping that picked the wrong pid and the
+    # check failed on output that was correct.
+    for _proc, _match, _port in (("python3", "jupyter-lab", 8888),
+                                 ("node_exporter", "node_exporter", 9100),
+                                 ("dcgm-exporter", "dcgm-exporter", 9400)):
+        _running = _o2("ps -eo pid,args --no-headers | grep -F %s "
+                       "| grep -v grep" % _match)
+        check("%s is running" % _proc, bool(_running), "(absent)")
+        check("...and %s holds a socket" % _proc, ":%d" % _port in _ss,
+              "no :%d in ss -tlnp" % _port)
+        if _running:
+            _pid = _running.split()[0]
+            check("...listed against the same pid ps gives",
+                  "pid=%s" % _pid in _ss, "pid=%s not in ss" % _pid)
+    # the exporters answer, and answer with this box's own numbers
+    _m = _o2("curl -s http://127.0.0.1:9100/metrics")
+    check("node_exporter serves metrics", "node_memory_MemTotal_bytes" in _m,
+          _m[:60])
+    _mt = _re2.search(r"node_memory_MemTotal_bytes (\S+)", _m)
+    _pm = _re2.search(r"MemTotal:\s+(\d+)", _o2("grep MemTotal /proc/meminfo"))
+    if _mt and _pm:
+        check("...and its MemTotal is /proc/meminfo's",
+              abs(float(_mt.group(1)) - int(_pm.group(1)) * 1024) < 2,
+              "%s vs %d" % (_mt.group(1), int(_pm.group(1)) * 1024))
+    _d = _o2("curl -s http://127.0.0.1:9400/metrics")
+    _du = _re2.search(r'DCGM_FI_DEV_GPU_UTIL\{gpu="0"[^}]*\} (\d+)', _d)
+    _dfb = _re2.search(r'DCGM_FI_DEV_FB_USED\{gpu="0"[^}]*\} (\d+)', _d)
+    _smi = _o2("nvidia-smi --query-gpu=utilization.gpu,memory.used "
+               "--format=csv,noheader,nounits").splitlines()
+    check("dcgm-exporter serves GPU metrics", bool(_du), _d[:60])
+    if _du and _dfb and _smi:
+        _f = _smi[0].split(", ")
+        check("...and gpu0 matches nvidia-smi",
+              [_du.group(1), _dfb.group(1)] == _f,
+              "dcgm %s/%s vs smi %r" % (_du.group(1), _dfb.group(1), _f))
+    check("one metric series per GPU",
+          _d.count("DCGM_FI_DEV_GPU_UTIL{") ==
+          int(_o2("nvidia-smi -L | wc -l")),
+          "%d series" % _d.count("DCGM_FI_DEV_GPU_UTIL{"))
+    # ...and a port nothing listens on is still refused
+    check("an unbound port is still refused",
+          _o2("curl -s -m 2 http://127.0.0.1:9999/") == "", "answered")
+    check("a wrong path on an exporter is a 404",
+          "404" in _o2("curl -s http://127.0.0.1:9100/nope"),
+          _o2("curl -s http://127.0.0.1:9100/nope")[:40])
+
     print("passed %d, failed %d" % (PASS, FAIL))
     for f in FAILURES:
         print("   FAILED: %s" % f)

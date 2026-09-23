@@ -32,6 +32,7 @@ Usage:  python3 procsurfacetest.py
 """
 
 import re
+import time
 import sys
 
 import fakeshell as F
@@ -61,17 +62,34 @@ def sh():
 
 
 def secs(text):
-    """ps TIME, [DD-]HH:MM:SS or MM:SS, to seconds."""
+    """ps TIME, [DD-]HH:MM:SS or MM:SS, to seconds.
+
+    The day field is days, not another base-60 digit. This folded the
+    whole string base-60 after turning the "-" into a ":", so 5-23:24:58
+    came back as 1164298 rather than 516298 -- 2.3x out -- and the
+    process it belonged to was reported as disagreeing with its own
+    /proc/<pid>/stat when the two in fact agreed to 0.07s. Nothing on this
+    box had a TIME of a day or more in the DD- form until torchrun grew
+    per-rank workers, so the parser had never been asked the question its
+    own docstring claimed it answered.
+    """
     t = (text or "").strip()
     if not t:
         return None
+    days = 0
+    if "-" in t:
+        head, _, t = t.partition("-")
+        try:
+            days = int(head)
+        except ValueError:
+            return None
     total = 0
     try:
-        for part in t.replace("-", ":").split(":"):
+        for part in t.split(":"):
             total = total * 60 + int(part)
     except ValueError:
         return None
-    return total
+    return days * 86400 + total
 
 
 def t_the_surface_matches_the_guest():
@@ -120,19 +138,36 @@ def t_cputime_agrees_with_ps():
     """(utime + stime) / 100 == the TIME column, for every process."""
     s = sh()
     bad = []
-    for line in s.run("ps -eo pid=,time=").splitlines():
-        f = line.split()
-        if len(f) != 2:
+    # One ps snapshot up front and then a separate /proc read per pid is
+    # two samples of a value that moves, and there are ~488 pids, so the
+    # loop itself is the drift: green run alone and red under an
+    # eight-wide pool, at 290:24 against 290:22. Both numbers come out of
+    # one shell invocation per process now -- microseconds apart instead of
+    # seconds -- so the 1s tolerance is measuring the emulator's agreement
+    # rather than the harness's own runtime.
+    pids = [l.split()[0] for l in s.run("ps -eo pid=").splitlines()
+            if l.split()]
+    for pid in pids:
+        pair = s.run("ps -o time= -p %s; cut -d' ' -f14,15 /proc/%s/stat"
+                     % (pid, pid)).split()
+        if len(pair) != 3:
             continue
-        pid, want = f[0], secs(f[1])
-        raw = s.run("cut -d' ' -f14,15 /proc/%s/stat" % pid).split()
+        want = secs(pair[0])
+        f = [pid, pair[0]]
+        raw = pair[1:]
         if want is None or len(raw) != 2:
             continue
         try:
             got = (int(raw[0]) + int(raw[1])) / 100.0
         except ValueError:
             continue
-        if abs(got - want) > 1:
+        # ps floors its TIME column to whole seconds while /proc keeps
+        # jiffies, so (proc - ps) is in [0, 1) by construction before any
+        # drift at all -- a 1s tolerance cannot accommodate its own
+        # rounding, and the gate caught it at 1.05s. Two seconds still
+        # catches what this is for: the frozen /proc/<pid>/stat this test
+        # was written against was 72s out, and grew.
+        if abs(got - want) > 2:
             bad.append((pid, f[1], raw))
     check("no process disagrees with its own TIME column", bad[:6], [])
 
@@ -171,8 +206,23 @@ def t_smaps_rollup_agrees_with_status_and_ps():
 
 
 def t_a_just_started_process_has_no_cpu():
-    """The implant case: launched now, so it cannot have burned CPU."""
+    """The implant case: launched now, so it cannot have burned much CPU.
+
+    The bound is elapsed wall-clock, not zero. This asserted exactly
+    ["0", "0"], which held only because /proc/<pid>/stat derived its ticks
+    as int(seconds) * 100 -- whole seconds -- so anything under a second
+    old reported nothing whatever it was doing. That quantisation was the
+    bug (a 2% daemon gained nothing between two reads and every sampler
+    faster than 1 Hz called it idle); with jiffy precision a process the
+    emulator models as CPU-burning shows a few tens of jiffies a quarter
+    second in, which is what a real one does.
+
+    What must still hold is the thing the implant case is actually about:
+    a process cannot have used more CPU than has existed since it started.
+    """
+    import time as _time
     s = sh()
+    _t0 = _time.time()
     s.run("mkdir -p /root/.stage; echo x > /root/.stage/miner; "
           "chmod +x /root/.stage/miner")
     s.run("cd /root/.stage && nohup ./miner &")
@@ -184,8 +234,128 @@ def t_a_just_started_process_has_no_cpu():
     if not pid:
         return
     raw = s.run("cut -d' ' -f14,15 /proc/%s/stat" % pid).split()
-    check("it reports no CPU ticks", raw, ["0", "0"])
+    elapsed = max(0.05, _time.time() - _t0)
+    try:
+        ticks = sum(int(x) for x in raw)
+    except (TypeError, ValueError):
+        ticks = None
+    check("it reports ticks at all, as a number", ticks is not None, True)
+    if ticks is not None:
+        # One core's worth of jiffies per second of life, plus slop for the
+        # emulator's own scheduling. A figure above this is CPU the process
+        # could not have had.
+        ceiling = int(elapsed * 100) + 50
+        check("a just-started process has not out-burned its own lifetime",
+              ticks <= ceiling, True)
     check("and ps agrees", secs(s.run("ps -p %s -o time=" % pid)), 0)
+
+
+def t_the_cpu_line_is_the_sum_of_the_per_cpu_lines():
+    """/proc/stat's aggregate must equal cpu0..cpuN, field by field.
+
+    Nothing checked this, and it is the cheapest possible contradiction to
+    find: two readings of one table, one of which anybody can add up. All
+    ten fields, so a future change that touches only the aggregate -- or
+    only the per-core rows -- cannot pass.
+    """
+    s = sh()
+    agg, per = None, []
+    for line in s.run("cat /proc/stat").splitlines():
+        f = line.split()
+        if not f:
+            continue
+        if f[0] == "cpu":
+            agg = [int(x) for x in f[1:]]
+        elif f[0].startswith("cpu") and f[0][3:].isdigit():
+            per.append([int(x) for x in f[1:]])
+    check("there is an aggregate cpu line", agg is not None, True)
+    check("one line per cpu", len(per), F.NCPU)
+    if agg is None or not per:
+        return
+    names = ("user", "nice", "system", "idle", "iowait", "irq", "softirq",
+             "steal", "guest", "guest_nice")
+    for i, n in enumerate(names[:len(agg)]):
+        check("cpu %s = sum of the per-cpu column" % n,
+              sum(p[i] for p in per if i < len(p)), agg[i])
+
+
+def t_steal_is_small_and_every_reader_rounds_it_the_same():
+    """A KVM guest reports steal, and top and vmstat both derive it here.
+
+    The persona carries a real, non-zero steal figure rather than a clean
+    zero -- exactly zero on a KVM guest is the less believable number --
+    but it is small enough that both readers show 0.0, and they have to
+    agree on that. This pins the relationship, not the constant: if steal
+    ever grows, top and vmstat must move together.
+    """
+    s = sh()
+    f = [int(x) for x in s.run("awk '/^cpu /{print}' /proc/stat").split()[1:]]
+    total = sum(f)
+    steal_pct = 100.0 * f[7] / total
+    check("steal is non-zero, as a guest's is", f[7] > 0, True)
+    check("...but well under a percent", steal_pct < 1.0, True)
+    top_st = None
+    for line in s.run("top -bn1 | head -6").splitlines():
+        m = re.search(r"([0-9.]+)\s+st", line)
+        if m:
+            top_st = float(m.group(1))
+    check("top prints a steal figure", top_st is not None, True)
+    if top_st is not None:
+        check("top's steal matches the table to one decimal",
+              top_st, round(steal_pct, 1))
+    vm = s.run("vmstat 1 1").splitlines()
+    if len(vm) >= 3:
+        hdr, row = vm[-2].split(), vm[-1].split()
+        if "st" in hdr:
+            check("vmstat's steal agrees too",
+                  int(row[hdr.index("st")]), int(round(steal_pct)))
+
+
+def t_proc_holds_exactly_the_processes_ps_reports():
+    """A /proc/<pid> directory ps denies is an artifact outliving its fact.
+
+    Enumerating /proc directly is standard recon -- it is how you list
+    processes without running ps -- so the two counts are a pair anyone
+    can compare in one line. On the live box the verification VFS carried
+    sixteen hollow pid directories, 4101-4117, each with an empty comm and
+    an empty stat, left behind by an older build; a fresh session has
+    none, and this keeps it that way. Every pid /proc admits to must also
+    be a process, and must have the two files a real one always has.
+    """
+    s = sh()
+    proc = sorted(x for x in s.run("ls -d /proc/[0-9]*").replace(
+        "/proc/", "").split() if x.isdigit())
+    ps = sorted(x for x in s.run("ps -eo pid=").split() if x.isdigit())
+    check("/proc holds no pid ps denies", sorted(set(proc) - set(ps)), [])
+    check("ps names no pid /proc lacks", sorted(set(ps) - set(proc)), [])
+    # and none of them is hollow
+    hollow = [p for p in proc[:40]
+              if not s.run("cat /proc/%s/comm" % p).strip()
+              or not s.run("cat /proc/%s/stat" % p).strip()]
+    check("no pid directory is empty", hollow, [])
+
+
+def t_every_reader_agrees_when_the_box_booted():
+    """btime, /proc/uptime, uptime, who -b and last reboot are one fact."""
+    s = sh()
+    btime = None
+    for line in s.run("cat /proc/stat").splitlines():
+        if line.startswith("btime"):
+            btime = int(line.split()[1])
+    check("btime is present", btime is not None, True)
+    up = float(s.run("cat /proc/uptime").split()[0])
+    now = int(s.run("date +%s").strip())
+    # /proc/uptime and btime describe the same instant; a second of slack
+    # covers the two reads landing either side of a tick.
+    check("btime and /proc/uptime agree",
+          abs((now - up) - btime) <= 2, True)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(btime))
+    check("uptime -s prints that instant", s.run("uptime -s").strip(), stamp)
+    check("who -b prints it to the minute",
+          stamp[:16] in s.run("who -b"), True)
+    check("last reboot prints the same day",
+          time.strftime("%b %e", time.localtime(btime)).replace("  ", " ")
+          in s.run("last reboot | head -1").replace("  ", " "), True)
 
 
 def main():
@@ -195,7 +365,11 @@ def main():
                t_cputime_agrees_with_ps,
                t_schedstat_agrees_with_stat,
                t_smaps_rollup_agrees_with_status_and_ps,
-               t_a_just_started_process_has_no_cpu):
+               t_a_just_started_process_has_no_cpu,
+               t_the_cpu_line_is_the_sum_of_the_per_cpu_lines,
+               t_steal_is_small_and_every_reader_rounds_it_the_same,
+               t_proc_holds_exactly_the_processes_ps_reports,
+               t_every_reader_agrees_when_the_box_booted):
         fn()
     for name, got, want in FAILS:
         print("  FAIL %-54s got %r want %r" % (name, got, want))

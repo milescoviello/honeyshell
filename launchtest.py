@@ -102,9 +102,14 @@ def main():
           s.run("ps -o times= -p %s" % pid).strip(), "0")
     check("TIME column agrees with times",
           s.run("ps -o time= -p %s" % pid).strip(), "00:00:00")
-    # etime and etimes are the same number in two formats.
-    et = s.run("ps -o etime= -p %s" % pid).strip()
-    ets = int(s.run("ps -o etimes= -p %s" % pid).strip())
+    # etime and etimes are the same number in two formats -- so they have to
+    # come out of the SAME ps, or the comparison is between two samples and
+    # a second boundary crossed between them makes it fail. Two calls is
+    # what this did, and it was green run alone and red in the gate, where
+    # launchtest takes 77s under an eight-wide pool. Within one call the
+    # two agree every time; verified over repeated samples.
+    _row = s.run("ps -o etime=,etimes= -p %s" % pid).split()
+    et, ets = _row[0], int(_row[1])
     mins, secs = et.split(":")[-2:]
     check("etime and etimes agree",
           int(mins) * 60 + int(secs), ets)

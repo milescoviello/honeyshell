@@ -54,7 +54,16 @@ PASS, FAIL = [], []
 # Measured on the guest: dpkg really does disown these.
 # write went with bsdextrautils, which this box does not install:
 # it was the one unowned binary that a package could have owned.
-UNOWNED_OK = {"editor", "pager", "nawk", "lzcat", "unlzma"}
+UNOWNED_OK = {"editor", "pager", "nawk", "lzcat", "unlzma",
+              # NVIDIA's .run installer puts these on disk and
+              # registers nothing with dpkg. Driver 595.84 is newer
+              # than Debian 13 packages, so a package owning them
+              # would contradict the version they report.
+              "nvidia-smi", "nvidia-debugdump",
+              "nvidia-persistenced",
+              # A release tarball for the exporters, pip for
+              # jupyter: none of them come from a .deb either.
+              "dcgm-exporter"}
 
 
 def sh():

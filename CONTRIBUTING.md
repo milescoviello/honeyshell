@@ -42,10 +42,11 @@ before you trust it.
 ./run-suites.sh
 ```
 
-On a Debian 13 host that should print `suites: 197   unexpected failures: 0
-known: 1` — the one known failure is `awktest.py`, and
-[docs/testing.md](docs/testing.md) says why it is tolerated by name rather
-than skipped. Anything else failing is either your change or a host that is
+On a Debian 13 host that should print `suites: 237   unexpected failures: 0
+known: 1` — the one known failure is `scripttest.py`, and
+[docs/testing.md](docs/testing.md#known-failures) says why it is tolerated by
+name rather than skipped. If your change makes those three cases match, take
+`scripttest.py` out of `KNOWN_FAILURES` in the same patch. Anything else failing is either your change or a host that is
 not Debian 13; several suites diff against the host's own `bash` and
 coreutils, so on another distribution they report the host's differences and
 not the emulator's.

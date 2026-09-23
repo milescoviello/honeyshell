@@ -82,7 +82,7 @@ def case(script, want, rc=0):
 # -- the payload's own sum ----------------------------------------------
 
 def t_hugepages():
-    case("echo $((1280 + $(nproc)))", "1284")
+    case("echo $((1280 + $(nproc)))", str(1280 + fs.NCPU))
 
 
 # -- literals ------------------------------------------------------------

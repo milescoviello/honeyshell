@@ -1,7 +1,7 @@
 # Testing
 
-There is more test than implementation here: 51,754 lines across 197 suites
-against 44,830 lines of emulator. That ratio is the point, not an accident —
+There is more test than implementation here: 68,907 lines across 237 suites
+against 60,213 lines of emulator. That ratio is the point, not an accident —
 see [design.md](design.md) for why.
 
 ## Running them
@@ -62,21 +62,32 @@ The job then prints its Python, awk, bash and `/etc/debian_version` versions
 before running anything, so a diff that turns out to be the reference's fault
 can be traced to which reference.
 
-## The one known failure
+## Known failures
 
-`run-suites.sh` should report exactly **one** failure on a Debian host, and it
-is a real difference rather than a flake:
+`run-suites.sh` should report exactly **one** failure on a Debian 13 host, and
+it is a real difference rather than a flake:
 
-- `awktest.py` — 89 of its 90 cases match the reference awk exactly. The one
-  that does not is `gsub(/a/, "\\&")`: GNU awk leaves `banana` unchanged and
-  warns, this emulator produces `b&n&n&`. Escaped-ampersand replacement is a
-  corner of awk's substitution escaping that has not been worked through.
+- `scripttest.py` — 420 of its 423 cases match. The three that do not are
+  uncaught exceptions under `python3 -c` (a `NameError`, a
+  `ModuleNotFoundError` and an `EOFError`), where Python 3.13.5 formats the
+  traceback differently from this emulator.
 
 `run-suites.sh` tolerates that one **by name** and reports it as `KNOWN`, so
 CI stays green without the failure being hidden. An unexpected failure still
 turns the build red, and `KNOWN_FAILURES= ./run-suites.sh` tolerates nothing.
-Skipping the suite instead would have hidden the other 89 cases it checks,
-which is why it is listed rather than disabled.
+Skipping the suite instead would hide the 420 cases it checks, which is why it
+is listed rather than disabled.
+
+This is a good illustration of why CI runs in `debian:trixie`: on a host with
+Python 3.12 those three cases match, because 3.12 formats them the same way
+this emulator does. The difference only exists against the Python that
+Debian 13 actually ships.
+
+The previously listed failure, `awktest.py`'s `gsub(/a/, "\\&")`, is fixed:
+gawk treats an unknown escape as the plain character, so `"\\&"` in a
+replacement is the matched text rather than a literal ampersand. `awktest.py`
+now reports 97/97 against the reference awk and 47/47 against mawk 1.3.4, and
+is no longer tolerated.
 
 `awktest.py`'s reference is whatever `awk` resolves to on `PATH`, and it
 prints which one on its first line (`reference: ...`). On CI that is gawk,

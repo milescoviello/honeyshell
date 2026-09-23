@@ -38,6 +38,7 @@ Run from `honeypot/`, or on the guest.
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -264,7 +265,25 @@ def t_loadavg_matches_the_process_table():
     if len(f) != 5:
         return
     running, total = f[3].split("/")
-    eq("loadavg task total equals the ps count", int(total), n)
+    # loadavg's `running/total` counts TASKS -- threads -- not processes.
+    # This pinned the process count, which was right while every process
+    # here was single-threaded and became wrong the moment
+    # MULTITHREADED_COMMS gave mariadbd 32 threads. Measured on a real
+    # kernel, where the thread reading is exact and the process reading is
+    # nowhere close:
+    #
+    #     /proc/loadavg      1.70 1.58 1.54 2/2551 1359358
+    #     processes in /proc                    719
+    #     sum of Threads:                      2551      <- matches
+    #
+    # `top` and `ps -e` still count processes, and they still agree with
+    # each other and with /proc; this is the one reader that counts tasks.
+    thread_sum = sum(int(x) for x in re.findall(
+        r"^Threads:\s+(\d+)",
+        run(s, "cat /proc/[0-9]*/status 2>/dev/null")[0], re.M))
+    eq("loadavg task total is the thread count", int(total), thread_sum)
+    check("...and threads outnumber processes here",
+          thread_sum > n, "%d threads over %d processes" % (thread_sum, n))
     o, _ = run(s, "awk '/^procs_running/{print $2}' /proc/stat")
     eq("loadavg running agrees with /proc/stat", running, o.strip())
     check("procs_running is at least 1", int(o.strip() or 0) >= 1, o.strip())

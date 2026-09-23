@@ -77,6 +77,42 @@ def main():
     check("...not even in the environment",
           s.run("FOO=bar true; env | grep -c ^FOO").strip(), "0")
 
+    # -- a known deviation, deliberately not fixed ----------------------
+    # bash expands a command line *before* applying the prefix, so the
+    # assignment is not visible to the command it is attached to:
+    #
+    #     X=old; X=new echo "$X"     bash: old      here: new
+    #     Y=new echo "$Y"            bash: (empty)  here: new
+    #
+    # 203.0.113.70 used exactly this form on 2026-09-02:
+    #   CRON="$(crontab -l ...)" echo "$CRON" | grep -F ... || <install>
+    # On a real box that expansion is empty, so the grep never matches and
+    # the loader reinstalls every run; here it matches and the install is
+    # skipped.
+    #
+    # It was tried and reverted. The prefix has to stay in self.vars
+    # because 51 places read the command's environment out of it --
+    # HOME in eight of them, plus PATH, IFS, TZ, TERM, LC_*, LOGNAME --
+    # and every one is a name that gets used as a prefix. Holding it in an
+    # overlay instead broke, in order: the same name assigned twice, env
+    # -i, a grandchild's inherited export, LD_PRELOAD reaching the loader,
+    # `locale` under LC_ALL=C, and PATH resolution under PATH=... Each was
+    # a separate consumer, which is the signal: this needs environment and
+    # shell variables genuinely separated throughout, not an overlay
+    # bolted beside them. The three checks below came out of that attempt
+    # and are kept, because they cover behaviour that is already correct
+    # and that the attempt broke.
+
+    check("the same name twice keeps the last value",
+          s.run("X=a X=b sh -c 'echo \"$X\"'"), "b\n")
+    check("env -i throws the prefix away with everything else",
+          s.run("X=new env -i sh -c 'echo \"[$X]\"'"), "[]\n")
+    # The inner $A/$B are escaped so the innermost shell expands them;
+    # unescaped, the middle shell eats $B and both bash and this box
+    # print 1, which would test nothing.
+    check("a child exports what it inherited from a prefix",
+          s.run('A=1 sh -c \'B=2 sh -c "echo \\$A\\$B"\''), "12\n")
+
     # A bare assignment is a shell variable, not an exported one. bash draws
     # this line and so must this: `FOO=bar; env` shows nothing.
     s = sh()

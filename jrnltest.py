@@ -69,9 +69,21 @@ def main():
           bool(re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00 ", iso)),
           True)
     check("...and carries the same message", iso.endswith(cat), True)
+    # split(None, 3), not split(" ", 3). The default format is
+    # "%b %e %H:%M:%S" and %e space-pads the day, so on the first nine of
+    # any month "Sep  1" carries two spaces, a fixed-count split on a
+    # single space yields an empty field, and [3] lands on the timestamp
+    # instead of the host. It went red at 00:19 on the 1st with journalctl
+    # printing exactly what journalctl prints.
+    #
+    # None keeps the maxsplit, so the tail stays "host tag[pid]: message"
+    # and this still compares host *and* tag, which is what it is named
+    # for. A plain .split() collapses the maxsplit too and quietly narrows
+    # it to the host alone -- which is what I tried first, and the check
+    # caught it.
     check("...and the same host and tag",
-          iso.split(" ", 1)[1].split(":")[0], default.split(" ", 3)[3
-          ].split(":")[0])
+          iso.split(" ", 1)[1].split(":")[0],
+          default.split(None, 3)[3].split(":")[0])
 
     unix = s.run("journalctl -o short-unix -n 1 --no-pager").strip()
     check("-o short-unix leads with epoch seconds",

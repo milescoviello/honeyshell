@@ -80,8 +80,19 @@ def df(sh, path="/"):
 
 
 def fill(sh, where="/root/fill"):
-    """Fill the root filesystem, and return what df says afterwards."""
-    out(sh, "dd if=/dev/zero of=%s bs=1M count=70000 2>/dev/null" % where)
+    """Fill the root filesystem, and return what df says afterwards.
+
+    The count is derived from the filesystem, not written down: a literal
+    70000 MiB filled a 63 GiB disk and does nothing at all to a 1.8 TiB
+    one, so the test would quietly stop testing the thing it is named
+    after the moment the persona grew.
+    """
+    import fakeshell
+    # Everything not already used, including the 5% ext4 keeps back --
+    # this runs as root, and root may spend the reserve, which is why the
+    # check below expects used to reach total exactly.
+    mib = (fakeshell.ROOT_BLOCKS - fakeshell.ROOT_USED) // 1024 + 8192
+    out(sh, "dd if=/dev/zero of=%s bs=1M count=%d 2>/dev/null" % (where, mib))
     return df(sh)
 
 
@@ -179,7 +190,10 @@ check("filling / does not touch /tmp", df(H, "/tmp"), tmp_before,
       "/tmp is a tmpfs with its own size")
 I = shell()
 root_before = df(I)
-out(I, "dd if=/dev/zero of=/tmp/big bs=1M count=4000 2>/dev/null")
+# /tmp is half of RAM, so the amount needed to fill it moves with the
+# persona too -- 4000 MiB filled a 994M tmpfs and does nothing to a 504G one.
+_tmp_mib = fakeshell.MEM_TOTAL_KB // 2 // 1024 + 512
+out(I, "dd if=/dev/zero of=/tmp/big bs=1M count=%d 2>/dev/null" % _tmp_mib)
 check("filling /tmp does not touch /", df(I), root_before)
 check("...and /tmp fills on its own", df(I, "/tmp")[2], 0)
 check("...stopping at its own size", df(I, "/tmp")[1], df(I, "/tmp")[0])

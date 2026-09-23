@@ -121,7 +121,15 @@ def t_tput_emits_real_escapes():
     s = sh()
     for cap, want in (("bold", "\x1b[1m"), ("sgr0", "\x1b(B\x1b[m"),
                       ("smso", "\x1b[7m"), ("rmso", "\x1b[27m"),
-                      ("el", "\x1b[K"), ("clear", "\x1b[H\x1b[2J"),
+                      ("el", "\x1b[K"),
+                      # Not the bare `clear` capability. terminfo has
+                      # clear=\E[H\E[2J, but ncurses' tput appends E3 to drop
+                      # the scrollback, so the bytes on the wire carry \E[3J
+                      # too. Measured on the guest, ncurses 6.5, Debian 13.6:
+                      #   xterm, xterm-256color  1b5b48 1b5b324a 1b5b334a
+                      #   linux                  1b5b48 1b5b4a   1b5b334a
+                      #   vt100                  1b5b48 1b5b4a
+                      ("clear", "\x1b[H\x1b[2J\x1b[3J"),
                       ("civis", "\x1b[?25l")):
         o, rc = run(s, "tput %s" % cap)
         eq("tput %s" % cap, (o, rc), (want, 0))
@@ -254,10 +262,30 @@ def t_geometry_is_plumbed_from_the_pty_request():
           in src, "still uses *_args")
     check("a window-change handler exists",
           "def check_channel_window_change_request" in src, "missing")
-    check("the shell is given the negotiated columns",
-          "shell.cols, shell.rows = getattr(server" in src, "missing")
-    check("and the negotiated term", 'shell.vars["TERM"] = shell.term' in src,
-          "missing")
+    # These two used to match the interactive path's own source lines,
+    # `shell.cols, shell.rows = getattr(server...` and `shell.vars["TERM"] =
+    # shell.term`. Both were true and both moved: the exec path made the
+    # same decision differently and dropped the geometry, so `ssh -tt web01
+    # <cmd>` negotiated 200x50 and reported 80x24, and the two hand-written
+    # copies were replaced by one Shell.set_channel_pty(). Asserting the
+    # spelling made a correct unification look like a regression, so this
+    # asserts what the lines were for: both callers hand the shell the
+    # channel's terminal and its size, and the shell answers with them.
+    check("both session paths hand the shell the channel's shape",
+          src.count("set_channel_pty(") >= 2, src.count("set_channel_pty("))
+    check("...the interactive one passing term and size",
+          "set_channel_pty(True, term=" in src, "missing")
+    check("...and the exec one passing them too",
+          'set_channel_pty(bool(getattr(server, "pty_requested", False)),'
+          in src and "size=getattr(server" in src, "missing")
+    _neg = fs.Shell(vfs=fs.VFS())
+    _neg.exec_mode = True
+    _neg.set_channel_pty(True, term="tmux-256color", size=(200, 50))
+    check("a negotiated geometry reaches $COLUMNS",
+          (_neg.run("echo $COLUMNS") or "").strip(), "200")
+    check("...and stty size", (_neg.run("stty size") or "").strip(), "50 200")
+    check("...and the negotiated term reaches $TERM",
+          (_neg.run("echo $TERM") or "").strip(), "tmux-256color")
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]

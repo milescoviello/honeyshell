@@ -54,6 +54,54 @@ def rows(text):
 def main():
     v, s = sh()
 
+    # -- the IPv6 socket every reader but ss and netstat already knew about --
+    # sshd -T advertised `listenaddress [::]:22`, /proc/net/tcp6 carried the
+    # row, and ss's own summary counted it -- while `ss -tln` and `netstat
+    # -tln` listed the v4 table only. Five readers, one socket, two of them
+    # silent about it. And -4/-6/-f were accepted and ignored, so `ss -tln -6`
+    # printed the six IPv4 listeners.
+    v6 = [l for l in rows(s.run("ss -tlnp")) if "[::]:22" in l]
+    check("ss lists the v6 listener", len(v6), 1)
+    if v6:
+        check("...as sshd, on its own fd", "sshd" in v6[0]
+              and "fd=4" in v6[0], True)
+        check("...with a bracketed peer", "[::]:*" in v6[0], True)
+    n4 = len(rows(s.run("ss -tln -4")))
+    n6 = len(rows(s.run("ss -tln -6")))
+    check("-4 and -6 partition the table", (n4, n6), (6, 1))
+    check("-f inet6 is the same as -6",
+          len(rows(s.run("ss -tln -f inet6"))), 1)
+    check("-f inet is the same as -4",
+          len(rows(s.run("ss -tln -f inet"))), 6)
+    check("...and unfiltered is both", len(rows(s.run("ss -tln"))), 7)
+
+    # The five readers have to agree on the count, which is the whole point.
+    tcp6_rows = [l for l in s.run("cat /proc/net/tcp6").split("\n")[1:]
+                 if l.split()]
+    check("/proc/net/tcp6 has the same one", len(tcp6_rows), 1)
+    summary = [l for l in s.run("ss -s").split("\n") if l.startswith("TCP\t")]
+    check("ss -s counts one IPv6 TCP",
+          summary and summary[0].split()[-1], "1")
+    check("netstat labels it tcp6",
+          len([l for l in s.run("netstat -tln").split("\n")
+               if l.startswith("tcp6")]), 1)
+    # Bracketed, not ":::22" -- net-tools 2.10's binary carries the literal
+    # "[::]" and no ":::" at all.
+    check("netstat brackets the address too",
+          any("[::]:22" in l for l in s.run("netstat -tln").split("\n")), True)
+    check("nothing prints the old ::: form",
+          ":::22" in s.run("netstat -tln") or ":::22" in s.run("ss -tln"),
+          False)
+
+    # /proc/net listed three socket files while six more were readable --
+    # `cat /proc/net/tcp6` worked and `ls /proc/net` denied it existed.
+    listed = set(s.run("ls /proc/net").split())
+    for f in ("tcp", "tcp6", "udp", "udp6", "raw", "raw6", "udplite",
+              "udplite6", "unix"):
+        check("ls /proc/net shows %s" % f, f in listed, True)
+        check("...and it reads", "No such file" not in
+              s.run("cat /proc/net/%s" % f), True)
+
     # -- -e: uid, inode, cookie, cgroup ---------------------------------------
     line = [l for l in rows(s.run("ss -tlnpe")) if ":22 " in l][0]
     for field in ("uid:", "ino:", "sk:", "cgroup:"):
@@ -123,8 +171,14 @@ def main():
 
     # -- filters filter ---------------------------------------------------------
     only22 = rows(s.run("ss -tlnp '( sport = :22 )'"))
-    check("a sport filter returns one socket", len(only22), 1)
-    check("...and it is port 22", ":22 " in only22[0], True)
+    # Two, not one: sshd binds both families on 22, so a port filter that
+    # returned a single row would be hiding one of them. This asserted 1
+    # while the v6 listener was missing from ss's table entirely.
+    check("a sport filter returns both sshd sockets", len(only22), 2)
+    check("...both on port 22",
+          all(":22" in l for l in only22), True)
+    check("...one per family",
+          sorted("[::]" in l for l in only22), [False, True])
     check("a different port returns that one",
           [":80 " in l for l in rows(s.run("ss -tlnp '( sport = :80 )'"))],
           [True])

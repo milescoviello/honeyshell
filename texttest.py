@@ -158,6 +158,27 @@ CASES = [
  ("uniq -c",            "printf 'a\\na\\nb\\n' | uniq -c"),
  ("uniq -d",            "printf 'a\\na\\nb\\n' | uniq -d"),
  ("sort|uniq -c|sort -rn","printf 'a\\nb\\na\\n' | sort | uniq -c | sort -rn"),
+    # uniq's skip options were listed so their arguments would not be
+    # read as filenames, and then nothing looked at them: three lines
+    # differing only in their first field came back as three. This suite
+    # covered uniq, uniq -c and uniq -d and never the options that decide
+    # what "the same line" means, which is how that survived.
+    ("uniq -f1",           "printf 'a x\\nb x\\nc x\\n' | uniq -f1"),
+    ("uniq -f 1",          "printf 'a x\\nb x\\nc x\\n' | uniq -f 1"),
+    ("uniq -1 obsolete",   "printf 'a x\\nb x\\nc x\\n' | uniq -1"),
+    ("uniq --skip-fields", "printf 'a x\\nb x\\nc x\\n' | uniq --skip-fields=1"),
+    ("uniq -s2",           "printf 'xxA\\nyyA\\nzzB\\n' | uniq -s2"),
+    ("uniq -w1",           "printf 'xxA\\nyyA\\nzzB\\n' | uniq -w1"),
+    ("uniq -c -f1",        "printf 'a x\\nb x\\nc x\\n' | uniq -c -f1"),
+    ("uniq -d -f1",        "printf 'a x\\nb x\\nc x\\n' | uniq -d -f1"),
+    # and the short-cluster forms a validator must never refuse
+    ("head -2 legacy",     "printf 'a\\nb\\nc\\n' | head -2"),
+    ("tail -2 legacy",     "printf 'a\\nb\\nc\\n' | tail -2"),
+    ("tail -n+2",          "printf 'a\\nb\\nc\\n' | tail -n+2"),
+    ("head -c3",           "printf 'abcdef' | head -c3"),
+    ("fold -w2",           "printf 'abcd\\n' | fold -w2"),
+    ("cut -d, -f2",        "printf 'a,b,c\\n' | cut -d, -f2"),
+    ("wc -lwc",            "printf 'a b\\n' | wc -lwc"),
  # tr
  ("tr ranges",          "echo abc | tr a-z A-Z"),
  ("tr -d",              "echo a1b2 | tr -d 0-9"),

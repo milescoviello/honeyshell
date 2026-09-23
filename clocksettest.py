@@ -52,6 +52,7 @@ Usage:  python3 clocksettest.py
 """
 
 import sys
+import re
 import time
 
 import fakeshell
@@ -81,10 +82,29 @@ def main():
     now = int(s.run("date +%s").strip() or 0)
     check("date agrees with the real clock to the second",
           abs(now - int(time.time())) <= 2, True)
-    check("timedatectl agrees with date",
-          s.run("timedatectl | head -1").split()[-2],
-          s.run("date +%H:%M:%S").strip()[:5]
-          if False else s.run("timedatectl | head -1").split()[-2])
+    # Against `date`, not against itself. This compared
+    # `timedatectl | head -1` to a second run of the same command, so the
+    # only thing it could ever detect was the two invocations landing
+    # either side of a second -- which is exactly what it did, failing the
+    # gate at 20:46:38 vs 20:46:39 while testing nothing. Two separate
+    # commands read the clock at two different instants on a real box too,
+    # so the assertion is agreement within a second or two, and the thing
+    # being agreed with is the other command.
+    def _hms(text):
+        m = re.search(r"(\d{2}):(\d{2}):(\d{2})", text or "")
+        if not m:
+            return None
+        h, mi, sec = (int(x) for x in m.groups())
+        return h * 3600 + mi * 60 + sec
+
+    td = _hms(s.run("timedatectl | head -1"))
+    dt = _hms(s.run("date +%H:%M:%S"))
+    check("timedatectl and date both report a time",
+          td is not None and dt is not None, True)
+    if td is not None and dt is not None:
+        # Modulo a day, so a run across midnight is not a failure.
+        delta = min((td - dt) % 86400, (dt - td) % 86400)
+        check("timedatectl agrees with date", delta <= 2, True)
 
     # -- setting it back a year ---------------------------------------------
     s = sh()
@@ -125,8 +145,18 @@ def main():
         s.run(cmd)
         check("%s takes the new clock" % cmd.split()[0],
               abs(epoch(s, path) - 1756195200) <= 5, True)
+    # Within a second, not identical. `date +%s` and the file's mtime are
+    # two reads of the clock taken at two different instants, so they
+    # straddle a second boundary whenever the test happens to run across
+    # one -- this failed the gate at 1756195201 against 1756195200 while
+    # passing five times in a row by hand. The same shape as the
+    # timedatectl check above, which was the other race in this file.
+    # What must still hold is that the file carries the *set* clock rather
+    # than the real one, which the surrounding checks pin to within 5s.
+    _now = int(s.run("date +%s").strip() or 0)
+    _mt = epoch(s, "/tmp/c2")
     check("date +%s and stat -c %Y agree on a new file",
-          s.run("date +%s").strip(), str(epoch(s, "/tmp/c2")))
+          abs(_now - _mt) <= 1, True)
 
     # -- forward, too --------------------------------------------------------
     s = sh()

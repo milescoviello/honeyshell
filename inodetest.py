@@ -111,7 +111,10 @@ def t_inodes_are_not_shared_by_accident():
 
 
 def t_the_three_readers_agree_about_one_file():
-    for p in ("/etc/passwd", "/usr/bin/bash", "/usr/sbin/init"):
+    # /usr/sbin/init is a symlink to ../lib/systemd/systemd on trixie, and
+    # the -inum check below excludes symlinks on purpose (a hardlink twin
+    # search would match them), so this asks about the file it points at.
+    for p in ("/etc/passwd", "/usr/bin/bash", "/usr/lib/systemd/systemd"):
         st = R("stat -c '%%i %%h' %s" % p)[0].split()
         lsi = R("ls -i %s" % p)[0].split()
         pf = R("find %s -printf '%%i %%n\\n'" % p)[0].split()

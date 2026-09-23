@@ -29,6 +29,12 @@ F2 = "apple\ndamson\n"
 F3 = "a b\nb c\n"
 
 CASES = [
+    # %N is the quoted name and %n the bare one -- the only difference
+    # between the two specifiers, and this returned the bare name for
+    # both. Each side of a symlink is quoted separately.
+    "stat -c '%N' f1", "stat -c '%n' f1",
+    "ln -s f1 lnk1 && stat -c '%N' lnk1",
+    "stat --printf '%N\\n' f1",
     "tac f1", "nl f1", "comm f1 f2", "comm -12 f1 f2", "comm -3 f1 f2",
     "paste f1 f2", "join f1 f2", "fold -w 3 f1", "factor 97 100 1",
     "cksum f1", "cksum f2", "sum f1",

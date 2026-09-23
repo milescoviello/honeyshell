@@ -294,6 +294,63 @@ def t_tr_still_matches_the_real_one():
         eq(cmd[:38], out(s, cmd), want)
 
 
+# -- `&` against `&>`, which differ only by a space ----------------------
+# bash reads `cmd &>file` as one redirection operator and `cmd & >file` as
+# a background job followed by a command that is nothing but a redirection.
+# Testing the whitespace-stripped text made those two identical here, so
+# the second form never backgrounded: the `&` became a literal argument.
+
+def t_ampersand_then_redirection_still_backgrounds():
+    s = shell()
+    # The guest prints hi: the redirection belongs to the empty command
+    # after the `&`, not to the job.
+    eq("echo hi & >/dev/null 2>&1", out(s, "echo hi & >/dev/null 2>&1"), "hi")
+    s = shell()
+    eq("a space does not change it",
+       out(s, "echo hi & > /dev/null"), "hi")
+
+
+def t_ampersand_greater_is_still_one_operator():
+    s = shell()
+    # No space: this one really is "redirect stdout and stderr".
+    eq("echo hi &>/dev/null", out(s, "echo hi &>/dev/null"), "")
+    s = shell()
+    eq("&> with a space after it",
+       out(s, "echo hi &> /dev/null"), "")
+
+
+def t_the_redirection_after_the_job_still_makes_its_file():
+    s = shell()
+    # `echo A & >/tmp/z1` backgrounds the echo -- whose output goes to the
+    # terminal -- and creates an empty /tmp/z1. This wrote the two
+    # characters "A &" into it instead, having taken the `&` as an argument.
+    eq("the job's output is not captured",
+       out(s, "echo A & >/tmp/z1"), "A")
+    eq("...and the file is empty",
+       out(s, "cat /tmp/z1"), "")
+    eq("...and it does exist",
+       out(s, "test -f /tmp/z1 && echo yes"), "yes")
+
+
+def t_a_backgrounded_payload_with_a_trailing_redirect_runs():
+    s = shell()
+    # The loader shape: the side effect always worked, which is why this
+    # went unnoticed -- only the job's own output was being swallowed.
+    s.run("./m & >/dev/null 2>&1")
+    eq("one process_started", len(starts(s)), 1)
+
+
+def t_fd_duplication_is_untouched():
+    for form in ("echo x >&2", "ls /nope 2>&1", "echo y 1>&2"):
+        s = shell()
+        check("still parses: %s" % form, "&" not in out(s, form),
+              "got %r" % out(s, form))
+    s = shell()
+    # `|&` is bash's shorthand for `2>&1 |` and is rewritten before the
+    # split, so it has to survive this change too.
+    eq("ls /nope |& wc -l", out(s, "ls /nope |& wc -l"), "1")
+
+
 TESTS = [t_backgrounding_starts_one_process, t_the_foreground_case_is_unchanged,
          t_ps_shows_the_argv_not_the_redirections,
          t_two_launches_are_two_processes, t_pgrep_counts_it_once,
@@ -303,7 +360,12 @@ TESTS = [t_backgrounding_starts_one_process, t_the_foreground_case_is_unchanged,
          t_kill_by_pid_and_by_jobspec_agree, t_killing_one_job_leaves_the_other,
          t_an_unknown_jobspec_is_still_an_error,
          t_no_self_reference_is_undefined, t_no_unreachable_code,
-         t_tr_still_matches_the_real_one]
+         t_tr_still_matches_the_real_one,
+         t_ampersand_then_redirection_still_backgrounds,
+         t_ampersand_greater_is_still_one_operator,
+         t_the_redirection_after_the_job_still_makes_its_file,
+         t_a_backgrounded_payload_with_a_trailing_redirect_runs,
+         t_fd_duplication_is_untouched]
 
 
 def main():

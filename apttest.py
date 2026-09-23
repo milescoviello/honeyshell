@@ -21,7 +21,9 @@ journalled; a binary on disk that dpkg denies is worse than either answer.
 
 Output shapes -- the NEW packages block, Get:/Fetched lines, Selecting/
 Unpacking/Setting up, the REMOVED block -- were measured by installing and
-removing htop on the real trixie guest.
+removing tcpdump on the real trixie guest. htop is not used here any
+more: this persona ships with it installed, so it cannot exercise the
+install path -- apt correctly answers "already the newest version".
 
 Run from `honeypot/`, or on the guest.
 """
@@ -66,7 +68,7 @@ def t_update_and_install_tell_one_story():
     eq("update rc", rc, 0)
     check("it claims the archive is reachable", "Hit:1 http://deb.debian.org"
           in o, o[:60])
-    o2, rc2 = run(s, "apt-get install -y htop")
+    o2, rc2 = run(s, "apt-get install -y tcpdump")
     eq("so an archive package installs", rc2, 0)
     check("and is not 'unable to locate'",
           "Unable to locate" not in o2, o2[-80:])
@@ -78,38 +80,38 @@ def t_update_and_install_tell_one_story():
 
 def t_install_prints_what_apt_prints():
     s = sh()
-    o, _ = run(s, "apt-get install -y htop")
+    o, _ = run(s, "apt-get install -y tcpdump")
     for frag in ("Reading package lists... Done",
                  "The following NEW packages will be installed:",
                  "0 upgraded, 1 newly installed, 0 to remove",
-                 "Need to get 171 kB of archives.",
-                 "Get:1 http://deb.debian.org/debian trixie/main amd64 htop",
-                 "Fetched 171 kB",
-                 "Selecting previously unselected package htop.",
-                 "Preparing to unpack .../htop_3.4.1-5_amd64.deb ...",
-                 "Unpacking htop (3.4.1-5) ...",
-                 "Setting up htop (3.4.1-5) ...",
+                 "Need to get 502 kB of archives.",
+                 "Get:1 http://deb.debian.org/debian trixie/main amd64 tcpdump",
+                 "Fetched 502 kB",
+                 "Selecting previously unselected package tcpdump.",
+                 "Preparing to unpack .../tcpdump_4.99.5-2_amd64.deb ...",
+                 "Unpacking tcpdump (4.99.5-2) ...",
+                 "Setting up tcpdump (4.99.5-2) ...",
                  "Processing triggers for man-db"):
         check("the output has: %s" % frag[:44], frag in o, o[:120])
 
 
 def t_a_second_install_says_so():
     s = sh()
-    run(s, "apt-get install -y htop")
-    o, rc = run(s, "apt-get install -y htop")
+    run(s, "apt-get install -y tcpdump")
+    o, rc = run(s, "apt-get install -y tcpdump")
     eq("rc", rc, 0)
     check("it is already the newest version",
-          "htop is already the newest version (3.4.1-5)." in o, o[:120])
+          "tcpdump is already the newest version (4.99.5-2)." in o, o[:120])
     check("and nothing is installed twice",
           "0 upgraded, 0 newly installed" in o, o[-80:])
 
 
 def t_simulate_changes_nothing():
     s = sh()
-    o, rc = run(s, "apt-get install -s -y htop")
+    o, rc = run(s, "apt-get install -s -y tcpdump")
     eq("rc", rc, 0)
-    check("-s prints the Inst lines", "Inst htop (3.4.1-5" in o, o[:200])
-    o2, rc2 = run(s, "command -v htop")
+    check("-s prints the Inst lines", "Inst tcpdump (4.99.5-2" in o, o[:200])
+    o2, rc2 = run(s, "command -v tcpdump")
     eq("and installs nothing", rc2, 1)
 
 
@@ -177,17 +179,17 @@ def t_the_install_is_logged():
 
 def t_remove_actually_removes():
     s = sh()
-    run(s, "apt-get install -y htop")
-    o, rc = run(s, "apt-get remove -y htop")
+    run(s, "apt-get install -y tcpdump")
+    o, rc = run(s, "apt-get remove -y tcpdump")
     eq("rc", rc, 0)
     check("the REMOVED block is there",
           "The following packages will be REMOVED:" in o, o[:160])
-    check("and the Removing line", "Removing htop (3.4.1-5) ..." in o,
+    check("and the Removing line", "Removing tcpdump (4.99.5-2) ..." in o,
           o[-120:])
-    o2, rc2 = run(s, "command -v htop")
+    o2, rc2 = run(s, "command -v tcpdump")
     eq("the binary is gone", rc2, 1)
-    o3, _ = run(s, "dpkg -l htop | tail -1")
-    check("dpkg agrees", "no packages found matching htop" in o3, o3[:70])
+    o3, _ = run(s, "dpkg -l tcpdump | tail -1")
+    check("dpkg agrees", "no packages found matching tcpdump" in o3, o3[:70])
 
 
 def t_removing_a_preinstalled_package():
@@ -231,8 +233,14 @@ def t_policy_knows_what_is_available():
     o2, _ = run(s, "apt-cache policy tcpdump")
     check("after installing, policy says so",
           "Installed: 4.99.5-2" in o2 or "4.99.5-2" in o2, o2[:120])
+    # apt-cache policy does NOT say a name cannot be located, and does not
+    # fail. Measured on Debian 13 with the streams separated: for
+    # zzqqxx123 and notarealpkg99 it prints nothing on stdout, nothing on
+    # stderr, and exits 0. "N: Unable to locate package" is apt-get's
+    # wording, and asserting rc 100 here was pinning our own bug.
     o3, rc3 = run(s, "apt-cache policy nosuchpkgxyz")
-    eq("an unknown name is still unknown", rc3, 100)
+    eq("an unknown name exits 0, as apt-cache does", rc3, 0)
+    check("...and prints nothing at all", o3.strip() == "", repr(o3[:60]))
 
 
 def t_the_state_survives_a_reconnect():

@@ -46,6 +46,37 @@ KNOWN = {k: v for k, v in KNOWN.items() if v}
 
 
 CASES = [
+ # A word that merely ends in a terminator's letters is not one.
+ # The guard deciding "is this whole line one construct" used
+ # text.endswith("fi"), which is true of `echo wifi`, so an if followed
+ # by such a word swallowed it -- and with a true condition it stripped
+ # two characters and printed "wi". done/undone, fi/wifi/hifi,
+ # esac/mesac all did it. The terminator now has to be a word, and the
+ # one the construct opened with: fi closes an if, done a loop.
+ ("kw word after if",     'if false; then :; fi; echo done'),
+ ("kw-suffix after if",   'if false; then :; fi; echo wifi'),
+ ("kw-suffix, true cond", 'if true; then :; fi; echo wifi'),
+ ("undone after if",      'if false; then :; fi; echo undone'),
+ ("mesac after if",       'if false; then :; fi; echo mesac'),
+ ("fi after a loop",      'for i in 1; do echo $i; done; echo fi'),
+ ("done after a loop",    'for i in 1; do echo $i; done; echo done'),
+ ("fi after a case",      'case x in x) echo m;; esac; echo fi'),
+ # $? saved into a variable. It was a sentinel: the assignment path
+ # parked -12345 in last_rc to learn whether a command substitution had
+ # run, and the assignment's own value is expanded while that is in
+ # place, so `rc=$?` stored -12345. Direct use -- `echo $?` -- was
+ # always right, which is why it lasted: only the saved form was wrong,
+ # and the saved form is the one scripts use.
+ ("save rc after false",  'false; rc=$?; echo "$rc"'),
+ ("save rc after true",   'true; rc=$?; echo "$rc"'),
+ ("save rc from a subst", 'x=$(exit 7); rc=$?; echo "$rc"'),
+ ("save rc and the out",  'out=$(echo hi); rc=$?; echo "[$out] rc=$rc"'),
+ ("save rc twice",        'false; a=$?; true; b=$?; echo "$a $b"'),
+ ("save rc from backtick",'v=`exit 3`; rc=$?; echo "$rc"'),
+ ("save rc after a pipe", 'echo x | grep zzz; rc=$?; echo "$rc"'),
+ ("save rc then arith",   'true; rc=$?; echo $((rc+1))'),
+ ("plain assign rc",      'false; x=1; echo "$?"'),
+ ("direct rc still works",'x=$(false); echo "$?"'),
  # parameter expansion
  ("len",            'V=abcdef; echo ${#V}'),
  ("substr",         'V=abcdef; echo ${V:2}; echo ${V:2:3}; echo ${V: -2}'),

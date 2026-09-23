@@ -397,6 +397,56 @@ def t_su_carries_the_uid_and_not_just_the_name():
     eq("and still needs no password", (rc, out.strip()), (0, "0"))
 
 
+def t_sudo_l_dash_U_asks_about_the_user_it_was_given():
+    """-U was parsed away, so every user got root's privileges.
+
+    `sudo -l -U <name>` is what somebody who already has root runs to find
+    out who else can get it. This box answered all of these with root's
+    listing:
+
+        sudo -l -U deploy       -> Matching Defaults entries for root
+        sudo -l -U www-data     -> Matching Defaults entries for root
+        sudo -l -U nosuchuser   -> Matching Defaults entries for root
+
+    while /etc/group says deploy is in sudo and www-data is not, and
+    /etc/passwd has never heard of nosuchuser. Three questions with three
+    answers, collapsed into one that was wrong for two of them.
+
+    Measured on sudo 1.9.16p2 -- the version this box reports -- in a
+    trixie container with a deploy in the sudo group and a www-data out
+    of it.
+    """
+    s = sh("root")
+    rc, out, _ = run(s, "sudo -l -U deploy")
+    eq("a privileged other user is rc 0", rc, 0)
+    check("the Defaults block names deploy",
+          "Matching Defaults entries for deploy on web01:" in out, out[:70])
+    check("...and so does the listing",
+          "User deploy may run the following commands on web01:" in out,
+          out[:120])
+    check("...with the privileges the sudoers line grants",
+          "(ALL : ALL) ALL" in out, out[:120])
+    check("and the caller is not named instead", "root" not in out, out[:120])
+    rc, out, err = run(s, "sudo -l -U www-data")
+    eq("an unprivileged user is still rc 0", rc, 0)
+    eq("the refusal is the one sudo prints", out,
+       "User www-data is not allowed to run sudo on web01.\n")
+    eq("...on stdout, not stderr", err, "")
+    check("no Defaults block for a user with no rules",
+          "Matching Defaults" not in out, out[:80])
+    rc, out, err = run(s, "sudo -l -U nosuchuser")
+    eq("an unknown user is rc 1", rc, 1)
+    eq("nothing on stdout", out, "")
+    check("the error names the user", "sudo: unknown user nosuchuser" in err,
+          err[:80])
+    rc, out, _ = run(s, "sudo -l")
+    check("sudo -l without -U is still about the caller",
+          "Matching Defaults entries for root on web01:" in out, out[:70])
+    rc, out, _ = run(s, "sudo -l -U mysql")
+    check("a system account is refused like www-data",
+          "is not allowed to run sudo" in out, out[:80])
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("t_") and callable(fn):

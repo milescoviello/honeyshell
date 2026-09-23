@@ -52,6 +52,14 @@ Run from `honeypot/`, or on the guest.
 """
 
 import os
+
+# A still picture: this suite is about the identities between
+# /proc/meminfo, /proc/vmstat and `free`, which separate commands read.
+# The live memory walk moves between commands -- true of a real box, and
+# not what is being checked here.
+os.environ["HONEY_MEM_STATIC"] = "1"
+
+import os
 import re
 import sys
 
@@ -99,7 +107,10 @@ def procvmstat():
 # -- the CPU side already agreed; keep it that way -----------------------
 
 def t_cpu_count_agrees_everywhere():
-    want = 4
+    # The point of this test is that six readers agree with each other, not
+    # that they agree with a number typed here -- so it takes the count from
+    # the persona and checks the six against it.
+    want = fs.NCPU
     eq("nproc", num("nproc"), want)
     eq("getconf _NPROCESSORS_ONLN", num("getconf _NPROCESSORS_ONLN"), want)
     eq("lscpu CPU(s)", num("lscpu | grep -E '^CPU\\(s\\):'"), want)
@@ -107,7 +118,7 @@ def t_cpu_count_agrees_everywhere():
     eq("cpuN dirs", num("ls -d /sys/devices/system/cpu/cpu[0-9]* | wc -l"), want)
     eq("/proc/stat per-cpu", num("grep -c '^cpu[0-9]' /proc/stat"), want)
     out, _ = run("cat /sys/devices/system/cpu/online")
-    eq("cpu online range", out.strip(), "0-3")
+    eq("cpu online range", out.strip(), "0-%d" % (fs.NCPU - 1))
 
 
 def t_boot_time_plus_uptime_is_now():
@@ -301,16 +312,168 @@ def t_the_attacker_recon_shapes_still_work():
        meminfo()["MemTotal"])
     eq("lscpu awk CPU(s)",
        num("lscpu 2>/dev/null | awk -F: '/^CPU\\(s\\):/ "
-           "{gsub(/ /,\"\",$2); print $2}'"), 4)
+           "{gsub(/ /,\"\",$2); print $2}'"), fs.NCPU)
     out, _ = run("lscpu | egrep 'Model name:' | cut -d ' ' -f 14-")
-    check("model name survives cut", "Xeon" in out, out[:60])
+    # The point is that cut does not mangle the field, not that the box is
+    # any particular chip: assert the text that survives is really part of
+    # the model name this persona reports.
+    check("model name survives cut",
+          bool(out.strip()) and out.strip() in fs.CPU_MODEL, out[:60])
     out, _ = run("uptime | grep -ohe 'up .*' | sed 's/,//g' "
                  "| awk '{ print $2\" \"$3 }'")
     check("uptime extraction", re.match(r"^\d+ days?$", out.strip()) is not None,
           out[:40])
 
 
-TESTS = [t_cpu_count_agrees_everywhere, t_boot_time_plus_uptime_is_now,
+def t_free_used_is_total_minus_available():
+    """free's used, checked against meminfo rather than against free.
+
+    t_used_memory_agrees compares `free -k` with `vmstat -s`. Both are
+    ours, both derived used the same way -- total minus free minus
+    buffers minus cached minus SReclaimable -- so they agreed with each
+    other and were both wrong, and the test passed for months.
+
+    procps does not derive it from the parts. Measured against the
+    guest's own procps 4.0.4, every candidate against its real output:
+
+        REAL free -k used = 1192608 kB
+          total - available                          1191600  MATCH
+          total - free - cached - buffers             927540
+          total - free - (cached+SRecl) - buffers     785764  <- was ours
+          total - free - (cached+SRecl-Shmem) - buf  1003404
+
+    and its `vmstat -s` "K used memory" printed the identical figure.
+    The difference is Shmem: 4 GiB on this persona, which is why btop,
+    htop and fastfetch all read 57 GiB while free said 52.
+    """
+    mi = meminfo()
+    want = mi["MemTotal"] - mi["MemAvailable"]
+    eq("free -k used == MemTotal - MemAvailable",
+       num("free -k | awk '/^Mem:/{print $3}'"), want)
+    eq("vmstat -s used == MemTotal - MemAvailable",
+       num("vmstat -s | awk '/K used memory/{print $1}'"), want)
+    # buff/cache was already right; pin it so the fix above cannot drift.
+    eq("free -k buff/cache == Buffers + Cached + SReclaimable",
+       num("free -k | awk '/^Mem:/{print $6}'"),
+       mi["Buffers"] + mi["Cached"] + mi["SReclaimable"])
+
+
+def t_free_columns_never_fuse():
+    """Every column stays a separate token, however wide the number.
+
+    On a terabyte box `free -b` printed
+
+        Mem:   1082331758592 57870151680797503561728  4294967296226...
+
+    -- used and free run together, then shared, buff/cache and available.
+    The columns were "%12s", and a value of exactly twelve characters
+    fills the field and touches its neighbour. procps does not: its own
+    binary carries " %11s", a leading space then width eleven, so the
+    geometry is identical for anything that fits and an overflowing value
+    still has a separator. Real free misaligns on a big box; it never
+    fuses.
+
+    Checking the numbers would not have caught this. Every value was
+    correct; only the space between them was missing.
+    """
+    for unit in ("-b", "-k", "-m", "-h"):
+        out, _ = run("free %s" % unit)
+        for line in out.splitlines():
+            if not line.startswith(("Mem:", "Swap:")):
+                continue
+            fields = line.split()
+            want = 7 if line.startswith("Mem:") else 4
+            check("free %s: %s row has %d separate columns"
+                  % (unit, line.split(":")[0], want),
+                  len(fields) == want,
+                  "got %d: %r" % (len(fields), line[:70]))
+    # and the widest unit really is wide enough to have exposed it
+    row = [l for l in run("free -b")[0].splitlines()
+           if l.startswith("Mem:")][0]
+    widest = max(len(t) for t in row.split()[1:])
+    check("free -b really does carry values wider than the column",
+          widest >= 12, "widest field %d chars" % widest)
+
+
+def _proc_mem(pid):
+    """statm's shared field, /proc/status's Rss* block, and top's SHR."""
+    out, _rc = run("cat /proc/%s/statm; echo ---; "
+                   "grep -E '^VmRSS|^RssAnon|^RssFile|^RssShmem' "
+                   "/proc/%s/status; echo ---; top -b -n1" % (pid, pid))
+    statm_txt, status_txt, top_txt = out.split("---", 2)
+    statm = statm_txt.split()
+    st = {}
+    for line in status_txt.strip().splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            st[k.strip()] = int(v.split()[0])
+    shr = None
+    for line in top_txt.splitlines():
+        f = line.split()
+        if f and f[0] == str(pid) and len(f) > 6:
+            shr = int(f[6])
+            break
+    return int(statm[2]) * 4, st, shr
+
+
+def t_one_process_has_one_shared_size():
+    """statm's shared field, RssFile+RssShmem and top's SHR are one number.
+
+    They were three. Measured here on pid 21400, one instant:
+
+        statm shared   13,909,504 kB   (pages//3)   -- htop showed 13.3G
+        top SHR        16,691,404 kB   (rss * 0.4)
+        RssFile        20,864,256 kB   (rss // 2)
+
+    On a real kernel statm's third field *is* RssFile+RssShmem, from the
+    same counter, and top reads statm rather than computing anything.
+    Verified on the guest twice: pid 1 gave 5588 kB from all three, and an
+    sshd-session gave 9380 kB from all three.
+
+    htop was the only one of the four tools that was right, because it is
+    the only one that reads statm -- so `top` and `htop` side by side, the
+    commonest possible cross-check on a box someone is deciding whether to
+    mine on, disagreed about the same pid in the same second.
+    """
+    for pid in ("21400", "21414", "884", "1"):
+        shared, st, shr = _proc_mem(pid)
+        check("pid %s: top SHR is statm's shared field" % pid,
+              shr == shared, "statm %r top %r" % (shared, shr))
+        check("pid %s: RssFile+RssShmem is statm's shared field" % pid,
+              st.get("RssFile", 0) + st.get("RssShmem", 0) == shared,
+              "statm %r status %r"
+              % (shared, st.get("RssFile", 0) + st.get("RssShmem", 0)))
+
+
+def t_the_rss_halves_add_up_to_the_whole():
+    """RssAnon + RssFile + RssShmem == VmRSS, as the kernel writes it.
+
+    This held before only because both halves were rss//2; it has to keep
+    holding now that RssFile is statm's number rather than half.
+    """
+    for pid in ("21400", "21414", "884", "1"):
+        _shared, st, _shr = _proc_mem(pid)
+        check("pid %s: the Rss halves sum to VmRSS" % pid,
+              st.get("RssAnon", 0) + st.get("RssFile", 0)
+              + st.get("RssShmem", 0) == st.get("VmRSS", -1),
+              "anon %r file %r shmem %r rss %r"
+              % (st.get("RssAnon"), st.get("RssFile"),
+                 st.get("RssShmem"), st.get("VmRSS")))
+
+
+def t_shared_never_exceeds_resident():
+    """A process cannot share more than it has resident."""
+    for pid in ("21400", "21414", "884", "1"):
+        shared, st, _shr = _proc_mem(pid)
+        check("pid %s: shared <= VmRSS" % pid,
+              0 < shared <= st.get("VmRSS", 0),
+              "shared %r rss %r" % (shared, st.get("VmRSS")))
+
+
+TESTS = [t_one_process_has_one_shared_size,
+         t_the_rss_halves_add_up_to_the_whole,
+         t_shared_never_exceeds_resident,
+         t_cpu_count_agrees_everywhere, t_boot_time_plus_uptime_is_now,
          t_free_memory_agrees_across_sources, t_page_cache_agrees,
          t_used_memory_agrees, t_meminfo_internal_arithmetic,
          t_meminfo_has_the_keys_a_real_one_has, t_top_agrees_with_free,
@@ -319,7 +482,9 @@ TESTS = [t_cpu_count_agrees_everywhere, t_boot_time_plus_uptime_is_now,
          t_vmstat_default_header_is_procps_404,
          t_procps_tools_report_their_version, t_top_rejects_an_unknown_flag,
          t_free_t_adds_the_total_row, t_free_w_splits_buffers_from_cache,
-         t_free_units_still_agree, t_the_attacker_recon_shapes_still_work]
+         t_free_units_still_agree, t_the_attacker_recon_shapes_still_work,
+         t_free_used_is_total_minus_available,
+         t_free_columns_never_fuse]
 
 
 def main():

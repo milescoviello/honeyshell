@@ -173,8 +173,15 @@ def main():
         return abs(val * unit - kib) < kib * 0.02 + 1024
     check("findmnt's size agrees with df's raw blocks",
           [approx(t, k) for t, k in zip(three, raw)], [True, True, True])
-    check("and it is not simply df -h's string",
-          three == s.run("df -h / | tail -1").split()[1:4], False)
+    # findmnt has its own formatter and must not be df -h's string copied.
+    # On / at this size the two happen to round identically -- 1.8T/384G/
+    # 1.3T either way -- so asserting they differ *there* was asserting a
+    # coincidence that held only while the disk was 63G. /run still shows
+    # the difference plainly: findmnt renders 100.8G where df -h says 101G,
+    # and 6M where df -h says 6.0M on the ESP.
+    fm_run = s.run("findmnt -n -o SIZE,USED,AVAIL /run").split()
+    df_run = s.run("df -h /run | tail -1").split()[1:4]
+    check("and it is not simply df -h's string", fm_run == df_run, False)
     check("findmnt --df / names the source",
           s.run("findmnt --df /").splitlines()[-1].split()[0], "/dev/sda1")
     noexec = s.run("findmnt -rn -O noexec -o TARGET").split()

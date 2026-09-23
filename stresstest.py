@@ -50,7 +50,15 @@ BUDGET = 20          # seconds per case
 # checks consolidated first, because they read the *element* structure of
 # the output list and a bulk append changes it, which would quietly alter
 # redirection parsing. Recorded in FINDINGS.md.
-SLOW = {"very long argument": 90}
+SLOW = {"very long argument": 90,
+        # A 100 GiB write to this persona's 504G tmpfs is 22 s of honest
+        # work at the rate the box reports, and dd now waits for it rather
+        # than claiming a transfer it did not take time to make. It is
+        # bounded -- _DD_MAX_WAIT -- and it costs 2.6 MB of memory, not 100
+        # GiB: df, du and ls -l all agree the file is 98G and the process
+        # never grows. A hang is unbounded, so this budget still catches
+        # one.
+        "dd bomb": 60}
 
 CASES = [
     ("fork bomb",             ":(){ :|:& };:"),

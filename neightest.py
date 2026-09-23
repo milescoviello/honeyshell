@@ -159,6 +159,55 @@ def main():
         check("%s: gone from every reader" % how.split()[0],
               [k for k, v in after.items() if gw in v], [])
 
+    # -- a host argument selects one entry -----------------------------------
+    # arp.c filters the table with
+    #     if (host[0] && strcmp(ip, host)) continue;
+    # and ours ignored it, so `arp -n 10.99.99.99` -- an address that is
+    # not in the table at all -- printed the gateway's entry instead,
+    # while `ip neigh` beside it filtered correctly.
+    s3 = sh()
+    gw3 = gw_of(s3)
+    check("arp -n <the gateway> shows it",
+          gw3 in s3.run("arp -n %s" % gw3), True)
+    check("...and shows only it",
+          len([l for l in s3.run("arp -n %s" % gw3).splitlines()
+               if l.strip() and not l.startswith("Address")]), 1)
+    # A miss prints no header: arp_disp writes it on the first row shown,
+    # so nothing shown means nothing printed but the message. Both the
+    # wording and the exit status are arp.c's, and it returns 0 either way.
+    miss = s3.run("arp -n 10.99.99.99")
+    check("a host with no entry says so",
+          miss.strip(), "10.99.99.99 (10.99.99.99) -- no entry")
+    check("...with no header above it", "Address" in miss, False)
+    check("...and exits 0, as net-tools does", s3.last_rc, 0)
+    # -a takes the other branch of the same if
+    check("the BSD format says it differently",
+          s3.run("arp -a 10.99.99.99").strip(),
+          "arp: in 1 entries no match found.")
+    check("...and -a on a real entry still prints it",
+          gw3 in s3.run("arp -a %s" % gw3), True)
+    # -i filters by device
+    check("-i on the right device keeps the entry",
+          gw3 in s3.run("arp -i eth0 -n"), True)
+    check("-i on a device with no entries says no match",
+          s3.run("arp -i nosuch0 -n").strip(),
+          "arp: in 1 entries no match found.")
+    # and ip neigh, which was always right, still is
+    check("ip neigh filters the same way",
+          s3.run("ip neigh show 10.99.99.99").strip(), "")
+
+    # -- and none of that cost the delete path ------------------------------
+    s4 = sh()
+    gw4 = gw_of(s4)
+    s4.run("arp -d %s" % gw4)
+    check("arp -d still empties the table", s4.run("arp -n").strip(), "")
+    check("...and ip neigh agrees it is gone",
+          s4.run("ip neigh").strip(), "")
+    s5 = sh()
+    s5.run("arp -d 172.31.20.5")
+    check("deleting an on-subnet address with no entry says so",
+          "No ARP entry for 172.31.20.5" in "".join(s5._err), True)
+
     for name, got, want in FAILS:
         print("  FAIL %-58s got %r want %r" % (name, got, want))
     return len(FAILS)

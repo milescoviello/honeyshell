@@ -17,6 +17,30 @@ Six readers, four answers. A dropper checks free space before it fetches
 and the size after; RedTail's setup.sh picks its install directory that
 way.
 
+That pass unified du, ls -s and `stat -c %b` for regular files and
+stopped there. Three classes of inode were never routed through the shared
+helper, and find was never routed through it at all:
+
+  * **symlinks.** ext4 stores a target of up to 59 bytes inside the inode
+    and allocates nothing; 60 bytes and over gets a block. We charged
+    every symlink a full block in stat and du while ls -s charged none,
+    so `stat -c %b`, `du` and `ls -s` said 8, 4 and 0 for the same link.
+    Measured across a 10..300 byte ladder on the guest: L59 is 0 and L60
+    is 8.
+  * **/proc and /sys.** du carried its own rule for them and ls -s
+    carried another; `stat -c %b` carried none, so it was the only reader
+    on the box that said a sysfs attribute occupies eight blocks where
+    the guest says zero.
+  * **find -size -N.** find rounds the file up to whole units and then
+    compares, for every form. -N was a raw byte comparison, so
+    `find / -size -1M` matched every file under a megabyte where find
+    matches only an empty one -- 292584 bytes is one unit rounded up, and
+    one is not less than one. The + and bare forms happened to agree
+    already, because ceil(s/u) > n is the same statement as s > n*u.
+  * **find -printf %b, %k and %S.** Not directives at all, so
+    `find -printf "%s %k"` printed the size and then the two characters
+    "%k" back at the caller.
+
 Reference behaviour measured on the guest (Debian 13, ext4).
 """
 import sys
@@ -188,6 +212,97 @@ def main():
     n = v2.nodes.get("/root/keep.img")
     check("the allocation is journalled", n is not None
           and F.node_size(n, "/root/keep.img") == 104857600, True)
+
+    # -- a symlink's target lives in the inode until it does not ----------
+    v, s = sh()
+    s.run("mkdir -p /tmp/lt")
+    for n in (10, 40, 59, 60, 61, 100, 300):
+        s.run("ln -s %s /tmp/lt/L%d" % ("a" * n, n))
+    for n, blocks in ((10, "0"), (40, "0"), (59, "0"),
+                      (60, "8"), (61, "8"), (100, "8"), (300, "8")):
+        p = "/tmp/lt/L%d" % n
+        kb = "0" if blocks == "0" else "4"
+        check("L%d: stat %%s is the target length" % n, field(s, p, "%s"),
+              str(n))
+        check("L%d: stat %%b" % n, field(s, p, "%b"), blocks)
+        check("L%d: du agrees with stat" % n,
+              s.run("du %s" % p).split()[0], kb)
+        check("L%d: ls -s agrees with both" % n,
+              s.run("ls -s %s" % p).split()[0], kb)
+
+    # -- neither pseudo filesystem charges for anything --------------------
+    v, s = sh()
+    for p in ("/proc/meminfo", "/proc/self/fd/0",
+              "/sys/class/net/eth0/address", "/sys/class/net", "/dev/null"):
+        check("%s: stat %%b" % p, field(s, p, "%b"), "0")
+        check("%s: du" % p, s.run("du %s" % p).split()[0], "0")
+        # -d, because two of these are directories and `ls -s` on one
+        # lists what is inside it.
+        check("%s: ls -sd" % p, s.run("ls -sd %s" % p).split()[0], "0")
+    out = s.run("ls -s /proc/1")
+    check("ls -s /proc/1 totals zero", out.splitlines()[0], "total 0")
+    check("and every cell in it is zero",
+          sorted(set(l.split()[0] for l in out.splitlines()[1:] if l.split())),
+          ["0"])
+
+    # -- find rounds up, for every form ------------------------------------
+    v, s = sh()
+    s.run("mkdir -p /tmp/sq")
+    SIZES = (0, 1, 512, 513, 1024, 1025, 1500, 2048, 4096, 4097, 500000,
+             1048576)
+    for n in SIZES:
+        s.run("head -c %d /dev/zero > /tmp/sq/f%d" % (n, n))
+
+    def matched(q):
+        got = s.run("cd /tmp/sq && find . -maxdepth 1 -type f -size %s "
+                    "-printf '%%f\n'" % q)
+        return sorted(got.split())
+
+    def want(q):
+        import re as _re
+        m = _re.match(r"([+-]?)(\d+)([bcwkMG]?)", q)
+        unit = {"b": 512, "": 512, "c": 1, "w": 2, "k": 1024,
+                "M": 1 << 20, "G": 1 << 30}[m.group(3)]
+        n = int(m.group(2))
+        out = []
+        for sz in SIZES:
+            blocks = (sz + unit - 1) // unit
+            ok = (blocks > n if m.group(1) == "+" else
+                  blocks < n if m.group(1) == "-" else blocks == n)
+            if ok:
+                out.append("f%d" % sz)
+        return sorted(out)
+
+    # Every one of these was compared against the guest, file for file.
+    for q in ("0", "1", "2", "1k", "-2k", "+1k", "-1M", "+0", "-1", "+1",
+              "1c", "-100c", "+512c", "-1500c", "2b", "-2b", "+1b", "-3",
+              "+2k", "1M", "-2M"):
+        check("find -size %s" % q, matched(q), want(q))
+
+    # The shape that made this visible: an apparently-small log file.
+    check("find -size -1M does not match a 292KB file",
+          s.run("find /var/log/lastlog -size -1M -printf SMALL"), "")
+    check("find -size 1M does",
+          s.run("find /var/log/lastlog -size 1M -printf ONE"), "ONE")
+
+    # -- find prints the same numbers as du, ls -s and stat ----------------
+    v, s = sh()
+    s.run("head -c 4097 /dev/zero > /tmp/p4097")
+    s.run(": > /tmp/pempty")
+    s.run("ln -s %s /tmp/plong" % ("a" * 100))
+    for path, want_str in (("/tmp/p4097", "4097|16|8|1.99951"),
+                           ("/tmp/pempty", "0|0|0|1"),
+                           ("/etc", "4096|8|4|1"),
+                           ("/etc/hostname", "6|8|4|682.667"),
+                           ("/tmp/plong", "100|8|4|40.96")):
+        check("find -printf %%s|%%b|%%k|%%S %s" % path,
+              s.run("find %s -maxdepth 0 -printf '%%s|%%b|%%k|%%S'" % path),
+              want_str)
+    check("find %b is stat -c %b",
+          s.run("find /tmp/p4097 -printf '%b'"), field(s, "/tmp/p4097", "%b"))
+    check("find %k is du",
+          s.run("find /tmp/p4097 -printf '%k'"),
+          s.run("du /tmp/p4097").split()[0])
 
     for label, got, want in FAILS:
         print("FAIL %s\n  got  %r\n  want %r" % (label, got, want))

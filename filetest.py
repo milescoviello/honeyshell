@@ -26,6 +26,19 @@ import fakeshell as fs                                          # noqa: E402
 
 
 CASES = [
+ # `file` decides text-vs-data by content, not by whether the bytes happen
+ # to decode. NUL and the other control bytes are valid UTF-8, so a file
+ # made of them came back "ASCII text" -- /etc/ld.so.cache among them, and
+ # any uploaded binary that decoded cleanly. One NUL is enough to make it
+ # data; tabs and newlines are not.
+ ("file: a NUL makes it data",
+  "printf 'hello\\0\\0world' > f; file f"),
+ ("file: control bytes make it data",
+  "printf 'abc\\001\\002def' > f; file f"),
+ ("file: plain text is text",
+  "printf 'hello world\\n' > f; file f"),
+ ("file: tabs and newlines are still text",
+  "printf 'tab\\there\\nnewline\\n' > f; file f"),
  # find -- predicates and actions
  ("find -type f",      "mkdir -p d/s; touch d/a d/s/b; find d -type f | sort"),
  # Symbolic modes. -perm took an octal string only; int(body, 8) raised on

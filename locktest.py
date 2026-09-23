@@ -191,8 +191,14 @@ check("there is exactly one runnable task", ps_r, 1,
 check("/proc/stat agrees",
       out(U, "awk '/^procs_running/{print $2}' /proc/stat").strip(),
       str(running))
-check("the total is the process count", total,
-      len([l for l in out(U, "ps -e --no-headers").splitlines() if l.strip()]))
+# loadavg's total counts tasks, so it is the THREAD count, not the process
+# count. Verified against a real kernel: loadavg 2/2551 with 719 processes
+# and 2551 threads -- an exact match on threads. This pinned the process
+# count, which held only while nothing on the box had a second thread.
+check("the total is the thread count", total,
+      sum(int(x) for x in re.findall(
+          r"^Threads:\s+(\d+)",
+          out(U, "cat /proc/[0-9]*/status 2>/dev/null"), re.M)))
 check("the last pid is not below the highest live one",
       int(la[4]) >= max(alive) if len(la) > 4 and la[4].isdigit() else False,
       True)

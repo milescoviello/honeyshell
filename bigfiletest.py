@@ -225,6 +225,37 @@ cmp -s e e2 && echo same || echo differ""").strip(), "same")
           len(shell().run("head -c 8388608 /dev/zero > f\nseq 1 5000000"))
           <= fs.MAX_OUTPUT, True)
 
+    # ---- a filter is bounded by its input, not by the generator cap ------
+    # `cat > f` truncated at exactly 4 MiB while `tee f`, handed the same
+    # bytes, wrote all of them: two ways of putting one payload on disk
+    # disagreeing by size. `cat > netai` is the idiom this box has captured
+    # fourteen times, so the file the attacker then checksums was short --
+    # the same failure as the 4 MiB exec-stdin cap, one layer further in.
+    for mb in (5, 8, 20):
+        sh = shell()
+        sh.run("cat > f", stdin="A" * (mb << 20))
+        check("cat > f keeps all %d MiB of its stdin" % mb,
+              sh.run("stat -c %s f").strip(), str(mb << 20))
+    sh = shell()
+    sh.run("tee g >/dev/null", stdin="A" * (5 << 20))
+    sh.run("cat > h", stdin="A" * (5 << 20))
+    check("cat and tee now agree on the same bytes",
+          sh.run("stat -c %s g").strip(), sh.run("stat -c %s h").strip())
+    sh = shell()
+    sh.run("tee src >/dev/null", stdin="A" * (5 << 20))
+    check("a redirected filter keeps its input too",
+          sh.run("tr A B < src > t; stat -c %s t").strip(), str(5 << 20))
+    # The exemption is only for output bounded by resident input. The thing
+    # MAX_OUTPUT exists to stop -- a generator that grows without limit --
+    # must still be stopped, including when stdin happens to be present.
+    check("an unbounded generator is still capped beside a stdin",
+          len(shell().run("seq 1 5000000", stdin="A" * 1024))
+          <= fs.MAX_OUTPUT, True)
+    sh = shell()
+    sh.run("cat > big", stdin="A" * (80 << 20))
+    check("...and the hard ceiling still binds",
+          sh.run("stat -c %s big").strip(), str(ceiling))
+
     print("\nbigfiletest: passed %d, failed %d" % (ok, bad))
     return 1 if bad else 0
 

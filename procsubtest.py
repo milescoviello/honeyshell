@@ -190,6 +190,51 @@ def t_xargs_splits_on_whitespace_like_the_real_one():
     eq("two words out of one name", out.split(), ["c", "d.txt"])
 
 
+
+def t_a_substitution_in_a_loop_body_runs_per_iteration():
+    """The loop variable has to reach the substituted command.
+
+    Resolving the substitution before the construct is recognised -- which
+    is what makes `done < <(cmd)` parse -- was applied to the whole text,
+    body included. So in
+
+        for p in a b; do diff <(dpkg -L $p) info/$p.list; done
+
+    `dpkg -L $p` ran once, up front, with $p unset: one empty file, reused
+    by every iteration. diff then reported every line of the right-hand
+    file as missing on inputs md5sum called identical, which is two
+    commands and one question. Real bash expands it per iteration.
+    """
+    out, err, rc = run('for n in one two three; do cat <(echo "[$n]"); done')
+    eq("one line per iteration, each with its own value",
+       out.split(), ["[one]", "[two]", "[three]"])
+    eq("no error", err.strip(), "")
+    eq("rc 0", rc, 0)
+
+
+def t_a_substitution_in_a_loop_body_compares_equal():
+    """The shape it was found in: diff against a real file, in a loop."""
+    z = sh()
+    run("mkdir -p /w3; printf 'a\\nb\\n' > /w3/ref.txt", z)
+    out, _e, _rc = run(
+        'for p in ref; do if diff <(printf "a\\nb\\n") /w3/$p.txt '
+        '>/dev/null 2>&1; then echo same; else echo differ; fi; done', z)
+    eq("identical content compares equal inside a loop", out.strip(), "same")
+
+
+def t_nested_loops_each_get_their_own():
+    out, _err, _rc = run('for a in 1 2; do for b in x y; do '
+                         'cat <(echo "$a$b"); done; done')
+    eq("both variables reach it", out.split(), ["1x", "1y", "2x", "2y"])
+
+
+def t_two_substitutions_in_one_condition():
+    out, _err, _rc = run('for n in a b; do if diff <(echo $n) <(echo $n) '
+                         '>/dev/null; then echo "$n-same"; else echo "$n-differ"; '
+                         'fi; done')
+    eq("a value compares equal with itself", out.split(), ["a-same", "b-same"])
+
+
 TESTS = [t_while_read_from_a_substitution, t_it_parses_at_all,
          t_a_plain_file_redirect_still_works,
          t_loop_status_after_a_substitution, t_read_side_basics,
@@ -198,7 +243,11 @@ TESTS = [t_while_read_from_a_substitution, t_it_parses_at_all,
          t_xargs_t_traces_to_stderr, t_xargs_t_with_n1,
          t_xargs_t_with_replace, t_xargs_without_t_is_quiet,
          t_xargs_basics_unchanged,
-         t_xargs_splits_on_whitespace_like_the_real_one]
+         t_xargs_splits_on_whitespace_like_the_real_one,
+         t_a_substitution_in_a_loop_body_runs_per_iteration,
+         t_a_substitution_in_a_loop_body_compares_equal,
+         t_nested_loops_each_get_their_own,
+         t_two_substitutions_in_one_condition]
 
 
 def main():

@@ -289,7 +289,13 @@ def main():
         # dropped the command; `last` is the surviving view of the same
         # question and it has to agree with who.
         lt_line = run(s, "last -1").splitlines()[0]
-        m2 = re.search(r"(\w{3} \w{3} ?\d+ \d\d:\d\d)", lt_line)
+        # `last` prints the day with %e, which space-pads to width two, so a
+        # single-digit day is "Sep  1" with *two* spaces and the 18th is
+        # "Aug 18" with one. This allowed at most one, so the check passed
+        # for twenty-two days a month and failed for the first nine. It
+        # went red at 00:18 on the 1st with the emulator printing exactly
+        # what last(1) prints.
+        m2 = re.search(r"(\w{3} \w{3} +\d+ \d\d:\d\d)", lt_line)
         check("last reports our login too", bool(m2), lt_line[:80])
         if m2:
             check("last names the user who is logged in",

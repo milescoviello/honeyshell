@@ -225,8 +225,139 @@ def t_starttime_is_not_derived_from_the_pid():
               int(young) != int((int(pid) % 97) * 100 + 250), True)
 
 
+def t_nothing_starts_at_tick_zero():
+    """No process on a real box has starttime 0, and they are staggered.
+
+    /proc/<pid>/stat field 22 is ticks-since-boot, and every process that
+    was not in the start table defaulted to the boot instant itself -- 481
+    of this box's 493 processes reporting the identical tick 0, a value no
+    real /proc ever shows. On the guest pid 1 is 8, pid 2 is 8, pid 3
+    through 27 sit at 19 while the early kernel threads come up, pid 213 is
+    111 and pid 588 is 434. The ordering is information: later pid, later
+    start.
+    """
+    s = sh()
+    zero, total, ticks = 0, 0, {}
+    for line in s.run("ls /proc").split():
+        if not line.isdigit():
+            continue
+        st = s.run("awk '{print $22}' /proc/%s/stat" % line).strip()
+        if not st.isdigit():
+            continue
+        total += 1
+        ticks[int(line)] = int(st)
+        if st == "0":
+            zero += 1
+    check("there are processes to check", total > 100, True)
+    check("no process starts at tick 0", zero, 0)
+    # The three the guest pins exactly.
+    for pid, want in ((1, 8), (2, 8), (213, 111)):
+        if pid in ticks:
+            check("pid %d starts at tick %d, as on the guest" % (pid, want),
+                  ticks[pid], want)
+    # Monotonic in pid, across every process. Without a pid wrap -- pid_max
+    # is 4194304 against a highest pid of 21435 -- a process created later
+    # cannot have started earlier, and the guest gives 0 out-of-order over
+    # all 104 of its own. This covered only the boot-time range while the
+    # workload table was ordered wrongly: the services held 21421/21428/
+    # 21435 while being the oldest things on the box, which `ps -eo
+    # pid,lstart --sort=pid` showed in one screen.
+    #
+    # Processes that predate this session only. The session's own pids are
+    # a separate, older question: this shell is 4100 while the workload
+    # sits at 21400+, so the newest process on the box holds a lower pid
+    # than things started days ago. That one is entangled with the fork
+    # counter in /proc/stat and is queued on its own.
+    up_ticks = int(float(s.run("cut -d. -f1 /proc/uptime").strip() or 0)) * 100
+    order = sorted(p for p, t in ticks.items() if up_ticks - t > 60000)
+    bad = [p for a, p in zip(order, order[1:]) if ticks[p] < ticks[a]]
+    check("starttime never decreases as pid increases", bad, [])
+    # The workload range has to be in the comparison, but not every pid in
+    # it: the hourly job is minutes old by design and drops out of the
+    # "predates this session" filter for part of each hour.
+    check("the comparison covered the workload pids",
+          max(order) > 21000, True)
+    # And the boot-time ones must not all share a value, which is what
+    # made the old behaviour visible in one glance.
+    boot = [t for p, t in ticks.items() if t < 100000]
+    check("boot-time processes are staggered, not identical",
+          len(set(boot)) > 5, True)
+
+
+def t_proc_and_ps_agree_on_age():
+    """`uptime - starttime/100` is how you age a process by hand.
+
+    It has to land on what ps says. Introducing the stagger above broke
+    this first: ps read its default from _proc_start and /proc/<pid>/stat
+    computed its own, so the two drifted apart by up to six seconds on
+    every boot-time process. One default, consulted by both.
+    """
+    # One shell pass, not a Python loop calling out per process: reading
+    # uptime once and then spending seconds in subprocess calls makes the
+    # baseline stale and every late comparison looks two seconds off. That
+    # is a measurement artifact, and it cost a false failure here first.
+    s = sh()
+    out = s.run(
+        '''up=$(cut -d. -f1 /proc/uptime); bad=0; n=0
+for d in /proc/[0-9]*; do p=${d#/proc/}
+  st=$(awk '{print $22}' $d/stat 2>/dev/null); [ -z "$st" ] && continue
+  et=$(ps -o etimes= -p $p 2>/dev/null | tr -d " "); [ -z "$et" ] && continue
+  n=$((n+1)); c=$((up - st/100)); df=$((c - et)); a=${df#-}
+  [ "$a" -gt 1 ] && bad=$((bad+1))
+done; echo "$n $bad"''')
+    parts = out.split()
+    checked = int(parts[0]) if parts and parts[0].isdigit() else 0
+    bad = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else -1
+    check("enough processes compared", checked > 50, True)
+    check("/proc and ps agree on every process's age", bad, 0)
+
+
+def t_pid_order_holds_as_the_box_ages():
+    """The ordering has to survive uptime, not just today's uptime.
+
+    This tree sits at exactly REF_UPTIME, where an age-anchored job's start
+    is still fresh; the deployed box had 15.7 days more, where the same
+    anchor has receded that far into the past. So the local check passed
+    while `ps -eo pid,lstart --sort=pid` on the live box showed pid 21435
+    starting two weeks before pid 21428 -- a check that is green here and
+    wrong there is worse than no check.
+
+    Asserted against the job table directly at several simulated uptimes,
+    because a Shell cannot be built at an arbitrary boot time without
+    disagreeing with itself about everything else.
+    """
+    import workload as wl
+    import fakeshell as F2
+    orig = F2.BOOT_TS
+    try:
+        for extra_days in (0, 1, 15.7, 60, 365):
+            F2.BOOT_TS = orig - int(extra_days * 86400)
+            rows = sorted(wl.active(), key=lambda j: j["pid"])
+            check("uptime REF+%gd: the table has jobs" % extra_days,
+                  len(rows) > 3, True)
+            bad, prev = [], None
+            for j in rows:
+                if prev is not None and j["started"] < prev - 1:
+                    bad.append(j["pid"])
+                prev = j["started"]
+            check("uptime REF+%gd: pid order tracks start order" % extra_days,
+                  bad, [])
+            # ...and a recurring job stays recurring-sized. An hourly
+            # builder reported 15.7 days of ELAPSED on the live box.
+            for j in rows:
+                if j.get("name") == "prep":
+                    age = time.time() - j["started"]
+                    check("uptime REF+%gd: the hourly job is under an hour "
+                          "old" % extra_days, age < 3700, True)
+    finally:
+        F2.BOOT_TS = orig
+
+
 def main():
-    for fn in (t_the_session_shell,
+    for fn in (t_nothing_starts_at_tick_zero,
+               t_pid_order_holds_as_the_box_ages,
+               t_proc_and_ps_agree_on_age,
+               t_the_session_shell,
                t_a_boot_time_daemon,
                t_a_process_the_attacker_launched,
                t_no_process_contradicts_itself,

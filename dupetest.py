@@ -221,9 +221,15 @@ def main():
           (0, 1))
     check("history is empty on a non-interactive shell",
           s.run("history"), "")
-    check("nohup writes nohup.out",
+    # Sweep 88 found cmd_nohup defined twice, the survivor being the one
+    # that did nothing at all -- so this check exists to prove the live
+    # definition really runs the command. It used to prove that by looking
+    # for nohup.out, which only appears when stdout is a terminal; this
+    # shell is an exec channel and has none, so the proof is now that the
+    # output comes back. A shadowing no-op definition still fails it.
+    check("nohup runs the command and its output is not lost",
           (s.run("cd /root && nohup echo hi"),
-           s.run("cat /root/nohup.out")), ("", "hi\n"))
+           s.run("cat /root/nohup.out 2>/dev/null")), ("hi\n", ""))
     check("logout is exit",
           s.dispatch("logout", [], "")[1], 0)
     check("local is local",

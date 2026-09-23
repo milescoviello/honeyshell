@@ -27,6 +27,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import re
 import fakeshell as fs                                        # noqa: E402
 
 PASS, FAIL = [], []
@@ -269,6 +270,122 @@ def t_the_live_loader_sequence_reads_cleanly():
               "Resolving" not in out, out[:160])
         check("%s: port preserved" % name, ":8080" in out, out[:160])
         check("%s: saved" % name, "saved" in out, out[-160:])
+
+
+# ------------------------------------------------------------------ 
+# A URL we could not fetch still has to behave like one file on one
+# server. The body was an ELF header padded with NULs to
+# random.randint(1200, 90000), rolled fresh on every call, so:
+#
+#     curl -o run 0: 47600 bytes     curl -I run 0: Content-Length 55111
+#     curl -o run 1:  3755 bytes     curl -I run 1: Content-Length 29130
+#     curl -o run 2: 41950 bytes
+#
+# Retrying a download is most of what a loader does, and `wget` twice
+# then `sha256sum` both is a two-line check that no amount of
+# plausible-looking output survives.
+
+def t_same_url_same_size():
+    s = sh()
+    sizes = []
+    for i in range(3):
+        run(s, "rm -f /tmp/f%d" % i)
+        run(s, "curl -s %s -o /tmp/f%d" % (URL, i))
+        sizes.append(run(s, "stat -c %%s /tmp/f%d" % i)[0].strip())
+    check("the same URL is the same size every time",
+          len(set(sizes)) == 1, "got %r" % (sizes,))
+
+
+def t_head_agrees_with_body():
+    s = sh()
+    hdr = run(s, "curl -I %s" % URL)[0]
+    m = re.search(r"Content-Length:\s*(\d+)", hdr)
+    run(s, "rm -f /tmp/b")
+    run(s, "curl -s %s -o /tmp/b" % URL)
+    body = run(s, "stat -c %s /tmp/b")[0].strip()
+    check("curl -I Content-Length is the size curl delivers",
+          bool(m) and m.group(1) == body,
+          "header %s, body %s" % (m.group(1) if m else "?", body))
+
+
+def t_url_spellings_agree():
+    # One resource. Scheme and host are case-insensitive and an empty
+    # path is "/", so these are four spellings of the same thing --
+    # 32674, 22086 and 62608 bytes before this.
+    s = sh()
+    sizes = []
+    for u in ("http://example.com", "http://example.com/",
+              "HTTP://Example.com/", "http://EXAMPLE.com"):
+        run(s, "rm -f /tmp/u")
+        run(s, "curl -s '%s' -o /tmp/u" % u)
+        sizes.append(run(s, "stat -c %s /tmp/u")[0].strip())
+    check("one resource has one size however it is spelled",
+          len(set(sizes)) == 1, "got %r" % (sizes,))
+
+
+def t_different_urls_differ():
+    s = sh()
+    got = []
+    for u in ("http://192.0.2.1/one.bin", "http://192.0.2.1/two.bin"):
+        run(s, "rm -f /tmp/v")
+        run(s, "curl -s %s -o /tmp/v" % u)
+        got.append(run(s, "stat -c %s /tmp/v")[0].strip())
+    check("different URLs are different files", got[0] != got[1],
+          "both %r" % (got[0],))
+
+
+def t_body_is_what_the_header_says():
+    # The header read the extension and the body did not, so payload.sh
+    # was announced text/plain and handed over as an ELF -- `curl URL | sh`
+    # feeding a binary to a shell -- while a stage named x86_64, having no
+    # dot, was announced as a web page.
+    s = sh()
+    for url, ctype, want in (
+            ("http://192.0.2.1/pl.sh", "text/plain", "shell script"),
+            ("http://192.0.2.1/x86_64", "application/octet-stream", "ELF"),
+            ("http://192.0.2.1/index.html", "text/html", "HTML document"),
+            ("http://example.com/", "text/html", "HTML document")):
+        hdr = run(s, "curl -I %s" % url)[0]
+        run(s, "rm -f /tmp/t")
+        run(s, "curl -s %s -o /tmp/t" % url)
+        kind = run(s, "file /tmp/t")[0]
+        check("%s is announced %s" % (url.rsplit("/", 1)[-1] or "/", ctype),
+              ctype in hdr, hdr.splitlines()[:6])
+        check("%s is delivered as %s" % (url.rsplit("/", 1)[-1] or "/", want),
+              want in kind, kind.strip()[:70])
+
+
+def t_file_names_markup():
+    # Verified against file 5.46 on three shapes -- a doctype, a bare
+    # <html>, and leading blank lines -- all "HTML document, ASCII text".
+    s = sh()
+    run(s, "printf '<!DOCTYPE html>\\n<html><body>hi</body></html>\\n' > /tmp/h1")
+    run(s, "printf '<html>\\n<body>hi</body></html>\\n' > /tmp/h2")
+    run(s, "printf '<?xml version=\"1.0\"?>\\n<root/>\\n' > /tmp/h3")
+    run(s, "printf 'plain text here\\n' > /tmp/h4")
+    check("file names an HTML document",
+          "HTML document, ASCII text" in run(s, "file /tmp/h1")[0],
+          run(s, "file /tmp/h1")[0].strip())
+    check("file names a bare <html> too",
+          "HTML document, ASCII text" in run(s, "file /tmp/h2")[0],
+          run(s, "file /tmp/h2")[0].strip())
+    check("file names an XML document",
+          "XML 1.0 document, ASCII text" in run(s, "file /tmp/h3")[0],
+          run(s, "file /tmp/h3")[0].strip())
+    check("file still calls plain text plain",
+          run(s, "file /tmp/h4")[0].strip().endswith("ASCII text"),
+          run(s, "file /tmp/h4")[0].strip())
+
+
+def t_wget_agrees_with_curl():
+    s = sh()
+    run(s, "rm -f /tmp/c1 /tmp/w1")
+    run(s, "curl -s %s -o /tmp/c1" % URL)
+    run(s, "wget -q -O /tmp/w1 %s" % URL)
+    a = run(s, "stat -c %s /tmp/c1")[0].strip()
+    b = run(s, "stat -c %s /tmp/w1")[0].strip()
+    check("wget and curl fetch the same file", a == b and a != "",
+          "curl %s, wget %s" % (a, b))
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]

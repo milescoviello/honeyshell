@@ -203,22 +203,47 @@ def t_timeout_reports_that_it_timed_out():
 
 
 def t_nohup_writes_the_file_it_announces():
+    """Whatever nohup announces has to be true -- in both directions.
+
+    The original defect was a notice naming nohup.out beside no such file.
+    The fix for that was applied unconditionally, which is the same defect
+    mirrored: on a channel with no terminal, real nohup announces nothing
+    and creates nothing, so creating the file was a claim nobody made.
+    Measured on the guest over a channel with no tty, `nohup echo hello`
+    prints hello, writes no file and says nothing.
+
+    So the invariant is checked on both sides: notice and file appear
+    together, or neither does.
+    """
+    # sh() is an exec channel: exec_mode is set, so there is no terminal.
     s = sh()
     run(s, "rm -f /root/nohup.out")
     o, rc = run(s, "cd /root && nohup echo hello")
     eq("nohup rc", rc, 0)
-    check("the notice names nohup.out", "appending output to 'nohup.out'" in o,
-          o[:90])
-    eq("the command's output is not on stdout", "hello" in o.split("\n")[0],
-       False)
-    body, rc = run(s, "cat /root/nohup.out")
-    eq("the output is in the file", body, "hello\n")
-    ls, _ = run(s, "ls -l /root/nohup.out")
-    check("and the file is 0600, as GNU nohup creates it",
-          ls.startswith("-rw-------"), ls[:40])
-    run(s, "cd /root && nohup echo second")
+    eq("no tty: no notice", "appending output to" in o, False)
+    eq("no tty: the output comes back", o.strip(), "hello")
     body, _ = run(s, "cat /root/nohup.out")
-    eq("a second run appends", body, "hello\nsecond\n")
+    eq("no tty: no file was created", "No such file" in body, True)
+
+    # The same shell with a terminal, where nohup does take stdout over.
+    t = sh()
+    t.exec_mode = False
+    run(t, "rm -f /root/nohup.out")
+    o, rc = run(t, "cd /root && nohup echo hello")
+    eq("tty: nohup rc", rc, 0)
+    check("tty: the notice names nohup.out",
+          "appending output to 'nohup.out'" in o, o[:90])
+    eq("tty: the command's output is not on stdout",
+       "hello" in o.split("\n")[0], False)
+    body, rc = run(t, "cat /root/nohup.out")
+    eq("tty: the output is in the file", body, "hello\n")
+    ls, _ = run(t, "ls -l /root/nohup.out")
+    check("tty: and the file is 0600, as GNU nohup creates it",
+          ls.startswith("-rw-------"), ls[:40])
+    run(t, "cd /root && nohup echo second")
+    body, _ = run(t, "cat /root/nohup.out")
+    eq("tty: a second run appends", body, "hello\nsecond\n")
+
     o, rc = run(s, "nohup")
     eq("no operand is rc 125", rc, 125)
     check("with nohup's wording", "missing operand" in o, o[:70])

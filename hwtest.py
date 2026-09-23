@@ -135,17 +135,32 @@ def t_a_vga_controller_has_a_drm_device():
 
 
 def t_no_gpu_is_still_no_gpu():
-    """The honest half: there is no accelerator here, and the tools that
-    would report one are not installed."""
+    """The accelerator answer, whatever it is, has to be the same answer
+    everywhere: the tool, the bus and the device nodes agree or the box is
+    lying to itself.
+
+    This used to assert there was no accelerator, which was true. The
+    persona now carries eight cards, so the assertion inverts -- but the
+    invariant does not, and it is the invariant that is worth testing: a
+    tool that reports GPUs the bus does not show, or device nodes with no
+    driver behind them, is what gives a fake away.
+    """
     s = sh()
-    for c in ("nvidia-smi", "rocm-smi"):
-        o, rc = run(s, c)
-        eq("%s is not installed" % c, rc, 127)
-        check("command not found", "command not found" in o, o[:60])
+    import nvidia
+    o, rc = run(s, "nvidia-smi")
+    eq("nvidia-smi runs", rc, 0)
     o2, _ = run(s, "lspci | grep -ci nvidia")
-    eq("no nvidia device on the bus", o2.strip(), "0")
+    eq("the bus shows the cards nvidia-smi claims",
+       int(o2.strip()), nvidia.GPU_COUNT * 2)      # each card is GPU + audio
+    eq("nvidia-smi lists that many",
+       len(run(s, "nvidia-smi -L")[0].strip().split("\n")), nvidia.GPU_COUNT)
     o3, _ = run(s, "ls /dev/nvidia0 2>/dev/null; echo rc=$?")
-    check("and no device node", "rc=1" in o3 or "rc=2" in o3, o3[:40])
+    check("and there is a device node for the first", "rc=0" in o3, o3[:40])
+    # rocm-smi is still absent: these are NVIDIA cards, and a box that
+    # answers for both vendors at once is not a box.
+    o4, rc4 = run(s, "rocm-smi")
+    eq("rocm-smi is not installed", rc4, 127)
+    check("command not found", "command not found" in o4, o4[:60])
 
 
 # --- dmidecode --------------------------------------------------------------
@@ -203,8 +218,27 @@ def t_memory_table_matches_the_kernel():
     mb = int(re.search(r"(\d+) MB", o).group(1))
     o2, _ = run(s, "grep MemTotal /proc/meminfo")
     kb = int(re.search(r"(\d+)", o2).group(1))
-    check("the DIMM is a little larger than MemTotal, as it always is",
-          kb // 1024 <= mb <= kb // 1024 + 64, "%d MB vs %d kB" % (mb, kb))
+    # This allowed the DIMM to be at most 64 MB above MemTotal, which on a
+    # 1 TB box is 0.006% -- it was pinning a 13 MB fudge that the DMI size
+    # used to be computed with. DMI describes installed DIMMs; MemTotal is
+    # what the kernel keeps after firmware and its own reservations, and
+    # the gap is a percent or two. Measured on a real 32 GiB machine:
+    #
+    #     MemTotal            32,791,452 kB   (97.7% of installed)
+    #     kernel Memory:      32,648,308K / 33,485,212K
+    #     installed           33,554,432 kB   (32 GiB)
+    #
+    # so MemTotal sits 2.3% below the DIMM there. The band below spans
+    # that and stays tight enough to catch a DIMM size that is really
+    # MemTotal wearing a hat, which is what it was.
+    _dimm = mb * 1024
+    # A floor as well as a ceiling: "larger by any amount at all" still
+    # passed the old MemTotal-plus-13-MB value, which is the exact thing
+    # this is meant to reject.
+    check("the DIMM is larger than MemTotal, by a percent or two",
+          kb * 1.005 <= _dimm <= kb * 1.05,
+          "%d MB (%d kB) vs MemTotal %d kB -- %.2f%% larger"
+          % (mb, _dimm, kb, 100.0 * (_dimm - kb) / kb))
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]

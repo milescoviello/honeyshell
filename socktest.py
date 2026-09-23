@@ -258,13 +258,32 @@ def t_socket_ownership_is_named_not_numeric():
 # -- the TCP side must not have moved ------------------------------------
 
 def t_tcp_views_still_agree():
+    """Both tables, not just the v4 one.
+
+    This counted /proc/net/tcp alone against the whole of `ss -tan`, which
+    was right only while nothing here bound IPv6. sshd binds both, so the
+    kernel keeps two tables and the commands print one merged list -- and
+    comparing the merged list to half the kernel's view makes the suite
+    fail for the one reason it should not: the box getting more correct.
+    """
     proc, _ = run("cat /proc/net/tcp")
-    nproc = len([l for l in proc.splitlines() if re.match(r"^\s*\d+:", l)])
+    proc6, _ = run("cat /proc/net/tcp6")
+    rowre = re.compile(r"^\s*\d+:")
+    nproc = len([l for l in proc.splitlines() if rowre.match(l)])
+    nproc6 = len([l for l in proc6.splitlines() if rowre.match(l)])
     nss = len([l for l in lines("ss -tan")
                if l.startswith(("LISTEN", "ESTAB"))])
     nnet = len([l for l in lines("netstat -tan") if l.startswith("tcp")])
-    eq("ss -tan vs /proc/net/tcp", nss, nproc)
-    eq("netstat -tan vs /proc/net/tcp", nnet, nproc)
+    eq("ss -tan vs /proc/net/tcp + tcp6", nss, nproc + nproc6)
+    eq("netstat -tan vs /proc/net/tcp + tcp6", nnet, nproc + nproc6)
+    # ...and each family lines up with its own table, which is the part
+    # the merged count cannot catch.
+    eq("ss -6 matches /proc/net/tcp6",
+       len([l for l in lines("ss -tan -6")
+            if l.startswith(("LISTEN", "ESTAB"))]), nproc6)
+    eq("netstat's tcp6 rows match it too",
+       len([l for l in lines("netstat -tan") if l.startswith("tcp6")]),
+       nproc6)
 
 
 def t_listeners_unchanged():

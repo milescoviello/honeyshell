@@ -23,6 +23,7 @@ Run from `honeypot/`, or on the guest.
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -143,8 +144,18 @@ def t_packages_the_files_imply():
     out, rc = run(s, "busybox")
     check("busybox absent, as on the real image",
           rc == 127 and "command not found" in out, out[:60])
+    # Absent from the disk is not absent from dpkg. This asserted rc 1 and
+    # "no packages found", which is what dpkg says about a name it has never
+    # heard of -- but something on a stock trixie image Recommends busybox,
+    # so dpkg keeps a stub for it and answers with an `un` row and rc 0.
+    # Measured on the guest itself, three times. The claim this check exists
+    # to make is that busybox is not *installed*, and the observable for that
+    # is the status column, not the exit status.
     out, rc = run(s, "dpkg -l busybox")
-    check("no busybox package", rc == 1, out[:60])
+    rows = [l for l in out.splitlines() if l.startswith(("ii ", "un "))]
+    check("dpkg answers about busybox at all", rc == 0, "rc=%s %s" % (rc, out[:50]))
+    check("busybox is known to dpkg but not installed",
+          [r.split()[0] for r in rows], ["un"])
 
 
 def t_dpkg_l_is_sorted():
@@ -304,12 +315,233 @@ def t_blob_reads_are_stable():
     eq("initrd delivers its declared size", out.strip(), "18240555")
 
 
+def t_dmesg_describes_the_hardware_the_box_claims():
+    """The boot log and every other reader, on the same hardware.
+
+    dmesg said the disk was 64 GiB -- "[sda] 134217728 512-byte logical
+    blocks: (68.7 GB/64.0 GiB)" -- while /sys/block/sda/size, lsblk, fdisk
+    and /proc/partitions all said 1.8 TiB. Not merely stale: sda1 alone is
+    3,861,954,560 sectors, twenty-nine times larger than the disk dmesg
+    described it as sitting on, so two lines of one log contradict each
+    other. It was a survivor of the 63 GiB persona, the same way
+    ROOT_INODES was until that was caught.
+
+    And the log knew about sda and nothing else: `dmesg | grep -iE
+    "nvme|nvidia"` was empty on a box whose df shows a 28 T NVMe volume and
+    whose nvidia-smi lists eight cards.
+    """
+    s = sh()
+    line = run(s, "dmesg | grep 'logical blocks'")[0].strip()
+    sectors = run(s, "cat /sys/block/sda/size")[0].strip()
+    check("dmesg's sector count is /sys/block/sda/size",
+          sectors and sectors in line, "%r vs sysfs %s" % (line[-60:], sectors))
+    fd = run(s, "fdisk -l 2>/dev/null | head -1")[0]
+    check("...and fdisk agrees on the same count",
+          sectors and sectors in fd, fd.strip()[:70])
+    check("dmesg prints the kernel's dual units",
+          " TB/" in line and " TiB)" in line, line.strip()[-40:])
+    # a partition cannot be bigger than its disk
+    p1 = run(s, "cat /sys/block/sda/sda1/size")[0].strip()
+    check("sda1 fits inside sda",
+          p1.isdigit() and sectors.isdigit() and int(p1) <= int(sectors),
+          "sda1 %s vs sda %s" % (p1, sectors))
+
+    # the other disk and the cards
+    check("dmesg mentions the nvme disk",
+          "nvme0" in run(s, "dmesg | grep -c nvme")[0] or
+          int(run(s, "dmesg | grep -ci nvme")[0].strip() or 0) > 0,
+          run(s, "dmesg | grep -i nvme | head -1")[0][:60])
+    ngpu = run(s, "nvidia-smi -L | wc -l")[0].strip()
+    nprobe = run(s, "dmesg | grep -c 'enabling device'")[0].strip()
+    eq("one dmesg probe line per GPU", nprobe, ngpu)
+    drv = run(s, "nvidia-smi --query-gpu=driver_version "
+                 "--format=csv,noheader | head -1")[0].strip()
+    check("dmesg's NVRM version is nvidia-smi's",
+          drv and drv in run(s, "dmesg | grep NVRM")[0],
+          "smi %s vs %r" % (drv, run(s, "dmesg | grep NVRM")[0][-40:]))
+    # every address dmesg probes is one lspci knows
+    for bus in run(s, "dmesg | grep 'enabling device' "
+                      "| grep -oE '[0-9a-f]{2}:00[.]0'")[0].split():
+        check("lspci knows %s" % bus,
+              bus in run(s, "lspci | grep -i nvidia")[0], bus)
+
+
+def t_the_firmware_and_the_kernel_agree_about_ram():
+    """The e820 map, the kernel's Memory: line, DMI and MemTotal.
+
+    The map was a stock small-VM one: two usable spans totalling 2.00 GiB,
+    ceilinged at 0x7fffffff, under a MemTotal of 1008 GiB. A 504x
+    discrepancy between the firmware's account of the machine and the
+    kernel's -- and `dmesg | grep usable` beside `free -h` is two commands
+    anyone runs. The kernel's own "Memory: 1987340K/2097152K available"
+    carried the same stale 2 GiB.
+
+    Three separate statements about installed RAM now come off one
+    constant: the e820 spans, the Memory: line's total, and DMI's DIMM
+    size. MemTotal is what the kernel keeps after its reservations, so it
+    is strictly less than all three -- which is the real relationship, and
+    the one the old numbers had backwards by a factor of five hundred.
+    """
+    import re as _re
+    s = sh()
+    dm = run(s, "dmesg")[0]
+    usable = 0
+    top = 0
+    for line in dm.splitlines():
+        m = _re.search(r"BIOS-e820: \[mem 0x([0-9a-f]+)-0x([0-9a-f]+)\] usable",
+                       line)
+        if m:
+            a, b = int(m.group(1), 16), int(m.group(2), 16)
+            usable += b - a + 1
+            top = max(top, b)
+    check("the e820 map has usable spans", usable > 0, str(usable))
+    mt_k = 0
+    m = _re.search(r"MemTotal:\s+(\d+) kB", run(s, "cat /proc/meminfo")[0])
+    if m:
+        mt_k = int(m.group(1))
+    check("MemTotal is not larger than the firmware's RAM",
+          mt_k * 1024 <= usable,
+          "MemTotal %d kB vs e820 %d bytes" % (mt_k, usable))
+    check("...and is within a few percent of it",
+          usable and abs(usable - mt_k * 1024) < usable * 0.05,
+          "e820 %.1f GiB vs MemTotal %.1f GiB"
+          % (usable / 1024.0 ** 3, mt_k / 1024.0 ** 2))
+    check("the map reaches above the 4 GiB hole on a box this size",
+          top > 0x100000000,
+          "tops out at 0x%x" % top)
+    # the kernel's own line: available/total, in K
+    m = _re.search(r"Memory: (\d+)K/(\d+)K available", dm)
+    check("dmesg states a Memory: available/total", bool(m),
+          [l for l in dm.splitlines() if "Memory:" in l][:1])
+    if m:
+        avail, total = int(m.group(1)), int(m.group(2))
+        eq("its available figure is MemTotal", avail, mt_k)
+        eq("its total is the e820 usable", total * 1024, usable)
+    # DMI describes the DIMMs, so it is physical and above MemTotal
+    m = _re.search(r"Size: (\d+) MB",
+                   run(s, "dmidecode -t memory 2>/dev/null")[0])
+    check("dmidecode reports a DIMM size", bool(m), "no Size: line")
+    if m:
+        dmi = int(m.group(1)) * 1024 * 1024
+        eq("DMI's size is the firmware's RAM", dmi, usable)
+        check("...and is above MemTotal, not equal to it",
+              dmi > mt_k * 1024,
+              "dmi %d vs MemTotal %d" % (dmi, mt_k * 1024))
+    # and free still speaks for the kernel, not the firmware
+    fr = run(s, "free -b")[0].splitlines()
+    if len(fr) > 1:
+        eq("free's total is MemTotal", fr[1].split()[1], str(mt_k * 1024))
+
+
+def t_kernel_timestamps_carry_entropy():
+    """dmesg's fractional seconds, and one spelling per message.
+
+    The jitter on every recurring runtime line was a whole number of
+    seconds added to a base whose fraction never moved, so every
+    SYN-flood line in the ring buffer ended .118000, every net_ratelimit
+    ended .118418 -- exactly 418us after its parent, every single time --
+    and every systemd-ssh-generator line ended .913000. A real kernel's
+    jiffies-to-microseconds conversion does not repeat like that, and
+    `dmesg | awk -F. '{print $2}' | sort | uniq -c` is one line to run.
+
+    Early boot is the exception and stays one: a real kernel really does
+    stamp a run of the first messages at exactly 0.000000.
+    """
+    import re as _re
+    import collections as _c
+    s = sh()
+    dm = run(s, "dmesg")[0]
+    stamped = []
+    for line in dm.splitlines():
+        m = _re.match(r"\[\s*(\d+)\.(\d{6})\]", line)
+        if m:
+            stamped.append((int(m.group(1)) + int(m.group(2)) / 1e6,
+                            m.group(2), line))
+    check("dmesg is timestamped", len(stamped) > 50, str(len(stamped)))
+    counts = _c.Counter(f for _t, f, _l in stamped)
+    repeats = [(f, n) for f, n in counts.items() if n > 1 and f != "000000"]
+    check("no fraction repeats except the boot instant", repeats == [],
+          "repeated: %r" % (sorted(repeats, key=lambda x: -x[1])[:4],))
+    check("most fractions are distinct",
+          len(counts) >= 0.8 * len(stamped),
+          "%d distinct of %d lines" % (len(counts), len(stamped)))
+    # the follow-on line is close to its parent, but not identically close
+    gaps = []
+    for i, (tv, _f, line) in enumerate(stamped):
+        if "net_ratelimit" in line and i > 0:
+            gaps.append(round((tv - stamped[i - 1][0]) * 1e6))
+    check("there are net_ratelimit lines to check", len(gaps) >= 3, str(gaps))
+    if gaps:
+        check("each follows its parent by a different interval",
+              len(set(gaps)) == len(gaps), "gaps %r" % (sorted(gaps)[:6],))
+        check("...and all of them within a millisecond",
+              all(0 < g < 1000 for g in gaps), "gaps %r" % (sorted(gaps)[:6],))
+    # one spelling of one kernel message
+    # Anchored on the trailing " Sending", not a lazy \S+? -- the lazy
+    # form matched just the leading "0" of "0.0.0.0:22", which is a digit,
+    # so the check passed on the very output it exists to reject.
+    ports = set(_re.findall(
+        r"Possible SYN flooding on port (\S+)\. Sending", dm))
+    check("the SYN-flood line has one port format",
+          all(p.isdigit() for p in ports), "ports seen: %r" % (sorted(ports),))
+
+
+def t_kernel_config_is_the_real_one():
+    """/boot/config was generated, and one grep found it out.
+
+    The file was built to the right head and the right size on the
+    reasoning that nothing else about it is observable. The size was exact
+    -- 132555 bytes, measured off the guest's own copy -- and the head was
+    right. The body was 6168 lines of CONFIG_<WORD>_<random number>, of
+    which 1211 ended "=n".
+
+    A real kernel config never writes =n: a disabled option is written
+    `# CONFIG_X is not set`. The generated file had 1211 of the first and
+    none of the second; the reference has none of the first and 1253 of
+    the second. Nor does any real symbol carry a bare number for a suffix
+    -- an independent 12420-line config has zero.
+
+    The guest runs Debian 13 and carries this exact file, same version and
+    same cloud flavour, so it is stored rather than imitated.
+    """
+    s = sh()
+    path = "/boot/config-" + fs.KERNEL
+    body, rc = run(s, "cat %s" % path)
+    eq("the config reads", rc, 0)
+    eq("...at the length the real one has", len(body), 132555)
+    lines = body.split("\n")
+    eq("no option is written =n, which kconfig never emits",
+       [l for l in lines if l.endswith("=n")], [])
+    check("disabled options use the form kconfig does write",
+          body.count("is not set") == 1253, body.count("is not set"))
+    # Not "no numeric suffix": real symbols carry them -- CONFIG_X86_64,
+    # CONFIG_HZ_250, CONFIG_SERIAL_8250 -- and the reference has 14 with
+    # four digits or more. The generated ones were random draws from
+    # 1000-99999 glued to an 18-word prefix list, and what actually
+    # distinguishes the file is that the real symbols are *there*.
+    # A generated config cannot answer a grep for one.
+    for sym, want in (("CONFIG_KVM_GUEST", "y"), ("CONFIG_64BIT", "y"),
+                      ("CONFIG_EXT4_FS", "y"), ("CONFIG_VIRTIO_PCI", "y"),
+                      ("CONFIG_HYPERVISOR_GUEST", "y")):
+        out, _ = run(s, "grep '^%s=' %s" % (sym, path))
+        eq("%s is present and set" % sym, out.strip(), "%s=%s" % (sym, want))
+    # And the one that settles the sound question: the cloud kernel has no
+    # HDA support at all, which is why lsmod, /proc/asound and /dev/snd
+    # carry none of it.
+    out, rc2 = run(s, "grep -c CONFIG_SND_HDA_INTEL %s" % path)
+    eq("the cloud kernel has no HDA sound", out.strip(), "0")
+
+
 TESTS = [t_boot_files, t_system_map_is_the_stub, t_file_magic,
+         t_kernel_config_is_the_real_one,
          t_dpkg_owns_what_it_shipped, t_packages_the_files_imply,
          t_dpkg_l_is_sorted, t_esp_agrees_everywhere, t_findmnt_semantics,
          t_mountpoint_semantics, t_every_mount_resolves,
          t_cmdline_points_at_a_real_kernel, t_grub_config_is_coherent,
-         t_blob_reads_are_stable]
+         t_blob_reads_are_stable,
+         t_dmesg_describes_the_hardware_the_box_claims,
+         t_the_firmware_and_the_kernel_agree_about_ram,
+         t_kernel_timestamps_carry_entropy]
 
 
 def main():

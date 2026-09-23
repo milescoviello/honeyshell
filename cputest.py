@@ -153,7 +153,7 @@ def t_the_caches_lscpu_names_are_in_sysfs():
     out, _ = run(s, "ls /sys/devices/system/cpu/cpu0/cache/")
     eq("four cache indices", sorted(out.split()),
        ["index0", "index1", "index2", "index3"])
-    for idx, (lvl, typ, size, ways, sets, shared) in enumerate(
+    for idx, (lvl, typ, size, ways, sets, cores_per) in enumerate(
             fs.CPU_CACHES):
         base = "/sys/devices/system/cpu/cpu0/cache/index%d" % idx
         for fname, want in (("level", str(lvl)), ("type", typ),
@@ -163,19 +163,33 @@ def t_the_caches_lscpu_names_are_in_sysfs():
                             ("coherency_line_size", "64")):
             o, rc = run(s, "cat %s/%s" % (base, fname))
             eq("index%d/%s" % (idx, fname), (o.strip(), rc), (want, 0))
+        # The sharing domain, not a boolean: an SMT pair for L1/L2 and a
+        # whole CCD for L3. Derived from the same helper sysfs uses, so a
+        # change to the topology has to move both or fail here.
         o, _ = run(s, "cat %s/shared_cpu_list" % base)
         eq("index%d is shared correctly" % idx, o.strip(),
-           ("0-%d" % (fs.NCPU - 1)) if shared else "0")
+           fs._cpu_range_list(fs._cache_group(0, cores_per)[1]))
 
 
 def t_lscpu_cache_lines_match_the_geometry():
     """Sizes lscpu prints are per-instance size times instance count."""
     s = sh()
     out, _ = run(s, "lscpu")
-    for label, want in (("L1d cache", "128 KiB (4 instances)"),
-                        ("L1i cache", "128 KiB (4 instances)"),
-                        ("L2 cache", "1 MiB (4 instances)"),
-                        ("L3 cache", "25 MiB (1 instance)")):
+    # Derived from the same table sysfs renders from, so this cannot be
+    # tuned to one persona: L1/L2 are per core and L3 is per CCD.
+    def _want(idx):
+        lvl, _t, size, _w, _s, cores_per = fs.CPU_CACHES[idx]
+        per = int(str(size).rstrip("K") or 0)
+        inst = max(1, fs.CPU_CORES // cores_per)
+        tot = per * inst
+        txt = ("%d MiB" % (tot // 1024)) if tot >= 1024 and tot % 1024 == 0 \
+            else "%d KiB" % tot
+        return "%s (%d instance%s)" % (txt, inst, "" if inst == 1 else "s")
+
+    for label, want in (("L1d cache", _want(0)),
+                        ("L1i cache", _want(1)),
+                        ("L2 cache", _want(2)),
+                        ("L3 cache", _want(3))):
         m = re.search(r"^%s:\s+(.+)$" % re.escape(label), out, re.M)
         check("%s is reported" % label, m, out[:60])
         if m:
@@ -202,6 +216,45 @@ def t_the_vulnerability_block_is_backed_by_sysfs():
             eq("and it matches sysfs: %s" % name, m.group(1).strip(), value)
 
 
+def t_the_kernel_this_box_claims_knows_tsa_and_vmscape():
+    """Two mitigations were missing and the gap looked defensible.
+
+    The reference guest does not have them either -- it runs 6.12.107 on
+    an Intel KVM CPU and reports both "Not affected" -- so comparing the
+    two boxes said "two lines apart, different kernels, fine". The
+    kernel's own Debian changelog settles it: VMSCAPE landed in 6.12.48-1
+    and TSA in 6.12.37-1, and this box claims 6.12.101-1.
+
+    The value is not a guess either. common.c at v6.12.101 carries
+    VULNBL_AMD(0x19, SRSO | TSA | VMSCAPE) and this box reports cpu family
+    25 -- 0x19 -- which is the same entry that already gives it Safe RET
+    for SRSO. A CPU flagged for one of the three is flagged for all three,
+    so reporting SRSO and not the other two was the contradiction.
+    """
+    s = sh()
+    names = dict(fs.CPU_VULNS)
+    for n in ("tsa", "vmscape"):
+        check("%s is in the table" % n, n in names, sorted(names))
+    # The strings are the kernel's own, out of bugs.c at v6.12.101.
+    eq("tsa is the FULL mitigation", names.get("tsa"),
+       "Mitigation: Clear CPU buffers")
+    eq("vmscape is the AMD exit-to-user path", names.get("vmscape"),
+       "Mitigation: IBPB before exit to userspace")
+    # The premise: this box is family 0x19, which is why it gets all three.
+    out, _ = run(s, "grep -m1 '^cpu family' /proc/cpuinfo")
+    eq("cpu family is 0x19", out.split(":")[-1].strip(), "25")
+    check("...and SRSO is mitigated, from the same VULNBL_AMD entry",
+          names.get("spec_rstack_overflow", "").startswith("Mitigation:"),
+          names.get("spec_rstack_overflow"))
+    # Both readers, and the count the guest shows.
+    out, _ = run(s, "ls /sys/devices/system/cpu/vulnerabilities/")
+    eq("sysfs holds seventeen", len(out.split()), 17)
+    lscpu, _ = run(s, "lscpu")
+    vl = [l for l in lscpu.split("\n") if l.startswith("Vulnerability")]
+    eq("lscpu prints seventeen", len(vl), 17)
+    eq("sysfs is listed in sorted order", out.split(), sorted(out.split()))
+
+
 def t_the_cpu_count_is_the_same_everywhere():
     """Five views of one number, which is what a miner sizes itself by."""
     s = sh()
@@ -211,7 +264,10 @@ def t_the_cpu_count_is_the_same_everywhere():
        str(n))
     eq("getconf", run(s, "getconf _NPROCESSORS_ONLN")[0].strip(), str(n))
     eq("sysfs cpu dirs",
-       run(s, "ls -d /sys/devices/system/cpu/cpu[0-9] | wc -l")[0].strip(),
+       # cpu[0-9] matches cpu0..cpu9 and nothing else, so this counted 10
+       # of 192 and would have counted 4 of 4 on the old persona purely by
+       # luck. The trailing * is the whole point of the check.
+       run(s, "ls -d /sys/devices/system/cpu/cpu[0-9]* | wc -l")[0].strip(),
        str(n))
     eq("lscpu -p row count",
        run(s, "lscpu -p | grep -vc '^#'")[0].strip(), str(n))

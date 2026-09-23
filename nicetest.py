@@ -171,7 +171,10 @@ def t_taskset_names_the_right_pid():
     s = shell()
     for pid in (701, 884, 1):
         eq("taskset -p %d" % pid, out(s, "taskset -p %d" % pid),
-           "pid %d's current affinity mask: f" % pid)
+           # One f per four CPUs: the mask is the machine's width, so a
+           # literal here only ever suited the CPU count it was written for.
+           "pid %d's current affinity mask: %s"
+           % (pid, "f" * (fs.NCPU // 4)))
 
 
 def t_the_mask_matches_the_cpu_count():

@@ -70,6 +70,27 @@ CASES = [
     "cd {D} && echo *.txt",
     "cd {D} && echo *",
     "cd {D} && ls *.log",
+    # A quoted *prefix* does not stop the unquoted tail from globbing.
+    # 203.0.113.24's RedTail loader is built on this exact idiom --
+    # `mv -f "$CURR"/redtail.* "$i"` -- and every word containing a quote
+    # anywhere in it was being exempted from expansion wholesale, so the
+    # loader was handed the literal string and its own install failed on a
+    # box where a real shell would have worked. Quoting exempts the
+    # characters inside the quotes, not the word.
+    'C={D}; echo "$C"/*.txt',
+    'C={D}; echo "$C"/x?',
+    'C={D}; echo "$C"/[a-c]*',
+    'C={D}; echo "$C"/nomatch*',
+    'echo "{D}"/*.txt',
+    'C={D}; echo "$C"/*.txt "$C"/*.log',
+    # ...and the other direction: a metacharacter that really is inside the
+    # quotes stays literal, which is what makes the fix safe.
+    'echo "*"',
+    "echo '*'",
+    'C="{D}/*.txt"; echo "$C"',
+    'C="{D}/*.txt"; echo $C',
+    'echo "?"',
+    'echo "[abc]"'
 ]
 
 

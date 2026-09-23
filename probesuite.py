@@ -107,8 +107,19 @@ def invariants():
     # binary on the disk answers with *silent success*, which is the failure
     # mode that corrupts a capture without anyone noticing. One without a
     # handler must fail loudly: non-empty stderr and a non-zero status.
+    #: ...with the exception of the ones where silent success is the real
+    #: answer. A pager with no file pages its stdin, and an empty stdin is
+    #: nothing to page. Measured in a debian:trixie container with the real
+    #: package: `less </dev/null` is rc 0 and no output, `echo piped | less`
+    #: is rc 0 and "piped". This invariant used to pass on `pager` only
+    #: because less had no implementation and the stock-binary answer
+    #: printed a version banner at anything -- so for that one name it was
+    #: asserting that less did not work.
+    SILENT_IS_REAL = ("pager", "less", "php")
     silent = []
     for name in sorted(listed):
+        if name in SILENT_IS_REAL:
+            continue
         # Dispatch normalises a dot the same way it normalises a dash --
         # update-rc.d and python3.13 are both real command names -- so the
         # exclusion has to normalise it too, or a command that does have a
@@ -284,12 +295,26 @@ def invariants():
         text = _re.sub(r"\d+", "N", text)
         return _re.sub(r"[A-Za-z0-9]{8,}", "X", text)
 
-    for nm, full in sorted(listed.items()):
+    def _pair(nm, full):
         a = fs.Shell(); a.exec_mode = True
         oa, ea = a.run(nm), "".join(a._err)
         b = fs.Shell(); b.exec_mode = True
         ob, eb = b.run(full), "".join(b._err)
-        if (_shape(oa), _shape(ea)) != (_shape(ob), _shape(eb)):
+        return (_shape(oa), _shape(ea)) == (_shape(ob), _shape(eb))
+
+    for nm, full in sorted(listed.items()):
+        # _shape masks digits and hex, but not the number of LINES, and
+        # some of these commands produce output that grows with the clock
+        # -- journalctl gains an entry, and the bare and absolute-path
+        # invocations are two separate runs. Under the parallel pool the
+        # gap between them is wide enough for that to happen, which is why
+        # this reported "differ by absolute path: journalctl" in the gate
+        # and passed every time it was run alone.
+        #
+        # A real difference between `foo` and `/usr/bin/foo` is
+        # deterministic; a clock race is not. One retry tells them apart
+        # without weakening the check.
+        if not _pair(nm, full) and not _pair(nm, full):
             path_diff.append(nm)
     if path_diff:
         persona.append("differ by absolute path: %s" % " ".join(path_diff[:8]))

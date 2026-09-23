@@ -332,7 +332,75 @@ def t_reload_keeps_the_current_pids():
     eq("reload changed nothing", pids(s), before)
 
 
-TESTS = [t_ps_and_proc_agree_on_the_count,
+def t_an_unprivileged_user_cannot_signal_root():
+    """This box let anyone kill anything.
+
+    As deploy, `kill -9 1` returned 0 with no message at all, and so did
+    killing the persona's own training workers -- the processes every
+    competitor-hunting dropper goes after. Real Linux answers EPERM, and
+    bash's builtin words it "(PID) - Operation not permitted", with the
+    dash rather than the colon /bin/kill uses; measured on the guest.
+
+    Two things were wrong at once: the box said a kill had worked while ps
+    still listed the process, and an unprivileged session could tear down
+    the workload the persona exists to advertise.
+    """
+    s = fs.Shell(fs.VFS(), user="deploy", peer="203.0.113.77")
+    s.exec_mode = True
+    # Looked up, not written down. This named 21401 and 21402 as training
+    # workers; the job table is ordered oldest-first so pid order tracks
+    # start order, and reordering it moved the workers to 21422-21425 --
+    # at which point the test was signalling pids that do not exist and
+    # reading "No such process" as if it were the permission check.
+    import workload as _w
+    _workers = sorted(j["pid"] for j in _w.active()
+                      if str(j.get("name", "")).startswith("train-w"))
+    check("there are training workers to signal", len(_workers) >= 2,
+          _workers)
+    for pid, what in (("1", "init"),
+                      (str(_workers[0]), "a root-owned worker")):
+        s._err = []
+        s.run("kill -9 " + pid)
+        err = "".join(s._err)
+        check("deploy cannot signal %s" % what, s.last_rc == 1, s.last_rc)
+        check("...and is told why (%s)" % what,
+              "Operation not permitted" in err, err.strip()[:50])
+        check("...in bash's builtin wording (%s)" % what,
+              "(%s) - Operation not permitted" % pid in err, err.strip()[:60])
+        check("...and the process is still there (%s)" % what,
+              pid in s.run("ps -eo pid=").split(), what)
+    # root is still allowed, and a user may still signal their own
+    r = shell()
+    r._err = []
+    r.run("kill -9 %d" % _workers[1])
+    check("root may still signal", r.last_rc == 0, r.last_rc)
+
+
+def t_mount_refuses_before_it_touches_anything():
+    """A non-root mount has to fail as mount, not as a leaked internal.
+
+    The superuser check was missing, so mount got as far as rewriting
+    /proc/mounts and reported *that*: "mount: /proc/mounts: Permission
+    denied". Wrong reason, and it names a path no real mount mentions.
+    """
+    s = fs.Shell(fs.VFS(), user="deploy", peer="203.0.113.77")
+    s.exec_mode = True
+    s.run("mkdir -p /tmp/ma /tmp/mb")
+    s._err = []
+    s.run("mount --bind /tmp/ma /tmp/mb")
+    err = "".join(s._err)
+    check("a non-root bind is refused", s.last_rc == 32, s.last_rc)
+    check("...as a superuser problem",
+          "must be superuser to use mount" in err, err.strip()[:60])
+    check("...naming no internal path",
+          "/proc/mounts" not in err, err.strip()[:60])
+    check("...and nothing was mounted",
+          "/tmp/mb" not in s.run("mount"), s.run("mount")[-50:])
+
+
+TESTS = [t_an_unprivileged_user_cannot_signal_root,
+         t_mount_refuses_before_it_touches_anything,
+         t_ps_and_proc_agree_on_the_count,
          t_every_pid_ps_lists_has_a_proc_dir, t_the_process_finders_agree,
          t_comm_matching_is_exact, t_psmisc_is_present_coherently,
          t_killing_a_worker_respawns_it, t_killing_the_master_stops_the_unit,

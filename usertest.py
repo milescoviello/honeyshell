@@ -135,7 +135,11 @@ def t_a_new_uid_resolves_to_its_name_everywhere():
     eq("find -printf %u",
        out(s, "find /home -maxdepth 1 -user bob -printf '%u:%g\\n'"),
        "bob:bob")
-    check("id agrees", "1001(bob)" in out(s, "id bob"), out(s, "id bob"))
+    # useradd takes the next free uid, and the persona now has an mlops
+    # account at 1001 -- so the number is derived rather than written down.
+    _uid = max([u for u in fs.UID_NAMES if u < 60000] or [1000]) + 1
+    check("id agrees", "%d(bob)" % _uid in out(s, "id bob"),
+          out(s, "id bob"))
 
 
 def t_useradd_writes_all_three_files():

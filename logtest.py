@@ -171,6 +171,48 @@ def t_agetty_owns_tty1():
                   for l in who.splitlines() if l.strip()), who[:70])
 
 
+def t_lastlog_is_sized_by_who_has_logged_in():
+    """It was 0 bytes on a box whose own `last` lists deploy sessions.
+
+    lastlog is indexed by uid: the record for uid N sits at offset N*292,
+    so logging in as uid N extends the file to (N+1)*292 and leaves a hole
+    in front of it. An empty lastlog means nobody has ever logged in, and
+    `last` says otherwise -- one file and one command disagreeing about
+    whether this box has ever had a user on it.
+
+    The reference reads 292584, which is exactly 1002*292 for a box whose
+    highest uid to have logged in is 1001, and it occupies 4096 bytes on
+    disk. Ours is derived from the same wtmp seed `last` reads.
+    """
+    s = sh()
+    size = int(run(s, "stat -c %s /var/log/lastlog")[0].strip())
+    check("lastlog is not empty", size > 0, size)
+    eq("...and is a whole number of 292-byte records", size % 292, 0)
+    # The highest uid with a login record, from the command that reads the
+    # same seed.
+    last_out, _ = run(s, "last")
+    pw = dict((l.split(":")[0], int(l.split(":")[2]))
+              for l in run(s, "cat /etc/passwd")[0].split("\n")
+              if l.count(":") == 6 and l.split(":")[2].isdigit())
+    users = {l.split()[0] for l in last_out.split("\n")
+             if l.split() and l.split()[0] in pw}
+    hi = max(pw[u] for u in users) if users else 0
+    eq("lastlog covers exactly the uids that have logged in",
+       size, (hi + 1) * 292)
+    # Sparse: length is not occupancy, and the whole file must not sit in
+    # RSS just because it is 292 KB long.
+    blocks = int(run(s, "stat -c %b /var/log/lastlog")[0].strip())
+    check("...and it is sparse", blocks * 512 <= 8192,
+          "%d blocks" % blocks)
+    eq("ownership is root:utmp",
+       run(s, 'stat -c "%U:%G %a" /var/log/lastlog')[0].strip(),
+       "root:utmp 664")
+    # btmp stays empty -- the reference's is 0 too, and a failed-login log
+    # that fills itself would be its own kind of wrong.
+    eq("btmp is still empty",
+       run(s, "stat -c %s /var/log/btmp")[0].strip(), "0")
+
+
 def t_lastlog_is_not_older_than_last():
     s = sh()
     last, _ = run(s, "last")
@@ -255,8 +297,12 @@ def t_utmp_family_ownership_and_size():
     check("wtmp is big enough for what last prints",
           size // 384 >= len(sessions),
           "%d records for %d lines" % (size // 384, len(sessions)))
-    # btmp and lastlog are empty on a fresh install.
-    for f in ("btmp", "lastlog"):
+    # btmp is empty -- the reference box's is 0 bytes too, and a
+    # failed-login log that fills itself would be its own kind of wrong.
+    # lastlog is NOT: it was measured on a fresh install, where nobody had
+    # logged in yet, and this box has a login history. It is sized by uid
+    # in t_lastlog_is_sized_by_who_has_logged_in above.
+    for f in ("btmp",):
         o, _ = run(s, "stat -c %s /var/log/" + f)
         eq("/var/log/%s is empty" % f, o.strip(), "0")
 
@@ -393,14 +439,116 @@ def t_the_access_log_records_the_whole_request_line():
           "/wp-login.php?" not in body, body[:80])
 
 
+def t_rotated_logs_are_fourteen_different_days():
+    """Two weeks of nginx history, and no two days the same.
+
+    `body` was computed once and written to access.log.1 and to all
+    thirteen .gz files behind it, so `zcat access.log.5.gz | md5sum`
+    equalled `md5sum access.log.1`: fourteen days of history in which
+    every day was a byte-for-byte copy, on a box whose logrotate config
+    says it keeps two weeks.
+
+    And each of those days was sixty copies of `GET / HTTP/1.1 200` with
+    sizes marching 180, 183, 186 and one client per line out of a 40-wide
+    block, so `awk '{print $1}' | sort | uniq -c` gave a dozen clients on
+    exactly 28 hits and three distinct counts in the whole file. Real
+    traffic is Pareto, and this box has its own numbers to shape it: its
+    HTTP log carries 43,003 hits on /xmlrpc.php against 4,278 on
+    /wp-login.php and a long tail below.
+    """
+    z = sh()
+    digests = {}
+    for name in ["access.log.1"] + ["access.log.%d.gz" % n
+                                    for n in range(2, 15)]:
+        if name.endswith(".gz"):
+            d = run(z, "zcat /var/log/nginx/%s | md5sum" % name)[0].split()
+        else:
+            d = run(z, "md5sum /var/log/nginx/%s" % name)[0].split()
+        if d:
+            digests[name] = d[0]
+    check("all fourteen rotated files are present", len(digests) == 14,
+          "%d found" % len(digests))
+    check("no two rotated days are identical",
+          len(set(digests.values())) == len(digests),
+          "%d distinct of %d" % (len(set(digests.values())), len(digests)))
+    counts = set()
+    for name in digests:
+        cat = "zcat" if name.endswith(".gz") else "cat"
+        counts.add(run(z, "%s /var/log/nginx/%s | wc -l" % (cat, name))[0].strip())
+    check("their line counts differ", len(counts) > 3,
+          "counts seen: %r" % sorted(counts)[:6])
+
+    body = run(z, "cat /var/log/nginx/access.log.1")[0]
+    lines = [l for l in body.splitlines() if '"' in l]
+    check("the day has enough lines to judge", len(lines) > 40, str(len(lines)))
+    import collections as _c
+    hits = _c.Counter(l.split()[0] for l in lines)
+    check("more than a handful of clients", len(hits) > 10,
+          "%d clients" % len(hits))
+    check("client hits are not all the same number",
+          len(set(hits.values())) > 3,
+          "counts: %r" % sorted(set(hits.values()))[:8])
+    top = hits.most_common(1)[0][1]
+    check("a heavy client is heavier than the tail",
+          top >= 3 * min(hits.values()),
+          "top %d vs min %d" % (top, min(hits.values())))
+    # Clients read as real addresses. They were all inside 203.0.113.0/24
+    # -- RFC 5737 TEST-NET-3 -- so fourteen days of logs came from a range
+    # reserved for documentation, which anyone who knows the RFCs spots at
+    # a glance. Miles chose real-looking addresses over that, with the
+    # tradeoff understood; the invariant is that none of them can be an
+    # address a real client could never have.
+    import ipaddress as _ip
+    bad = []
+    for a in set(l.split()[0] for l in lines):
+        try:
+            addr = _ip.ip_address(a)
+        except ValueError:
+            bad.append(a)
+            continue
+        if (addr.is_private or addr.is_reserved or addr.is_multicast
+                or addr.is_loopback or addr.is_link_local
+                or a.startswith(("192.0.2.", "198.51.100.", "203.0.113."))):
+            bad.append(a)
+    check("no client is a reserved or documentation address", bad == [],
+          "%d bad: %r" % (len(bad), bad[:4]))
+    check("clients are spread across many networks",
+          len(set(a.split(".")[0] for a in
+                  set(l.split()[0] for l in lines))) > 8,
+          "%d distinct first octets"
+          % len(set(a.split(".")[0] for a in
+                    set(l.split()[0] for l in lines))))
+    paths = set(l.split('"')[1] for l in lines)
+    check("more than one request line", len(paths) > 3,
+          "paths: %r" % sorted(paths)[:5])
+    check("the heaviest path is the one the box actually gets",
+          any("xmlrpc" in p for p in paths), sorted(paths)[:4])
+    agents = set(l.rsplit('"', 2)[-2] for l in lines if l.count('"') >= 4)
+    check("more than one user agent", len(agents) > 2,
+          "%d agents" % len(agents))
+    sizes = [int(l.split('" ')[1].split()[1]) for l in lines if '" ' in l]
+    check("response sizes are not an arithmetic run",
+          len(set(sizes)) > 10 and
+          len(set(sizes[i + 1] - sizes[i] for i in range(len(sizes) - 1))) > 3,
+          "%d distinct sizes" % len(set(sizes)))
+    # ordered oldest first, as a log written by appending must be
+    stamps = [l.split("[")[1].split("]")[0] for l in lines if "[" in l]
+    check("the file is in chronological order",
+          stamps == sorted(stamps, key=lambda x: (x[7:11], x[3:6], x[0:2],
+                                                  x[12:])),
+          "first %r last %r" % (stamps[:1], stamps[-1:]))
+
+
 TESTS = [t_rsyslog_backs_its_own_log_files, t_boot_records_agree, t_rsyslogd_process_is_coherent,
          t_who_w_users_agree, t_still_logged_in_means_a_utmp_entry,
          t_agetty_owns_tty1, t_lastlog_is_not_older_than_last,
+         t_lastlog_is_sized_by_who_has_logged_in,
          t_our_own_session_is_in_auth_log, t_auth_log_grows_with_the_session,
          t_utmp_family_ownership_and_size, t_run_utmp_backs_the_commands_that_read_it,
          t_syslog_trio_ownership, t_log_timestamps_are_not_in_the_future,
          t_logrotate_knows_about_these_files,
-         t_the_access_log_records_the_whole_request_line]
+         t_the_access_log_records_the_whole_request_line,
+         t_rotated_logs_are_fourteen_different_days]
 
 
 def main():

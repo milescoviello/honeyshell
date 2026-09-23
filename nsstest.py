@@ -44,6 +44,50 @@ def sh():
 def main():
     v, s = sh()
 
+    # -- a package that creates an account must have created it ----------
+    # uuid-runtime is installed here -- `dpkg -S /usr/sbin/uuidd` names it
+    # -- and it creates the uuidd system account. The reference guest has
+    # the same package and the same account, and this box had neither the
+    # user nor its runtime directory.
+    check("uuidd is in passwd", s.run("getent passwd uuidd").strip(),
+          "uuidd:x:115:115::/run/uuidd:/usr/sbin/nologin")
+    check("uuidd is in group", s.run("getent group uuidd").strip(),
+          "uuidd:x:115:")
+    check("id resolves it both ways", s.run("id uuidd").strip(),
+          "uid=115(uuidd) gid=115(uuidd) groups=115(uuidd)")
+    # The numbers are this box's, not the guest's: uid 101 -- what the
+    # guest gave uuidd -- is systemd-network here, so copying the guest
+    # would have put two accounts on one uid.
+    _pw = [l for l in s.run("cat /etc/passwd").split("\n") if l.count(":") == 6]
+    _uids = [l.split(":")[2] for l in _pw]
+    check("no two accounts share a uid", len(set(_uids)), len(_uids))
+    _gr = [l for l in s.run("cat /etc/group").split("\n") if l.count(":") >= 3]
+    _gids = [l.split(":")[2] for l in _gr]
+    check("no two groups share a gid", len(set(_gids)), len(_gids))
+
+    # Its runtime directory, setgid and owned by it -- `ls -ld /run/uuidd`
+    # on the guest is drwxrwsr-x uuidd uuidd.
+    _ls = s.run("ls -ld /run/uuidd").split()
+    check("/run/uuidd is setgid", _ls[0] if _ls else "", "drwxrwsr-x")
+    check("...and owned by uuidd", " ".join(_ls[2:4]) if len(_ls) > 3 else "",
+          "uuidd uuidd")
+
+    # Every shell named in passwd has to exist, and every login account
+    # needs the home it claims.
+    _bad_shell = [l.split(":")[0] for l in _pw
+                  if l.split(":")[6] not in ("/usr/sbin/nologin", "/bin/false")
+                  and "No such" in s.run("ls -d %s" % l.split(":")[6])]
+    check("every shell named in passwd exists", _bad_shell, [])
+    _bad_home = [l.split(":")[0] for l in _pw
+                 if l.split(":")[6] in ("/bin/bash", "/bin/sh")
+                 and "No such" in s.run("ls -d %s" % l.split(":")[5])]
+    check("every login account has its home", _bad_home, [])
+
+    # rsyslog's spool is 700 -- its own postinst chmods it. The guest has
+    # no rsyslog at all, so this came from the shipped .deb.
+    check("rsyslog's spool is not world-readable",
+          s.run("stat -c %a /var/spool/rsyslog").strip(), "700")
+
     # -- the files are the real ones ----------------------------------------
     for path, lines in (("/etc/services", 365), ("/etc/protocols", 68),
                         ("/etc/rpc", 41), ("/etc/networks", 4),

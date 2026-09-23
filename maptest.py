@@ -155,9 +155,22 @@ def sonames_from(cmd):
 ldd = sonames_from("ldd /usr/bin/bash")
 mapped = sorted({l.rsplit("/", 1)[-1] for l in maps
                  if ".so" in l and "ld-linux" not in l})
+# ldd prints the soname; the kernel records the dentry mmap actually
+# opened. Measured on a real Debian box: `ldd /bin/bash` says
+# libtinfo.so.6, that same process's maps say libtinfo.so.6.4, and
+# libtinfo.so.6 is a symlink to it. So a soname is mapped when either
+# spelling is present -- asserting the soname alone is asserting that
+# the library directory has no symlinks in it, which was the bug this
+# suite was holding in place.
 check("every library ldd names is mapped",
-      [so for so in ldd if so not in mapped], [],
+      [so for so in ldd
+       if so not in mapped and fakeshell.SO_REAL.get(so) not in mapped], [],
       "ldd and the loader are describing one act")
+check("...and where they differ, maps has the versioned file",
+      sorted(so for so in ldd
+             if so not in mapped and fakeshell.SO_REAL.get(so) in mapped),
+      ["libtinfo.so.6"],
+      "the soname is the link, the versioned name is the file")
 # ...but not by the same spelling, and that asymmetry is measured: the
 # kernel records where the dentry is, ld.so reports where the cache sent
 # it, and /lib is a symlink only one of them follows.

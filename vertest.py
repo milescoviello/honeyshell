@@ -128,7 +128,14 @@ def t_openssl_is_one_build():
                   "%s != %s" % (pv, ver))
 
     out, _e, _r = R("apt-cache policy openssl")
-    m = re.search(r"Version: (\S+)", out)
+    # `Installed:`, not `Version:`. policy has no Version line at all --
+    # confirmed on the guest, where `apt-cache policy openssl | grep -c
+    # ^Version:` is 0 and the installed version is on the Installed line.
+    # This matched a Version: for as long as policy was wrongly falling
+    # through to the `show` stanza, so the check was passing *because* of
+    # the bug it sat next to: it compared dpkg against show's output while
+    # claiming to compare it against policy's.
+    m = re.search(r"Installed: (\S+)", out)
     dv = R("dpkg -l openssl")[0].splitlines()
     dv = [l.split()[2] for l in dv if l.startswith("ii")]
     check("apt-cache policy matches dpkg", m and dv and m.group(1) == dv[0],
@@ -428,7 +435,50 @@ def t_package_descriptions_are_not_the_fallback():
               desc and desc != "Debian %s package" % pkg, desc[:60])
 
 
-TESTS = [t_openssl_is_one_build,
+def t_the_openssh_binary_and_its_package_disagree_on_purpose():
+    """`ssh -V` says 10.0p2; dpkg says 1:10.0p1-7+deb13u4. Both are right.
+
+    Debian backported upstream OpenSSH 10.0p2 into the deb13u4 security
+    update without bumping the package version, so on a real trixie box
+    the binary reports a version the archive has no .deb for. Verified
+    against the guest: `ssh -V` and the wire banner on 2222 both say
+    OpenSSH_10.0p2 Debian-7+deb13u4, while dpkg-query says
+    1:10.0p1-7+deb13u4 for all three openssh packages.
+
+    We had dpkg saying 1:10.0p2-7+deb13u4, which is a package Debian never
+    released -- that .deb is a 404 in the pool and the trixie Packages
+    index carries only p1. So `ssh -V` and `dpkg -l openssh-client` were
+    one question with two answers and the second named nothing real.
+
+    Correcting it broke the first: both version strings were being built
+    out of the package version, so `ssh -V` immediately started saying
+    10.0p1. They are separate facts here now, and the binary half is
+    derived from the banner so it cannot drift from what goes on the wire.
+    """
+    _o, _e, _ = R("ssh -V")
+    ver = (_o + _e).strip()
+    check("ssh -V reports the backported upstream version",
+          ver.startswith("OpenSSH_10.0p2 Debian-7+deb13u4"), ver[:60])
+    _o2, _e2, _ = R("sshd -V")
+    _sshdv = (_o2 + _e2).strip()
+    check("sshd -V agrees with it",
+          _sshdv.startswith("OpenSSH_10.0p2 Debian-7+deb13u4"), _sshdv[:60])
+    import fakeshell as _fs
+    check("and the wire banner is the same string",
+          _fs.SSH_BANNER == "SSH-2.0-OpenSSH_10.0p2 Debian-7+deb13u4",
+          _fs.SSH_BANNER)
+    for pkg in ("openssh-client", "openssh-server", "openssh-sftp-server"):
+        row = R("dpkg -l %s | tail -1" % pkg)[0].split()
+        got = row[2] if len(row) > 2 else "?"
+        check("%s is the version Debian shipped" % pkg,
+              got == "1:10.0p1-7+deb13u4", got)
+    check("no openssh package claims the p2 version, which has no .deb",
+          "10.0p2" not in R("dpkg -l | grep openssh")[0],
+          R("dpkg -l | grep openssh")[0][:80])
+
+
+TESTS = [t_the_openssh_binary_and_its_package_disagree_on_purpose,
+         t_openssl_is_one_build,
          t_openssl_version_flags_agree_with_a,
          t_cpuinfo_line_matches_the_cpu,
          t_dash_v_is_version_for_curl_and_wget,

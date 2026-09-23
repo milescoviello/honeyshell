@@ -92,7 +92,12 @@ def t_the_disk_size_agrees_everywhere():
     check("fdisk agrees on sectors",
           "%d sectors" % (fs.DISK_BLOCKS * 2) in out(s, "fdisk -l"),
           out(s, "fdisk -l | head -1"))
-    check("lsblk agrees", " 64G " in out(s, "lsblk | head -2"),
+    # Derived: lsblk picks its unit from the disk size, so a literal only
+    # ever matched the persona it was written against.
+    _dk = fs.DISK_BLOCKS
+    _want = ("%.1fT" % (_dk / 1024.0 ** 3) if _dk >= 1024 ** 3
+             else "%.0fG" % (_dk / 1024.0 ** 2))
+    check("lsblk agrees", (" %s " % _want) in out(s, "lsblk | head -2"),
           out(s, "lsblk | head -2"))
 
 
@@ -127,9 +132,15 @@ def t_sda14_is_the_same_size_in_all_three():
     s = shell()
     eq("/proc/partitions", out(s, "awk '/sda14/{print $3}' /proc/partitions"),
        str(fs.BIOS_BOOT_BLOCKS))
-    check("lsblk says 4M", "4M" in out(s, "lsblk | grep sda14"),
+    # This asserted lsblk "4M" and fdisk "4.0M" -- it froze a
+    # *disagreement* into a test whose own name says the three agree.
+    # The real guest prints the same string in both: its 3 MiB BIOS boot
+    # partition is "3M" in lsblk and "3M" in fdisk, because fdisk's Size
+    # column uses lsblk's convention, not df's. Measured on the guest.
+    _want = s._lsblk_size(fs.BIOS_BOOT_BLOCKS)
+    check("lsblk says %s" % _want, _want in out(s, "lsblk | grep sda14"),
           out(s, "lsblk | grep sda14"))
-    check("fdisk says 4.0M", "4.0M" in out(s, "fdisk -l | grep sda14"),
+    check("fdisk says the same", _want in out(s, "fdisk -l | grep sda14"),
           out(s, "fdisk -l | grep sda14"))
 
 
@@ -175,17 +186,34 @@ def t_fallocate_reads_suffixes():
 
 
 def t_fallocate_respects_the_tmpfs_size():
-    """The other half: a gigabyte does not fit in /tmp, and it says so."""
+    """The other half: a request larger than /tmp is refused.
+
+    This test was in the file and in no TESTS list, so it had never run
+    once. Its numbers were written when /tmp was 970M; /tmp is half of
+    RAM, so on this persona it is 504G and the old assertions were
+    asserting the wrong box. Rewritten against what /tmp actually is,
+    read from df rather than restated here, so it cannot go stale the
+    same way again.
+    """
     s = shell()
+    total_kb = int(out(s, "df --output=size /tmp | tail -1").strip())
+    fits = "%dK" % (total_kb // 2)          # comfortably inside
+    over = "%dK" % (total_kb * 2)           # comfortably outside
+    out(s, "rm -f /tmp/fa /tmp/fb")
+    eq("half of /tmp fits",
+       out(s, "fallocate -l %s /tmp/fa; stat -c '%%s' /tmp/fa" % fits),
+       str((total_kb // 2) * 1024))
+    eq("...and df counts it",
+       out(s, "df --output=used /tmp | tail -1").strip(),
+       str(total_kb // 2))
     out(s, "rm -f /tmp/fa")
-    eq("1G on a 970M tmpfs is refused",
-       out(s, "fallocate -l 1G /tmp/fa 2>&1"),
+    eq("twice /tmp is refused",
+       out(s, "fallocate -l %s /tmp/fb 2>&1" % over),
        "fallocate: fallocate failed: No space left on device")
     eq("...leaving a 0-byte file",
-       out(s, "stat -c '%s' /tmp/fa"), "0")
-    eq("...and 100M still fits",
-       out(s, "rm -f /tmp/fb; fallocate -l 100M /tmp/fb; "
-              "stat -c '%s' /tmp/fb"), str(100 * 1024 ** 2))
+       out(s, "stat -c '%s' /tmp/fb"), "0")
+    eq("...and df back to empty",
+       out(s, "df --output=used /tmp | tail -1").strip(), "0")
 
 
 def t_truncate_and_fallocate_agree():
@@ -317,6 +345,7 @@ TESTS = [t_the_disk_size_agrees_everywhere, t_the_partitions_agree,
          t_there_is_no_sda2, t_the_label_is_gpt,
          t_sda14_is_the_same_size_in_all_three, t_fdisk_needs_dash_l,
          t_no_swap_means_no_swap_anywhere, t_fallocate_reads_suffixes,
+         t_fallocate_respects_the_tmpfs_size,
          t_truncate_and_fallocate_agree, t_a_huge_allocation_costs_no_memory,
          t_a_small_allocation_is_still_real_bytes,
          t_reading_a_sparse_file_is_bounded, t_util_linux_is_coherent,

@@ -96,7 +96,7 @@ def t_stat_has_the_fields_proc5_defines():
               f[39] == "0" and f[40] == "0", "%s %s" % (f[39], f[40]))
         check("pid %d: exit_signal is SIGCHLD" % pid, f[37] == "17", f[37])
         check("pid %d: processor is a cpu this box has" % pid,
-              f[38].isdigit() and int(f[38]) < 4, f[38])
+              f[38].isdigit() and int(f[38]) < fs.NCPU, f[38])
 
 
 def t_priority_and_nice_are_one_number():
@@ -193,12 +193,15 @@ def t_ionice_remembers():
 def t_taskset_answers_about_the_pid_it_was_given():
     out = R("taskset -p 1")[0].strip()
     check("taskset -p names pid 1", out.startswith("pid 1's"), out[:40])
-    check("and gives a mask", out.endswith("affinity mask: f"), out[-30:])
+    check("and gives a mask",
+          out.endswith("affinity mask: %s" % ("f" * (fs.NCPU // 4))),
+          out[-30:])
     out = R("taskset -cp 1")[0].strip()
     check("taskset -cp still names pid 1", out.startswith("pid 1's"),
           out[:40])
     check("and gives a list, not a mask",
-          out.endswith("affinity list: 0-3"), out[-30:])
+          out.endswith("affinity list: 0-%d" % (fs.NCPU - 1)),
+          out[-30:])
     check("-c -p spelled apart is the same",
           R("taskset -c -p 1")[0] == R("taskset -cp 1")[0], "differs")
     # The list has to be the CPUs the box says it has.

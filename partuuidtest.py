@@ -102,7 +102,24 @@ def lsblk_col(dev, col):
     return "<no row>"
 
 
-PARTS = ("sda1", "sda14", "sda15")
+# Every partition on the box, from the emulator's own layout call, not
+# the three sda ones this was pinned to. A fourth partition on a second
+# disk is exactly the case that turned partuuid_of's trailing-digit key
+# into two devices sharing one GPT entry, so it belongs in this suite.
+def _all_parts():
+    fn = getattr(fakeshell, "gpt_layout", None)
+    disks = getattr(fakeshell, "DISKS", None)
+    if not fn:
+        return ("sda1", "sda14", "sda15")
+    if not disks:
+        return tuple(p[0] for p in fn())
+    out = []
+    for d in disks:
+        out += [p[0] for p in fn(d[0])]
+    return tuple(out)
+
+
+PARTS = _all_parts()
 
 # ------------------------------------------------ the form is a GPT form
 for part in PARTS:
@@ -112,7 +129,7 @@ for part in PARTS:
           "an MBR id plus an index -- 'b41c9e2a-01' -- is what a DOS label "
           "produces, and this layout is GPT. got %r" % got)
 check("...and they are all different",
-      len({blkid_partuuid(p) for p in PARTS}), 3)
+      len({blkid_partuuid(p) for p in PARTS}), len(PARTS))
 check("...and none is the disk identifier with an index",
       any(blkid_partuuid(p).endswith(("-01", "-14", "-15")) for p in PARTS),
       False)
@@ -132,7 +149,11 @@ check("a PARTUUID is the same on a fresh box", again, first,
 
 # --------------------------------- every reader of it says the same thing
 links = set(r("ls /dev/disk/by-partuuid").split())
-check("/dev/disk/by-partuuid holds one link per partition", len(links), 3)
+# One per partition, counted from the partition list rather than fixed at
+# three -- a literal here fails for the wrong reason the moment the box
+# gains a disk, which is not what this check is about.
+check("/dev/disk/by-partuuid holds one link per partition",
+      len(links), len(PARTS))
 check("...named exactly as blkid reports them",
       links, {blkid_partuuid(p) for p in PARTS},
       "these were a second hardcoded copy of the strings; they are built "

@@ -261,7 +261,16 @@ def t_each_field_is_named():
                        ("* * 99 * * /bin/true", "bad day-of-month"),
                        ("* * * 99 * /bin/true", "bad month"),
                        ("* * * * 99 /bin/true", "bad day-of-week"),
-                       ("* * * * *", "bad command")):
+                       # `* * * * *` used to be here expecting "bad
+                       # command". vixie cron in debian:trixie *accepts*
+                       # it -- it installs and runs an empty command --
+                       # so it has moved to the accepted list below. Real
+                       # cron never says "bad command" for a missing
+                       # command; when the line runs out mid-schedule it
+                       # names the field it was reaching for, which is
+                       # what cronerrtest pins.
+                       ("2", "bad hour"),
+                       ("2 3", "bad day-of-month")):
         why, _rc = bad(s, text)
         eq("%s" % text[:26], why, want)
 
@@ -289,7 +298,11 @@ def t_valid_forms_are_accepted():
                  "@daily /tmp/y.sh",
                  "# just a comment",
                  "MAILTO=root",
-                 "SHELL=/bin/sh"):
+                 "SHELL=/bin/sh",
+                 # Accepted by real cron, which installs it and runs an
+                 # empty command. Verified by reading it back with
+                 # `crontab -l` in the container.
+                 "* * * * *"):
         _o, _e, rc = run(s, "printf '%s\\n' | crontab -" % text)
         eq("accepted: %s" % text[:28], rc, 0)
 
@@ -297,7 +310,10 @@ def t_valid_forms_are_accepted():
 def t_an_unknown_special_is_refused():
     s = shell()
     why, rc = bad(s, "@bogus /tmp/y.sh")
-    eq("message", why, "bad minute")
+    # Measured: vixie cron in debian:trixie answers
+    # `"-":0: bad time specifier`. This expected "bad minute", which is
+    # the wrong field to name -- an @ line has no minute field at all.
+    eq("message", why, "bad time specifier")
     eq("rc", rc, 1)
 
 

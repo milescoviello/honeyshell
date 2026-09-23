@@ -41,9 +41,28 @@ PASS, FAIL = 0, 0
 FAILURES = []
 
 # The counters move with uptime, so two commands a moment apart legitimately
-# differ. eth0 grows by 594 bytes a second here; a second of slack is plenty
-# and still catches a reader that is off by a factor of sixteen.
-SLACK = 4000
+# differ -- on a real box too: read /proc/net/dev and then sysfs and the
+# second number is bigger, because time passed. What must hold is that they
+# agree to within what the interface could actually have transferred in
+# between, not that they are byte-identical.
+#
+# Measured rather than hardcoded. This was 4000, sized as "a second at 594
+# bytes a second"; when the interface was given a rate a real web server
+# would show, the constant silently became a tenth of a second of traffic
+# and four readers that agreed perfectly started failing. A tolerance
+# pinned to a number the box can change out from under it is a tolerance
+# that will rot again.
+def _measured_slack():
+    """Three seconds of this interface's own traffic, whatever that is."""
+    def rx():
+        for line in (S.run("cat /proc/net/dev") or "").splitlines():
+            if "eth0:" in line:
+                return int(line.split(":", 1)[1].split()[0])
+        return 0
+    import time as _t
+    a = rx(); t0 = _t.time(); _t.sleep(0.25); b = rx()
+    per_sec = max(0.0, (b - a) / max(1e-3, _t.time() - t0))
+    return int(max(4000, per_sec * 3))
 
 
 def check(name, ok, detail=""):
@@ -56,6 +75,7 @@ def check(name, ok, detail=""):
 
 
 S = fs.Shell(fs.VFS())
+SLACK = _measured_slack()
 S.exec_mode = True
 
 
